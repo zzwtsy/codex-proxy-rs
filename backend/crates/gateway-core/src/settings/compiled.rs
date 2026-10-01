@@ -55,6 +55,7 @@ impl CompiledSettings {
             AccountConcurrency::new(settings.max_concurrent_per_account),
             Duration::from_millis(settings.request_interval_ms),
         )
+        .with_openai_guardian_reserved_concurrency(settings.openai_guardian_reserved_concurrency)
         .with_smart_scheduling(settings.smart_scheduling)
         .with_queue(ConcurrencyQueuePolicy {
             max_waiting: settings.max_waiting_per_account,

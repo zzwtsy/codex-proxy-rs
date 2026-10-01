@@ -3,7 +3,7 @@ import type { AccountImportTask, AccountImportTaskDetail } from '@/api'
 import { BaseButton, BaseEmpty, BaseIconButton, BaseModal, BasePopover, BaseSelect } from '@codex-proxy/ui'
 import { CircleAlert, ListTodo } from '@lucide/vue'
 import { computed, shallowRef, useId, watch } from 'vue'
-import { taskLabel, taskTime } from './presenter'
+import { taskLabel } from './presenter'
 import TaskDetail from './TaskDetail.vue'
 
 const props = defineProps<{
@@ -20,7 +20,7 @@ const retentionOpen = shallowRef(false)
 const retentionId = useId()
 const taskOptions = computed(() => props.tasks.map(task => ({
   value: task.taskId,
-  label: taskTime(task.createdAt),
+  label: task.createdAtDisplay,
   description: `${task.total} 个条目 · ${taskLabel(task)}`,
 })))
 

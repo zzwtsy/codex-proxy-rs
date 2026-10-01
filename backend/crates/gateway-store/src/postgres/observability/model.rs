@@ -415,7 +415,7 @@ pub struct ProviderAccountUsageQuery {
     pub range: ObservabilityRange,
     pub account_ids: Option<Vec<String>>,
     pub limit: u16,
-    pub(crate) include_hourly_request_buckets: bool,
+    pub(crate) request_bucket_range: Option<ObservabilityRange>,
 }
 
 impl ProviderAccountUsageQuery {
@@ -431,7 +431,7 @@ impl ProviderAccountUsageQuery {
             limit: u16::try_from(account_ids.len())
                 .map_err(|_| invalid("account usage query is too large"))?,
             account_ids: Some(account_ids),
-            include_hourly_request_buckets: false,
+            request_bucket_range: None,
         })
     }
 
@@ -443,17 +443,22 @@ impl ProviderAccountUsageQuery {
             range,
             account_ids: None,
             limit,
-            include_hourly_request_buckets: false,
+            request_bucket_range: None,
         })
     }
 
     pub fn with_hourly_request_buckets(mut self) -> StoreResult<Self> {
-        if self.range.end.signed_duration_since(self.range.start)
-            > TimeDelta::hours(ACCOUNT_USAGE_TIMELINE_HOURS)
-        {
-            return Err(invalid("account request timeline cannot exceed 24 hours"));
-        }
-        self.include_hourly_request_buckets = true;
+        // 小时图独立展示最近 24 个 UTC 小时桶，自然日统计不能限制为 24 小时。
+        let current_hour =
+            DateTime::from_timestamp(self.range.end.timestamp().div_euclid(3600) * 3600, 0)
+                .ok_or_else(|| invalid("account request timeline exceeds supported timestamps"))?;
+        let start = current_hour
+            .checked_sub_signed(TimeDelta::hours(ACCOUNT_USAGE_TIMELINE_HOURS - 1))
+            .ok_or_else(|| invalid("account request timeline exceeds supported timestamps"))?;
+        self.request_bucket_range = Some(ObservabilityRange {
+            start,
+            end: self.range.end,
+        });
         Ok(self)
     }
 }

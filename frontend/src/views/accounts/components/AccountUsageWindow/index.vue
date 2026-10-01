@@ -2,7 +2,6 @@
 import type { AccountQuotaWindow } from '../../constants'
 import type { AccountUsageWindowVariant } from './presenter'
 import { computed } from 'vue'
-import { useUiClock } from '@/composables/useUiClock'
 import AccountRequestTimeline from './AccountRequestTimeline.vue'
 import { resolveAccountUsageWindowPresentation } from './presenter'
 
@@ -22,12 +21,10 @@ const props = withDefaults(
   },
 )
 
-const now = useUiClock()
 const view = computed(() => resolveAccountUsageWindowPresentation({
   window: props.window,
   variant: props.variant,
   showLocalValue: props.showLocalValue,
-  now: now.value.getTime(),
 }))
 </script>
 

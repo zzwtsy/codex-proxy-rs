@@ -58,7 +58,9 @@ export interface SystemUpdateStatus {
     message: string | null
     error: string | null
     startedAt: string | null
+    startedAtDisplay: string | null
     finishedAt: string | null
+    finishedAtDisplay: string | null
   }
 }
 

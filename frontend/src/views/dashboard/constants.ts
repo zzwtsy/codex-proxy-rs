@@ -22,6 +22,7 @@ export type HealthStatus
   = 'future' | 'no_data' | 'unavailable' | 'unstable' | 'low_sample' | 'stable'
 
 export interface HealthTimelinePoint {
+  bucketStart: string
   time: string
   status: HealthStatus
   reliabilityDisplay: string

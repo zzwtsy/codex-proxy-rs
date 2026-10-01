@@ -13,11 +13,11 @@ services:
     command:
       - postgres
       - -c
-      - timezone=Asia/Shanghai
+      - timezone=UTC
       - -c
-      - log_timezone=Asia/Shanghai
+      - log_timezone=UTC
     environment:
-      TZ: Asia/Shanghai
+      TZ: UTC
       POSTGRES_DB: codex_proxy
       POSTGRES_USER: codex_proxy
       POSTGRES_PASSWORD: '${CPR_DATABASE_PASSWORD:?Set CPR_DATABASE_PASSWORD in the project root .env}'

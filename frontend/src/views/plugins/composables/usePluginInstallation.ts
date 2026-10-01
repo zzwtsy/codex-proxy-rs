@@ -222,16 +222,18 @@ export function usePluginInstallation({ runAction, notifyError, onInstalled, onS
   }
 
   watch(showInstall, (open) => {
-    if (!open) {
-      resetReleaseQuery()
-      resetArtifactVerification()
-      acceptanceArtifact.value = null
-    }
-  })
-  onScopeDispose(() => {
+    if (!open)
+      cancelQueries()
+  }, { flush: 'sync' })
+
+  function cancelQueries() {
     releaseController?.abort()
     verificationController?.abort()
-  })
+    releaseController = undefined
+    verificationController = undefined
+  }
+
+  onScopeDispose(cancelQueries)
   return {
     showInstall,
     installMode,

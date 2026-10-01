@@ -22,7 +22,9 @@ fn retention_preserves_complete_dates_across_compression_rotation_and_restart() 
         return;
     }
     let directory = tempfile::tempdir().unwrap();
-    let today = chrono::Utc::now().date_naive();
+    let today = gateway_core::time::DeploymentTimeZone::default()
+        .local(chrono::Utc::now())
+        .date_naive();
     let mut retained = Vec::new();
     let mut expired = Vec::new();
     for (prefix, days) in [
@@ -42,7 +44,7 @@ fn retention_preserves_complete_dates_across_compression_rotation_and_restart() 
         let path = directory.path().join(format!("{prefix}{old_date}.log"));
         seed_log(&path, old_date, "expired date\n");
         expired.push(path);
-        // If any old segment was recently written, protect its whole UTC date.
+        // 时区切换或恢复的文件按较近写入日期保护整个分段组。
         let restored_date = old_date - chrono::Days::new(1);
         for segment in 0..=1 {
             let path = directory
@@ -139,10 +141,9 @@ fn retention_preserves_complete_dates_across_compression_rotation_and_restart() 
 
 fn seed_log(path: &Path, date: chrono::NaiveDate, body: &str) {
     fs::write(path, body).unwrap();
-    let modified = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-        date.and_hms_opt(0, 0, 0).unwrap(),
-        chrono::Utc,
-    );
+    let modified = gateway_core::time::DeploymentTimeZone::default()
+        .date_start(date)
+        .unwrap();
     fs::File::open(path)
         .unwrap()
         .set_modified(SystemTime::from(modified))

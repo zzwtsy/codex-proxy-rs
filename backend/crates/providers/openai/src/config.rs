@@ -29,6 +29,8 @@ const fn default_stream_max_retries() -> u64 {
 /// OpenAI Provider 唯一启动配置。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct OpenAiConfig {
+    #[serde(skip)]
+    pub(crate) timezone: gateway_core::time::DeploymentTimeZone,
     #[serde(default)]
     pub api: CodexApiConfig,
     #[serde(default)]
@@ -46,6 +48,12 @@ pub struct OpenAiConfig {
 }
 
 impl OpenAiConfig {
+    #[must_use]
+    pub fn with_timezone(mut self, timezone: gateway_core::time::DeploymentTimeZone) -> Self {
+        self.timezone = timezone;
+        self
+    }
+
     /// 校验 Provider-owned 字段，并从统一运行数据目录定位会话身份密钥。
     pub fn resolve_and_validate(
         &mut self,
@@ -109,6 +117,7 @@ impl OpenAiConfig {
 impl Default for OpenAiConfig {
     fn default() -> Self {
         Self {
+            timezone: Default::default(),
             api: CodexApiConfig::default(),
             ws_pool: CodexWebSocketPoolSettings::default(),
             quota: CodexQuotaSettings::default(),

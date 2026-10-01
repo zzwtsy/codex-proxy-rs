@@ -18,7 +18,7 @@
 
 | 位置 | 内容 | 修改方式 |
 | --- | --- | --- |
-| `deploy/config.yaml` | 监听、数据库/Redis 地址、管理员初始密码与日志等应用启动配置 | 从模板创建，已有部署合并修改，不覆盖原文件 |
+| `deploy/config.yaml` | 监听与数据库/Redis 连接地址、管理员初始密码、时区与日志等应用启动配置 | 从模板创建，已有部署合并修改，不覆盖原文件 |
 | `.env` | Compose 使用的 `CPR_DATABASE_PASSWORD` 和 `CPR_REDIS_PASSWORD` | 安装器生成；手动安装设为 `0600` |
 | `deploy/compose.yaml` | 镜像、容器网络、端口、挂载与资源限制 | 调整 Compose 并重建受影响容器 |
 | PostgreSQL | 账号、Key、运行设置、上游身份、插件配置等业务数据 | 管理端或管理 API |
@@ -32,6 +32,26 @@ Compose 命令从安装目录运行，并通过 `--env-file .env` 明确读取�
 后端从当前目录向上查找 `deploy/config.yaml`，相对数据、日志和静态资源路径以该文件所在目录解析
 
 Compose 通过环境变量将监听和数据库地址设为容器内地址，并指定镜像中的静态资源目录
+
+### 部署时区
+
+在 `deploy/config.yaml` 设置统一的 IANA 时区，省略时默认 `Asia/Shanghai`：
+
+```yaml
+host:
+  timezone: 'Asia/Shanghai'
+```
+
+支持 `UTC`、`America/New_York`、`Asia/Kathmandu` 等名称；空值、未知名称和错误类型会阻止启动，
+错误指出 `host.timezone`，不输出配置值。修改后重启网关生效，二进制与 Compose 使用同一配置
+
+管理端与 Key 用量页的时间文本由后端生成；自然日筛选、日统计、Key 限额、账号预热和备份 Cron 使用该时区。
+浏览器、进程 `TZ` 和 PostgreSQL 会话时区不覆盖业务配置；Compose 的基础设施时间基准为 UTC。
+上游请求身份中的位置时区仍由对应运行设置或代理配置控制，与部署时区独立
+
+切换时区保留已打开限额窗口的 UTC 边界与用量，到期后按新时区续接；不会因重启立即清零。
+备份调度从切换后的当前时刻计算未来执行点，不补跑旧时区漏过的任务，已入队任务保持原状态。
+夏令时中不存在的预热或 Cron 时刻跳过，重复时刻只选较早一次。日志日期与保留规则见[日志与保留窗口](#日志与保留窗口)
 
 ## 部署结构
 
@@ -367,8 +387,8 @@ Provider schema 以明文 JSON 保存于 PostgreSQL。Redis 只保存可重建�
 
 | 文件集 | 保留配置 | 默认完整窗口 |
 | --- | --- | --- |
-| 普通日志、OAuth 恢复日志 | `host.logging.file.retention_days` | 至少 7×24 小时 |
-| 全量请求/响应报文 | `host.logging.request_dump_retention_days` | 至少 24 小时（默认 1） |
+| 普通日志、OAuth 恢复日志 | `host.logging.file.retention_days` | 前 7 个完整自然日及当天 |
+| 全量请求/响应报文 | `host.logging.request_dump_retention_days` | 前 1 个完整自然日及当天 |
 
 文件名统一为 `codex-proxy-rs-<类别>.YYYY-MM-DD[.N].log[.gz]`，类别分别为
 `application`、`oauth-recovery`、`request-dump`。专用 tracing target 为 `oauth_recovery` 和
@@ -376,9 +396,10 @@ Provider schema 以明文 JSON 保存于 PostgreSQL。Redis 只保存可重建�
 程序只管理上述规范名称的日志，其他命名的文件由运维手动清理。
 普通日志未配置 `retention_days` 时默认使用 7 天，显式配置优先
 
-按 UTC 日期整组保留：例如 9 月 8 日配置 1 天，会保留 9 月 7 日全天及 9 月 8 日的所有分片，
+日志时间戳采用部署时区并携带数字偏移，文件按该时区的日期轮转和整组保留：例如 9 月 8 日配置 1 天，会保留 9 月 7 日全天及 9 月 8 日的所有分片，
 到 9 月 9 日才允许清理 9 月 7 日。这会略多保留，保证跨午夜及高流量时不留下半天日志。
-配置 7 天同理，保留前 7 个完整 UTC 日期及当天；若旧日期分片近期又被写入，整组延后删除。
+配置 7 天同理，保留前 7 个完整自然日及当天，夏令时日期允许为 23 或 25 小时。切换时区不重命名历史文件；
+按文件名日期与部署时区中的实际修改日期取较近值，旧日期分片近期被写入时整组延后删除。
 `max_file_size_mb` 仅决定分片大小（默认 20 MiB），不决定保存时长，单条大记录不会被截断。
 关闭的分片压缩为 `.log.gz`；成功压缩、同步并发布归档后才删除原文件，保留原修改时间。
 清理发生在启动和轮转时；空闲期间过期文件可能暂时多保留。检索时须同时读取 `.log` 与 `.log.gz`

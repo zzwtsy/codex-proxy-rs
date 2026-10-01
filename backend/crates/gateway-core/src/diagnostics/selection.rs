@@ -63,6 +63,7 @@ impl TraceContext {
                 "preferredAccountId": context.preferred_account.as_ref().map(|id| id.as_str()),
                 "preferredResult": selection.as_ref().map(|s| format!("{:?}", s.preferred())),
                 "roundRobinCursor": context.round_robin_cursor,
+                "reservedConcurrency": context.reserved_concurrency,
                 "smartScoreTolerance": smart.then(|| context.policy.smart_scheduling().score_tolerance()),
                 "candidateCount": candidates.len(),
                 "omittedCandidates": candidates.len().saturating_sub(observations.len()),

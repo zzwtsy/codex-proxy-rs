@@ -518,7 +518,7 @@ async fn concurrent_calls_keep_their_wire_ids_monotonic() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     callbacks.release();
     for call in calls {
-        assert!(call.await.unwrap().is_ok());
+        call.await.unwrap().unwrap();
     }
     session.shutdown(Duration::from_secs(1)).await;
 }

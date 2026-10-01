@@ -147,6 +147,28 @@ HTTPS 来源以及缺失、`null` 或非法来源保留 `Secure`。`HttpOnly`、
 OpenAI 上游 `401` 按 `50201` 返回，不代表管理员会话失效，也不要求管理端重新登录。
 Codex PAT 验证服务不可用和身份响应无效分别返回 `50301`、`50201` 及对应的安全提示
 
+### 页面时间合同
+
+管理端与 Key 用量接口保留原始 RFC3339 时间点，并提供 `createdAtDisplay`、`updatedAtDisplay`、
+`expiresAtDisplay` 等展示字段。展示文本由后端按部署 `host.timezone` 生成，完整时间通常为
+`YYYY-MM-DD HH:mm:ss`，短时间、相对时间和图表标签按对应视图返回；缺失时间的展示字段为 `null` 或占位文本。
+调用者直接显示文本，使用原始时间点进行排序、比较和输入，不把展示文本转回请求时间
+
+账号冷却返回 RFC3339 `rateLimitedUntil` 和 `rateLimitRecoveryDisplay`，后者包含剩余时长、
+到期时间或等待恢复探测的提示，随账号数据刷新；前端不解析展示文本或自行计算恢复提示
+
+`period=today|7d|30d` 表达自然日范围，`asOf` 是 Unix 毫秒查询锚点，省略时取服务端当前时刻。
+近 7 天包含锚点所在日期及前 6 个自然日，近 30 天同理包含前 29 日；结束点为锚点。
+同一组汇总、趋势与列表共享 `asOf`，分页保持锚点，刷新再更新。显式 `startTime` / `endTime`
+使用带偏移的 RFC3339，不能与 `period` 或 `asOf` 混用；对应接口仍执行范围上限校验。
+自然日刚开始时允许空的今日快照，显式起止范围仍要求开始早于结束
+
+图表的 `label`、日期提示和空桶由后端提供；日粒度按本地日界，小时及 15 分钟桶以 UTC 时间点定位。
+账号请求柱覆盖截至锚点的最近 24 个 UTC 小时桶，包含当前未完整小时，独立于今日汇总的自然日范围。
+健康时间线覆盖锚点所在自然日，每 15 分钟一个桶，夏令时日期可以为 92 或 100 个桶。
+重复本地时刻的标签携带偏移，唯一键、排序和去重仍使用原始时间点。
+只有日历日期的上游统计保留日期语义，不当作 UTC 午夜换算
+
 ### 管理写入一致性
 
 管理写入不要求客户端提供全局配置版本。会改变路由快照或安全配置的写入由后端在事务内推进
@@ -413,7 +435,7 @@ OpenAI 选号阶段确认本次可选账号全部额度耗尽时，HTTP 返回 `
 
 金额使用十进制字符串，`total` 为当前周期限额，`used` 为该周期已结算金额，`remaining` 为限额减已用且最低为零。
 不限额时 `total`、`remaining` 均为 `null`，仍返回已用金额。`resetsAt` 为 RFC3339 时间，尚未开启或已到期的窗口返回 `null`，
-已到期窗口的 `used` 为 `"0"`。日窗口按北京时间零点划分，周窗口沿用首次使用起的七天周期，不固定为周一。
+已到期窗口的 `used` 为 `"0"`。日窗口按部署时区的自然日划分，周窗口沿用首次使用起的七个本地日历日周期，不固定为周一。
 修改限额、管理员重置和费用结算均复用现有 Key 账本，不从请求日志重算余额
 
 缺失、非法、已禁用或已删除的 Key 返回 OpenAI 风格 `401` 错误；未知查询参数返回 `400 invalid_usage_query`，
@@ -468,19 +490,19 @@ OpenAI 选号阶段确认本次可选账号全部额度耗尽时，HTTP 返回 `
 
 | 方法 | 路由 | 查询 | 说明 |
 | --- | --- | --- | --- |
-| `GET` | `/api/key-usage/overview` | `startTime`、`endTime`、`model?` | 用量汇总、趋势、当前额度和北京时间今日健康时间线 |
+| `GET` | `/api/key-usage/overview` | `period?`、`asOf?` 或 `startTime?`、`endTime?`，另含 `model?` | 用量汇总、趋势、当前额度和锚点所在日期的健康时间线 |
 | `GET` | `/api/key-usage/records` | 同上，另含 `kind?`、`currentPage?`、`pageSize?` | 当前 Key 的成功请求或错误记录 |
 | `GET` | `/api/key-usage/config` | 无 | 当前 Key 的客户端配置凭据 |
 | `GET` | `/api/key-usage/version` | 无 | “关于”弹窗使用的当前版本号和提交号 |
 
-用量查询的起止时间使用 RFC3339，开始必须早于结束，一次最多 31 天。模型按完整名称匹配；
+用量查询支持[页面时间合同](#页面时间合同)，默认 `period=7d`，一次最多 31 天。模型按完整名称匹配；
 不接受 Key ID、账号、Provider 等范围参数或其他未知字段。页码默认 1，每页默认 20，允许 1–100 条；
 `kind` 为 `success`（默认）或 `error`。分页响应为 `{ items, currentPage, pageSize, total }`
 
-overview 返回 `asOf`、`startTime`、`endTime`、`key`、`summary`、`trend`、`healthTimeline`。
+overview 返回 `asOf`、`asOfDisplay`、`startTime`、`endTime`、`key`、`summary`、`trend`、`healthTimeline`。
 `key` 仅包含名称、掩码前缀、并发/RPM、日与周限额、已用 USD 及重置时间；零限额表示不限，
 未启动窗口的重置时间为 null。额度使用现有结算账本，不受日志日期或模型筛选影响。
-健康时间线沿用管理端的 96 个北京时间日内桶与可用性语义，不受历史范围和模型筛选影响
+健康时间线沿用管理端的自然日分桶与可用性语义，以 `asOf` 为锚点，不受所选周期长度和模型筛选影响
 
 汇总和趋势返回请求数、输入、输出、缓存读写、推理、总 Tokens 与 USD 成本；输入已包含缓存读写，
 推理为输出的明细，不得把缓存或推理重复计入总消耗。趋势另含 `time` 与 `bucketSeconds`。
@@ -686,6 +708,9 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
   "upstreamBody": "{\"error\":{...}}"
 }
 ```
+
+所有连接测试事件都包含服务端发出时的 `occurredAt`、完整 `occurredAtDisplay` 和短 `timeDisplay`。
+浏览器本地取消或断网没有服务端发生时间，应保持事件顺序和状态，不伪造时间戳
 
 - `source` 为 `gateway`、`provider` 或 `upstream`：分别表示尚未进入 Provider、Provider 本地且未发送、
   已发送/可能已发送或已经捕获到上游事实
@@ -1132,7 +1157,8 @@ HTTP 请求头及新建 WS 的握手提示按当时的最终出站档位构造�
 列表返回 `dailyLimitUsd`、`weeklyLimitUsd`、`dailyUsedUsd`、`weeklyUsedUsd`（均为字符串）、
 `dailyResetsAt`、`weeklyResetsAt`（RFC3339 或 `null`）。
 记账和限额比较保留完整精度。
-日窗口按北京时间零点重置；周窗口从首次准入当天零点起持续七天，到期后在下一次使用时重新开启。
+日窗口按部署时区的下一自然日边界重置；周窗口从首次准入当天日界起持续七个本地日历日，到期后在下一次使用时重新开启。
+切换部署时区不修改已打开窗口的起止点或金额，到期后续接窗口不与旧窗口重叠。
 手动重置清零所选周期的已用金额并清除到期时间，保留限额上限和历史费用，返回 `{ id }`。
 所选窗口的重置时间返回 `null`，下次使用时按新建 Key 的规则重新开启。重置前完成但延迟结算的费用不再计入所选周期，也不会开启窗口；
 重置后完成的请求继续计费，包括重置时仍在进行的请求。操作保留管理员审计，不改变账号上游额度。
@@ -1192,6 +1218,7 @@ refreshConcurrency
 maxConcurrentPerAccount
 maxWaitingPerKey
 maxWaitingPerAccount
+openaiGuardianReservedConcurrency
 concurrencyWaitTimeoutSeconds
 responsesMaxDecompressedBodyBytes
 requestIntervalMs
@@ -1214,9 +1241,10 @@ accountWarmupScheduleTime
 accountWarmupModel
 ```
 
-定时账号预热默认关闭。`accountWarmupScheduleTime` 使用北京时间（UTC+8）的 `HH:MM`，
+定时账号预热默认关闭。`accountWarmupScheduleTime` 使用部署时区中的 `HH:MM`，
 多个时段以逗号分隔，默认 `08:00`；`accountWarmupModel` 默认 `null`，开启前必须显式选择模型。
 任务面向可用的 OpenAI OAuth 账号，跳过周额度耗尽及五小时窗口距离重置仍超过 30 分钟的账号。
+不存在的本地时刻跳过，重复时刻只执行较早一次；同一本地分钟的去重跨进程重启保留。
 只有收到响应成功终态才记为预热成功；预热不计入客户端业务用量
 
 `requestLocationEnabled` 是必填布尔值，默认 `false`：关闭时不覆盖客户端原有位置和时区；开启时使用已保存的
@@ -1237,6 +1265,13 @@ accountWarmupModel
 `concurrencyWaitTimeoutSeconds` 取值 1～120，默认 30，从首次入队开始计时，密钥与账号两层共享该等待时限；
 切换账号或内部重试不重新计时，等待同时计入请求总超时。该时限不用于中断已开始的上游生成。
 设置更新请求须包含这三个字段，新请求使用更新后的快照
+
+`openaiGuardianReservedConcurrency`（默认 0，取值 0～4,294,967,295）为 Codex Guardian 自动审批保留账号并发，保存后对新请求生效。
+Guardian 以 `subagent_kind` 或 `client_metadata.x-openai-subagent` 值 `guardian` 识别。取值 R 大于 0 时，
+有限上限为 L 的账号对其他 OpenAI 请求只开放 `max(L − R, 1)` 个名额，Guardian 可用满 L；
+开启账号排队后，Guardian 排在同账号已有 Guardian 之后、全部普通等待者之前，不受单账号排队上限约束，
+仍受总等待容量与等待时限约束。不限并发的账号和关闭排队时的其余行为不变。
+设置更新请求须包含该字段
 
 `responsesMaxDecompressedBodyBytes` 是压缩 Responses HTTP 请求的解压输出上限，单位字节，默认
 67108864（64 MiB）。必须为正整数，且可表示为进程平台的 `isize`；管理端以整数 MiB 编辑。
@@ -1463,7 +1498,7 @@ Desktop 三段 SemVer 门禁，也不会自动回写最低版本设置。门禁�
 | `GET` | `/api/admin/settings/backups` | 无 | 读取存储配置（含明文 Secret）、验证状态与调度配置 |
 | `POST` | `/api/admin/settings/backups/storage/update` | S3 配置 | 更新存储配置；`secretAccessKey` 为空字符串会校验失败 |
 | `POST` | `/api/admin/settings/backups/storage/test` | 无 | 测试已保存的存储配置（Put/Head/Get/Delete 探针） |
-| `POST` | `/api/admin/settings/backups/schedule/update` | 调度配置 | 更新 Cron、时区与保留策略 |
+| `POST` | `/api/admin/settings/backups/schedule/update` | 调度配置 | 更新 Cron 与保留策略 |
 | `GET` | `/api/admin/settings/backups/records` | 查询参数 | 分页查询备份记录 |
 | `POST` | `/api/admin/settings/backups/create` | `{ expiresInDays? }` | 创建手动备份，返回 `202 Accepted`；`expiresInDays` 为过期天数（0 或缺省表示不过期） |
 | `POST` | `/api/admin/settings/backups/download-url` | `{ backupId }` | 创建 5 分钟有效预签名下载地址（仅 completed） |
@@ -1473,8 +1508,9 @@ Desktop 三段 SemVer 门禁，也不会自动回写最低版本设置。门禁�
 
 ```text
 storageRevision, endpoint, region, bucket, accessKeyId, secretAccessKey, prefix,
-forcePathStyle, verified, scheduleEnabled, cronExpression, scheduleTimezone,
-retentionDays, retentionCount, nextRunAt, lastVerifiedAt, updatedAt
+forcePathStyle, verified, scheduleEnabled, cronExpression,
+retentionDays, retentionCount, nextRunAt, nextRunAtDisplay,
+lastVerifiedAt, lastVerifiedAtDisplay, updatedAt, updatedAtDisplay
 ```
 
 更新存储请求字段：
@@ -1490,10 +1526,11 @@ endpoint, region, bucket, accessKeyId, secretAccessKey, prefix, forcePathStyle
 更新调度请求字段：
 
 ```text
-scheduleEnabled, cronExpression, scheduleTimezone, retentionDays, retentionCount
+scheduleEnabled, cronExpression, retentionDays, retentionCount
 ```
 
-`cronExpression` 为 5 段格式；`retentionDays`/`retentionCount` 为 0 表示禁用对应清理。启用计划前必须已保存完整存储配置且通过连接测试
+`cronExpression` 为 5 段格式，按部署 `host.timezone` 解释；不存在的本地时刻跳过，重复时刻只执行较早一次。
+调度时区没有独立请求字段。`retentionDays`/`retentionCount` 为 0 表示禁用对应清理。启用计划前必须已保存完整存储配置且通过连接测试
 
 记录列表查询参数：
 
@@ -1507,6 +1544,8 @@ page, pageSize, status, trigger
 id, triggerKind, status, scheduledAt, objectKey, sizeBytes, sha256, attemptCount,
 errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 ```
+
+记录中的时间点同时返回对应的 `*Display` 字段
 
 `expiresAt` 在创建时确定：手动备份来自 `expiresInDays`，计划备份来自当时的
 `retentionDays`；到期后由 Worker 进入删除流程
@@ -1523,7 +1562,7 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 
 | HTTP | 场景 |
 | --- | --- |
-| `400` | 配置、Cron、时区或状态参数无效 |
+| `400` | 配置、Cron 或状态参数无效 |
 | `404` | 备份记录不存在 |
 | `409` | 已有活跃任务、状态冲突或存储身份锁定 |
 | `502` | S3 兼容服务返回无效或失败响应 |
@@ -1535,7 +1574,7 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 
 | 方法 | 路由 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/admin/dashboard/summary` | Dashboard 汇总；支持 `kind`、`startTime`、`endTime` |
+| `GET` | `/api/admin/dashboard/summary` | Dashboard 汇总；支持 `kind` 与统一时间范围参数 |
 | `GET` | `/api/admin/dashboard/trend` | Dashboard 趋势；`kind=usage\|latency\|errors` |
 | `GET` | `/api/admin/usage/records` | 请求记录分页列表 |
 | `GET` | `/api/admin/usage/records/detail` | 按 `id` 查询请求详情 |
@@ -1558,6 +1597,9 @@ Dashboard 的 `accountUsage[]` 由后端提供 `usageWindow`、`metricLabel`、`
 滚动窗口使用相应时间范围的本地用量，独立于 Dashboard 的今日统计范围
 
 ### 请求字段与筛选
+
+Dashboard 默认 `period=today`，用量、诊断和错误查询默认 `period=7d`，范围参数遵循[页面时间合同](#页面时间合同)。
+Dashboard 返回原始 `asOf` 及 `asOfDisplay`，作为当前数据的查询锚点
 
 用量查询可组合页码/游标、时间范围、Provider、Client Key、账号、模型、route、transport、状态码、
 request/response/upstream ID、outcome 与搜索文本。诊断 `dimension` 可取 `model`、`account`、

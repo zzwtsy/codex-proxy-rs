@@ -151,11 +151,13 @@ struct SystemOperationStateView {
     message: Option<String>,
     error: Option<String>,
     started_at: Option<String>,
+    started_at_display: Option<String>,
     finished_at: Option<String>,
+    finished_at_display: Option<String>,
 }
 
-impl From<SystemOperationState> for SystemOperationStateView {
-    fn from(operation: SystemOperationState) -> Self {
+impl From<(SystemOperationState, crate::time::TimePresenter)> for SystemOperationStateView {
+    fn from((operation, time): (SystemOperationState, crate::time::TimePresenter)) -> Self {
         Self {
             operation_id: operation.operation_id,
             kind: operation.kind.map(operation_kind_name),
@@ -163,7 +165,15 @@ impl From<SystemOperationState> for SystemOperationStateView {
             target_version: operation.target_version,
             message: operation.message,
             error: operation.error,
+            started_at_display: operation
+                .started_at
+                .as_ref()
+                .map(|value| time.datetime(value)),
             started_at: operation.started_at.map(|value| value.to_rfc3339()),
+            finished_at_display: operation
+                .finished_at
+                .as_ref()
+                .map(|value| time.datetime(value)),
             finished_at: operation.finished_at.map(|value| value.to_rfc3339()),
         }
     }
@@ -178,13 +188,13 @@ struct SystemUpdateStatusView {
     operation: SystemOperationStateView,
 }
 
-impl From<SystemUpdateStatus> for SystemUpdateStatusView {
-    fn from(status: SystemUpdateStatus) -> Self {
+impl From<(SystemUpdateStatus, crate::time::TimePresenter)> for SystemUpdateStatusView {
+    fn from((status, time): (SystemUpdateStatus, crate::time::TimePresenter)) -> Self {
         Self {
             previous_version: status.previous_version,
             current_version: status.current_version,
             need_restart: status.need_restart,
-            operation: status.operation.into(),
+            operation: SystemOperationStateView::from((status.operation, time)),
         }
     }
 }
@@ -224,6 +234,7 @@ struct SystemUpdateEventView {
     terminal: bool,
     progress_percent: Option<u8>,
     at: String,
+    at_display: String,
 }
 
 /// 构造固定 GET/POST 系统管理路由。
@@ -291,13 +302,16 @@ async fn update_event_stream<S>(
 where
     S: SessionState + Send + Sync,
 {
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let stream = state
         .admin_services()
         .system()
         .update_events()
-        .map(|message| {
+        .map(move |message| {
             let id = message.id.clone();
-            let data = SystemUpdateEventView::from(message).into_json().to_string();
+            let data = SystemUpdateEventView::from((message, time))
+                .into_json()
+                .to_string();
             Ok(Event::default().event("update").id(id).data(data))
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
@@ -347,6 +361,7 @@ async fn update_status<S>(
 where
     S: SessionState + Send + Sync,
 {
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let status = state
         .admin_services()
         .system()
@@ -355,7 +370,7 @@ where
         .map_err(map_system_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(SystemUpdateStatusView::from(status)),
+        AdminEnvelope::ok(SystemUpdateStatusView::from((status, time))),
     ))
 }
 
@@ -445,8 +460,8 @@ where
     ))
 }
 
-impl From<SystemUpdateEvent> for SystemUpdateEventView {
-    fn from(event: SystemUpdateEvent) -> Self {
+impl From<(SystemUpdateEvent, crate::time::TimePresenter)> for SystemUpdateEventView {
+    fn from((event, time): (SystemUpdateEvent, crate::time::TimePresenter)) -> Self {
         Self {
             id: event.id,
             operation_id: event.operation_id,
@@ -455,6 +470,7 @@ impl From<SystemUpdateEvent> for SystemUpdateEventView {
             message: event.message,
             terminal: event.terminal,
             progress_percent: event.progress_percent,
+            at_display: time.time(&event.occurred_at),
             at: event.occurred_at.to_rfc3339(),
         }
     }
@@ -470,7 +486,7 @@ impl SystemUpdateEventView {
             "message": self.message,
             "terminal": self.terminal,
             "progressPercent": self.progress_percent,
-            "at": self.at,
+            "at": self.at, "atDisplay": self.at_display,
         })
     }
 }

@@ -529,6 +529,7 @@ impl Environment {
             ClientConfig::default(),
             self.store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
+                timezone: Default::default(),
                 service_middleware: {
                     let snapshots = core.snapshots();
                     let middleware = runtime.middleware_registry();

@@ -8,7 +8,6 @@ import UsageClientIpCell from '@/views/usage/components/UsageClientIpCell.vue'
 import UsageLatencyCell from '@/views/usage/components/UsageLatencyCell.vue'
 import UsageTokenCell from '@/views/usage/components/UsageTokenCell.vue'
 import UsageTransportBadge from '@/views/usage/components/UsageTransportBadge.vue'
-import { keyUsageTime } from '../utils/format'
 
 defineProps<{ rows: KeyUsageRecord[], pagination: Pagination, loading: boolean, error: string, stale: boolean }>()
 defineEmits<{ pageChange: [page: number], pageSizeChange: [size: number] }>()
@@ -65,7 +64,7 @@ const columns = computed(() => defineTableColumns<KeyUsageRecord>([
           <span class="font-mono text-cp-sm font-bold text-cp-error-text">{{ row.statusCode ?? '错误' }}</span>
         </template>
         <template #createdAt="{ row }">
-          {{ keyUsageTime(row.createdAt) }}
+          {{ row.createdAtDisplay }}
         </template>
         <template #clientIp="{ row }">
           <UsageClientIpCell :record="row" />

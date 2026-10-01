@@ -268,6 +268,7 @@ impl AdminHarness {
                 Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
+                timezone: Default::default(),
                 service_middleware: self.service_middleware,
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),
                 plugin_management: Arc::new(plugins::TestPluginPorts),

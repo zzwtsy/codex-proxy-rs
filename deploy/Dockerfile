@@ -42,7 +42,7 @@ FROM ${POSTGRES_IMAGE} AS pg-client
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime-base
 
-ENV TZ=Asia/Shanghai
+ENV TZ=UTC
 
 # 运行时基础只从 Debian 官方源补 libpq（pg_dump 的动态依赖；ABI 兼容，无需引入第三方
 # APT 源）。pg_dump/pg_restore 二进制由 pg-client stage COPY，构建期不依赖运行时安装。

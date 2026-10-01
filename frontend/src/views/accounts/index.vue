@@ -75,6 +75,7 @@ const {
   showDeleteModal,
   showSingleDeleteModal,
   pendingDeleteAccount,
+  deleteCount,
   recoveringAccountIds,
   refreshingAccountIds,
   refreshingQuotaAccountIds,
@@ -93,6 +94,7 @@ const {
   handleCreate,
   handleAuthorizeOAuth,
   openCreateAccount,
+  clearCreate,
   openReauthorizeAccount,
   requestDeleteAccount,
   handleDelete,
@@ -152,6 +154,7 @@ const {
   modelAccess: batchModelAccess,
   hasChanges: batchHasChanges,
   catalogAccountId: batchCatalogAccountId,
+  editingCount: batchEditingCount,
   proxyMode: batchProxyMode,
   proxyId: batchProxyId,
   selectedGroupIds: batchGroupIds,
@@ -183,8 +186,8 @@ const {
   saving: savingAccountEdit,
   open: openAccountEdit,
   save: saveAccountEdit,
+  clearCredentials,
 } = useAccountEditor({
-  accounts,
   reloadAccounts: loadAccounts,
   reloadGroups: loadGroups,
 })
@@ -294,10 +297,11 @@ const {
                 :status="derivedAccountStatus(row)"
                 :error-reason="row.errorReason"
                 :error-message="row.errorMessage"
-                :rate-limited-until="row.quota.rateLimitedUntil"
+                :rate-limit-recovery-display="row.quota.rateLimitRecoveryDisplay"
                 :rate-limit-reason="row.quota.rateLimitReason"
                 :recovery-probe-required="row.quota.recoveryProbeRequired"
                 :next-refresh-at="row.nextRefreshAt"
+                :next-refresh-at-display="row.nextRefreshAtDisplay"
               />
             </template>
 
@@ -316,7 +320,7 @@ const {
             </template>
 
             <template #lastUsedAt="{ row }">
-              <LastUsedAtCell :value="row.usage.lastUsedAt" />
+              <LastUsedAtCell :value="row.usage.lastUsedAt" :display="row.usage.lastUsedAtDisplay" :full-display="row.usage.lastUsedAtFullDisplay" />
             </template>
 
             <template #actions="{ row }">
@@ -392,6 +396,7 @@ const {
       @select="importTasks.select"
       @refresh="importTasks.refresh"
       @stop="importTasks.stop"
+      @after-leave="importTasks.refresh(true)"
       @view-accounts="showImportTasks = false; loadAccounts()"
     />
 
@@ -408,6 +413,7 @@ const {
       :saving="creatingAccount"
       @create="handleCreate"
       @generate-oauth="handleAuthorizeOAuth"
+      @after-leave="clearCreate"
     />
 
     <AccountEditModal
@@ -429,6 +435,7 @@ const {
       :groups-loading="groupsLoading"
       :saving="savingAccountEdit"
       @save="saveAccountEdit"
+      @after-leave="clearCredentials"
     />
 
     <AccountBatchEditModal
@@ -441,7 +448,7 @@ const {
       v-model:proxy-id="batchProxyId"
       v-model:selected-group-ids="batchGroupIds"
       :catalog-account-id="batchCatalogAccountId"
-      :selected-count="selectedIds.size"
+      :selected-count="batchEditingCount"
       :groups="groups"
       :groups-loading="groupsLoading"
       :saving="savingBatchEdit"
@@ -459,7 +466,7 @@ const {
       @confirm="handleBatchDelete"
     >
       <p class="m-0">
-        确定要删除选中的 {{ selectedIds.size }} 个账号吗？此操作不可撤销
+        确定要删除选中的 {{ deleteCount }} 个账号吗？此操作不可撤销
       </p>
     </BaseConfirmModal>
 

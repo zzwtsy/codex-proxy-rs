@@ -23,10 +23,11 @@ export function usePluginUpdateCheck(credentials: Ref<PluginSourceCredential[]>,
   const result = shallowRef<PluginUpdateSelection | null>(null)
   let controller: AbortController | undefined
 
-  function cancel() {
+  function cancel(resetLoading = true) {
     controller?.abort()
     controller = undefined
-    checking.value = false
+    if (resetLoading)
+      checking.value = false
   }
 
   async function check(target: InstalledPlugin) {
@@ -96,8 +97,8 @@ export function usePluginUpdateCheck(credentials: Ref<PluginSourceCredential[]>,
 
   watch(open, (value) => {
     if (!value)
-      cancel()
-  })
+      cancel(false)
+  }, { flush: 'sync' })
   onScopeDispose(cancel)
   return { open, checking, plugin, result, check }
 }

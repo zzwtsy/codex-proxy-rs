@@ -14,6 +14,7 @@ pub struct SettingsValues {
     pub(crate) max_waiting_per_key: u32,
     pub(crate) max_waiting_per_account: u32,
     pub(crate) concurrency_wait_timeout_seconds: u32,
+    pub(crate) openai_guardian_reserved_concurrency: u32,
     pub(crate) responses_max_decompressed_body_bytes: u64,
     pub(crate) request_interval_ms: u64,
     pub(crate) smart_scheduling: crate::account::SmartSchedulingConfig,
@@ -24,6 +25,12 @@ pub struct SettingsValues {
 }
 
 impl SettingsValues {
+    #[must_use]
+    pub const fn with_openai_guardian_reserved_concurrency(mut self, reserved: u32) -> Self {
+        self.openai_guardian_reserved_concurrency = reserved;
+        self
+    }
+
     #[must_use]
     pub fn request_profiles(&self) -> &BTreeMap<ProviderKind, crate::account::OpaqueProviderData> {
         &self.request_profiles
@@ -104,6 +111,7 @@ impl SettingsValues {
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
+            openai_guardian_reserved_concurrency: 0,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             request_interval_ms,
             smart_scheduling: crate::account::SmartSchedulingConfig::default(),

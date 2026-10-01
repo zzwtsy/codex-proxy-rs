@@ -146,6 +146,14 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
     .fetch_one(&first)
     .await
     .expect("load runtime PostgreSQL session settings");
+    let timezone: String = sqlx::query_scalar("show time zone")
+        .fetch_one(&first)
+        .await
+        .unwrap();
+    assert_eq!(
+        timezone, "UTC",
+        "runtime sessions use an explicit technical time basis"
+    );
     let first_tables = sqlx::query_scalar::<_, String>(
         "select table_name
          from information_schema.tables
@@ -226,6 +234,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "_sqlx_migrations",
             "account_group_accounts",
             "account_groups",
+            "account_warmup_slots",
             "admin_audit_events",
             "admin_users",
             "authorization_receipts",

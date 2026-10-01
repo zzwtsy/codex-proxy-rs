@@ -230,6 +230,7 @@ impl GrokAccountSessionSelector {
                 round_robin_cursor: scheduling.round_robin_cursor(),
                 eligibility: request.eligibility(),
                 account_scope: (!diagnostic).then(|| Arc::clone(request.account_scope())),
+                reserved_concurrency: 0,
             };
             let wait_candidates = AccountSelector.wait_candidates(&candidates, &context);
             let capacity_context = context.clone();

@@ -7,7 +7,7 @@ import PluginHelpPopover from './PluginHelpPopover.vue'
 import PluginResourcePicker from './PluginResourcePicker.vue'
 import PluginScopeInput from './PluginScopeInput.vue'
 
-const props = defineProps<{ metadata: PluginArtifactMetadata, disabled?: boolean }>()
+const props = withDefaults(defineProps<{ metadata: PluginArtifactMetadata, disabled?: boolean, active?: boolean }>(), { active: true })
 const emit = defineEmits<{ validityChange: [valid: boolean] }>()
 const bindings = defineModel<PluginCapabilityBinding[]>({ required: true })
 const entries = computed(() => pluginRequestBindingEntries(props.metadata).map(entry => ({ ...entry, key: keyOf(entry) })))
@@ -80,10 +80,10 @@ watch(valid, value => emit('validityChange', value), { immediate: true })
         </div>
         <div v-if="entry.scope !== 'none' && !globalScopes.has(entry.key)" class="grid gap-4 sm:grid-cols-2">
           <BaseFormItem label="客户端 Key">
-            <PluginResourcePicker :model-value="bindingFor(entry.key)!.clientKeyIds" kind="keys" :disabled="disabled" @update:model-value="patch(entry.key, { clientKeyIds: $event })" />
+            <PluginResourcePicker :model-value="bindingFor(entry.key)!.clientKeyIds" kind="keys" :active="active" :disabled="disabled" @update:model-value="patch(entry.key, { clientKeyIds: $event })" />
           </BaseFormItem>
           <BaseFormItem label="账号分组">
-            <PluginResourcePicker :model-value="bindingFor(entry.key)!.accountGroupIds" kind="groups" :disabled="disabled" @update:model-value="patch(entry.key, { accountGroupIds: $event })" />
+            <PluginResourcePicker :model-value="bindingFor(entry.key)!.accountGroupIds" kind="groups" :active="active" :disabled="disabled" @update:model-value="patch(entry.key, { accountGroupIds: $event })" />
           </BaseFormItem>
           <PluginScopeInput :model-value="bindingFor(entry.key)!.models" label="模型范围" placeholder="每行一个模型名称，精确匹配" :class="entry.scope === 'model' ? 'sm:col-span-2' : undefined" :disabled="disabled" @update:model-value="patch(entry.key, { models: $event })" />
           <PluginScopeInput v-if="entry.scope === 'provider'" :model-value="bindingFor(entry.key)!.providerIds" label="Provider 范围" placeholder="每行一个 Provider 标识" :disabled="disabled" @update:model-value="patch(entry.key, { providerIds: $event })" />

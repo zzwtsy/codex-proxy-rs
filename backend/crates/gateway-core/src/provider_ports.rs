@@ -936,6 +936,19 @@ fn invalid_refresh_policy(operation: &'static str) -> ProviderStoreError {
 }
 
 pub trait ProviderRuntimePolicyPort: Send + Sync {
+    /// 原子领取每日时间槽，跨进程重启与重复本地时刻保持幂等。
+    fn claim_warmup_slot<'a>(
+        &'a self,
+        _timezone: crate::time::DeploymentTimeZone,
+        _slot: chrono::NaiveDateTime,
+    ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
+        Box::pin(async {
+            Err(ProviderStoreError::new(
+                ProviderStoreErrorKind::Unavailable,
+                "claim warmup slot",
+            ))
+        })
+    }
     /// 仅首次启动写入该 Provider 的默认选择；已保存的管理配置始终优先。
     fn initialize_request_profile<'a>(
         &'a self,

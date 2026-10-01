@@ -187,6 +187,7 @@ pub enum AdminConfigError {
 /// 字段全部私有；调用方经 accessor 直接调用能力，不需要命名内部 `use_case` 模块。
 #[derive(Clone)]
 pub struct AdminServices {
+    timezone: gateway_core::time::DeploymentTimeZone,
     public_services: Arc<service::Registry>,
     plugins: Arc<PluginsService>,
     plugin_management: Arc<PluginManagementService>,
@@ -207,6 +208,11 @@ pub struct AdminServices {
 }
 
 impl AdminServices {
+    #[must_use]
+    pub const fn timezone(&self) -> gateway_core::time::DeploymentTimeZone {
+        self.timezone
+    }
+
     pub fn public_services(&self) -> Arc<service::Registry> {
         self.public_services.clone()
     }
@@ -318,6 +324,7 @@ impl AdminBundle {
 
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入。
 pub struct AdminRuntimePorts {
+    pub timezone: gateway_core::time::DeploymentTimeZone,
     pub service_middleware: service::PlanSource,
     pub plugin_preparation: Arc<dyn ports::plugins::PluginPreparation>,
     pub plugin_management: Arc<dyn ports::plugin_management::PluginManagement>,
@@ -367,6 +374,7 @@ async fn initialize_inner(
     plugin_accounts: Option<Arc<dyn PluginAccountAccess>>,
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
+        timezone,
         service_middleware,
         plugin_preparation,
         plugin_management,
@@ -413,12 +421,14 @@ async fn initialize_inner(
         backup_ports.object_store(),
         store.auth(),
         snapshot.clone(),
+        timezone,
     ));
     let backup_task = backup::task::BackupTask::new(
         backup_ports.repository(),
         backup_ports.dump(),
         backup_ports.object_store(),
-    );
+    )
+    .with_timezone(timezone);
     let system_preflight = Arc::new(use_case::plugin_update::PluginSystemUpdatePreflight::new(
         store.plugins(),
         plugin_inspector.clone(),
@@ -431,6 +441,7 @@ async fn initialize_inner(
         store.client_keys(),
         store.observability(),
         system.clone(),
+        timezone,
     ));
     let credentials = Arc::new(CredentialsService::new(
         registry.clone(),
@@ -452,6 +463,7 @@ async fn initialize_inner(
     let mut public_services = service::Registry::new(service_middleware);
     public_services.register_settings(&settings)?;
     let services = AdminServices {
+        timezone,
         public_services: Arc::new(public_services),
         plugin_management: Arc::new(PluginManagementService::new(
             plugin_management,
@@ -492,6 +504,7 @@ async fn initialize_inner(
             store.accounts(),
             store.settings(),
             registry.clone(),
+            timezone,
         )),
         settings,
         system,

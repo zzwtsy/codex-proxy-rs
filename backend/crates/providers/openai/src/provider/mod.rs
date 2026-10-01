@@ -182,13 +182,11 @@ impl CodexProvider {
     fn prepare_generate_request(
         &self,
         generate: &GenerateRequest,
-        upstream_model: &UpstreamModelId,
+        mut upstream: CodexResponsesRequest,
         context: &AttemptContext,
-    ) -> Result<PreparedGenerateRequest, ProviderError> {
+    ) -> PreparedGenerateRequest {
         let previous_session = decode_openai_session_state(generate);
         let continuation_requested = generate.native_continuation_requested();
-        let mut upstream = encode_generate_request(generate, upstream_model.as_str(), None)
-            .map_err(map_request_error)?;
         if let Some(conversation_id) = previous_session
             .as_ref()
             .and_then(|state| state.conversation_id.as_ref())
@@ -215,13 +213,13 @@ impl CodexProvider {
             derive_codex_session_affinity(&upstream, context.client_api_key_ref());
         let cyber_policy_session_key =
             derive_codex_cyber_policy_session_key(&upstream, context.client_api_key_ref());
-        Ok(PreparedGenerateRequest {
+        PreparedGenerateRequest {
             upstream,
             previous_session,
             continuation_requested,
             session_affinity,
             cyber_policy_session_key,
-        })
+        }
     }
 
     fn client_for_request(
@@ -276,6 +274,15 @@ impl CodexProvider {
             session_transport_recovery: CodexSessionTransportRecovery::default(),
             stream_max_retries,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn with_timezone(
+        mut self,
+        timezone: gateway_core::time::DeploymentTimeZone,
+    ) -> Self {
+        self.client = self.client.with_timezone(timezone);
+        self
     }
 
     pub(crate) fn with_session_identity(mut self, identity: CodexSessionIdentity) -> Self {
@@ -508,10 +515,18 @@ impl Provider for CodexProvider {
         }
         // 其他协议必须先取得真实账号，再按固定 attempt 阶段调用转换器；选号前不能
         // 把未知正文当成 OpenAI wire 解释会话、亲和或传输字段。
-        let preselection = (adapter.is_none()
-            && generate.protocol_payload().protocol() == PROVIDER_NAME)
-            .then(|| self.prepare_generate_request(generate, upstream_model, &context))
-            .transpose()?;
+        let upstream = (generate.protocol_payload().protocol() == PROVIDER_NAME)
+            .then(|| encode_generate_request(generate, upstream_model.as_str(), None))
+            .transpose()
+            .map_err(map_request_error)?;
+        // 固定调度约束：Guardian 分类先于选号，不能随原生/适配器发送路径改变。
+        // 复用编码器的权威 metadata 解析，但只为原生路径准备会话与传输状态。
+        let guardian = upstream
+            .as_ref()
+            .is_some_and(CodexResponsesRequest::is_guardian);
+        let preselection = upstream
+            .filter(|_| adapter.is_none())
+            .map(|upstream| self.prepare_generate_request(generate, upstream, &context));
         let (selection_session_affinity, selection_cyber_policy_key, requires_websocket) =
             preselection.map_or((None, None, false), |prepared| {
                 let requires_websocket =
@@ -543,6 +558,7 @@ impl Provider for CodexProvider {
                     selection_cyber_policy_key.as_ref(),
                     selection_session_affinity.as_ref(),
                     requires_websocket,
+                    guardian,
                 )
                 .await
                 .map_err(map_selection_error)
@@ -639,7 +655,9 @@ impl CodexProvider {
             ));
         }
         validate_openai_reasoning(generate.protocol_payload().body())?;
-        let processed = self.prepare_generate_request(&generate, &upstream_model, &context)?;
+        let upstream = encode_generate_request(&generate, upstream_model.as_str(), None)
+            .map_err(map_request_error)?;
+        let processed = self.prepare_generate_request(&generate, upstream, &context);
         let mut upstream_request = processed.upstream;
         let previous_session = processed.previous_session;
         let continuation_requested = processed.continuation_requested;

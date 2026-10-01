@@ -4,7 +4,6 @@ import type { AccountQuotaWindow } from '../../constants'
 import { BasePopover } from '@codex-proxy/ui'
 
 import { computed } from 'vue'
-import { useUiClock } from '@/composables/useUiClock'
 import AccountRequestTimeline from '../AccountUsageWindow/AccountRequestTimeline.vue'
 import AccountUsageWindow from '../AccountUsageWindow/index.vue'
 import { resolveAccountUsageWindowPresentation } from '../AccountUsageWindow/presenter'
@@ -18,7 +17,6 @@ const props = withDefaults(defineProps<{
   showPercentage: true,
 })
 
-const now = useUiClock()
 const detailHeading = computed(() => props.label)
 const detailTitle = computed(() => detailHeading.value ?? props.windows[0]?.labelDisplay ?? '额度详情')
 const summaryLabel = computed(() => props.label ?? props.windows[0]?.labelDisplay ?? '额度')
@@ -29,7 +27,6 @@ const detailItems = computed(() =>
       window,
       variant: 'detail',
       showLocalValue: true,
-      now: now.value.getTime(),
     })
 
     return {

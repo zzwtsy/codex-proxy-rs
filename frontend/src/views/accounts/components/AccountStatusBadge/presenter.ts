@@ -2,7 +2,7 @@ import type { Component } from 'vue'
 import type { AccountErrorReason, AccountStatus } from '@/api'
 import { AlertTriangle, CircleCheck, Gauge, Power, Timer } from '@lucide/vue'
 
-import { formatDateTime, parseTimestamp } from '@/utils/format'
+import { parseTimestamp } from '@/utils/format'
 import { errorReasonLabels, statusLabels, statusTones } from '../../constants'
 
 export type AccountStatusDisplayMode = AccountStatus | 'refresh_backoff'
@@ -45,10 +45,11 @@ export interface AccountStatusPresentationInput {
   status: AccountStatus
   errorReason: AccountErrorReason | null
   errorMessage: string | null
-  rateLimitedUntil: string | null
+  rateLimitRecoveryDisplay: string | null
   rateLimitReason: 'upstream_rate_limit' | 'capacity_freeze' | null
   recoveryProbeRequired: boolean
   nextRefreshAt: string | null
+  nextRefreshAtDisplay: string | null
   now: number
 }
 
@@ -160,14 +161,11 @@ export function resolveAccountStatusPresentation(
           : '冷却结束后自动恢复调度，也可手动恢复账号',
       }
     : displayDefinitions[mode]
-  const nextRefreshDisplay = isBackoff ? formatDateTime(nextRefreshTimestamp) : null
+  const nextRefreshDisplay = isBackoff ? input.nextRefreshAtDisplay : null
   const reasonLabel = input.errorReason ? errorReasonLabels[input.errorReason] : null
   const title = definition.title ?? reasonLabel ?? definition.label
-  const until = input.rateLimitedUntil ? parseTimestamp(input.rateLimitedUntil) : null
   const rateLimitRecovery = mode === 'rate_limited'
-    ? waitsForProbe && until !== null && until <= input.now
-      ? '等待探测成功'
-      : remainingTime(input.rateLimitedUntil, input.now)
+    ? input.rateLimitRecoveryDisplay
     : null
   const recoveryHint = mode !== 'refresh_backoff'
     && mode !== 'rate_limited'
@@ -193,25 +191,4 @@ export function resolveAccountStatusPresentation(
     recoveryTimeLabel: waitsForProbe ? '恢复探测' : '预计恢复',
     triggerLabel,
   }
-}
-
-function remainingTime(value: string | null, now: number) {
-  if (!value)
-    return null
-
-  const until = parseTimestamp(value)
-  if (until === null)
-    return value
-
-  const minutes = Math.round((until - now) / 60_000)
-  if (minutes < 1)
-    return value
-  if (minutes < 60)
-    return `剩余 ${minutes} 分钟`
-
-  const hours = Math.floor(minutes / 60)
-  const remainingMinutes = minutes % 60
-  return remainingMinutes === 0
-    ? `剩余 ${hours} 小时`
-    : `剩余 ${hours} 小时 ${remainingMinutes} 分`
 }

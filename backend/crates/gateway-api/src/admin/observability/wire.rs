@@ -394,20 +394,12 @@ pub struct DashboardAccountUsageView {
     pub plan_type_display: String,
     pub tokens: String,
     pub request_count: u64,
-    pub request_buckets: Vec<DashboardAccountRequestBucketView>,
+    pub request_buckets: Vec<crate::time::RequestBucketView>,
     pub quota_used_percent: Option<f64>,
     pub usage_window: Option<crate::admin::accounts::AccountQuotaWindowView>,
     pub metric_label: String,
     pub metric_value: String,
     pub last_used: String,
-}
-
-/// Dashboard 账号单小时请求数。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DashboardAccountRequestBucketView {
-    pub bucket_start: DateTime<Utc>,
-    pub request_count: u64,
 }
 
 /// Provider 账号池的持久事实汇总。
@@ -470,6 +462,7 @@ pub struct AttemptMetricsView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthTimelinePointView {
+    pub bucket_start: DateTime<Utc>,
     pub time: String,
     pub status: String,
     pub reliability_display: String,
@@ -510,6 +503,7 @@ pub struct DashboardWireProfileView {
     pub attributes: Vec<DashboardWireAttributeView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<DateTime<Utc>>,
+    pub verified_at_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release: Option<DashboardDesktopReleaseView>,
 }
@@ -537,6 +531,7 @@ pub struct DashboardDesktopReleaseView {
     pub status: DashboardDesktopReleaseStatusView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<DateTime<Utc>>,
+    pub checked_at_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -570,6 +565,8 @@ impl From<domain::DesktopReleaseStatus> for DashboardDesktopReleaseStatusView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardDataView {
+    pub as_of: DateTime<Utc>,
+    pub as_of_display: String,
     pub cards: DashboardCardsView,
     pub trend: TrendData,
     pub health_timeline: HealthTimelineView,

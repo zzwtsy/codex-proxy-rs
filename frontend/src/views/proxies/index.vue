@@ -8,7 +8,6 @@ import { createProxy, deleteProxy, getProxies, probeProxy, testProxy, updateProx
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { usePagedQuery } from '@/composables/usePagedQuery'
 import { normalizeRequestLocation, requestLocationError } from '@/utils/data'
-import { formatDateTime } from '@/utils/format'
 import ProxyAccountsModal from './components/ProxyAccountsModal.vue'
 import ProxyFormModal from './components/ProxyFormModal.vue'
 import { effectiveProxyLocation } from './utils/location'
@@ -192,7 +191,6 @@ async function save() {
           location,
         }))
     showForm.value = false
-    form.proxyUrl = ''
     toast.success('代理已保存')
     search.value = ''
     query.page.value = 1
@@ -231,11 +229,10 @@ watch(() => form.proxyUrl, () => {
   formTestResult.value = null
 })
 
-watch(showForm, (open) => {
-  if (!open) {
-    form.proxyUrl = ''
-  }
-})
+function clearCredentials() {
+  form.proxyUrl = ''
+}
+
 watchDebounced(search, () => setPage(1), { debounce: 300 })
 onMounted(() => void query.execute())
 </script>
@@ -316,7 +313,7 @@ onMounted(() => void query.execute())
               </button>
             </template>
             <template #testedAt="{ row }">
-              {{ row.lastTestAt ? formatDateTime(row.lastTestAt) : '-' }}
+              {{ row.lastTestAtDisplay ?? '-' }}
             </template>
             <template #actions="{ row }">
               <div class="flex items-center gap-1">
@@ -351,6 +348,7 @@ onMounted(() => void query.execute())
       @save="save"
       @test="testConnection"
       @detect-location="detectLocation"
+      @after-leave="clearCredentials"
     />
     <BaseConfirmModal v-model="showDelete" title="删除代理" destructive :loading="deleting" @confirm="confirmDelete">
       <p class="m-0">

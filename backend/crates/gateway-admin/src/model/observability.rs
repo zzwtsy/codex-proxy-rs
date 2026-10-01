@@ -2,18 +2,27 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, TimeDelta, Timelike as _, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use super::{AdminModelError, PageSize};
 
-/// 观测日界所用的东八区(UTC+8)固定偏移秒数。
-const CHINA_OFFSET_SECONDS: i64 = 8 * 60 * 60;
+/// 页面筛选表达自然日范围，具体 UTC 边界由部署时区解析。
+#[derive(Debug, Clone, Copy)]
+pub enum CalendarPeriod {
+    Today,
+    SevenDays,
+    ThirtyDays,
+}
 
-/// 将 UTC 时刻截断到东八区(UTC+8)当日零点,返回值仍为 UTC。
-#[must_use]
-pub fn china_day_start(value: DateTime<Utc>) -> DateTime<Utc> {
-    let elapsed = (value.timestamp() + CHINA_OFFSET_SECONDS).rem_euclid(24 * 60 * 60);
-    value - TimeDelta::seconds(elapsed) - TimeDelta::nanoseconds(i64::from(value.nanosecond()))
+impl CalendarPeriod {
+    pub fn parse(value: &str) -> Result<Self, AdminModelError> {
+        match value {
+            "today" => Ok(Self::Today),
+            "7d" => Ok(Self::SevenDays),
+            "30d" => Ok(Self::ThirtyDays),
+            _ => Err(AdminModelError::InvalidTimeRange),
+        }
+    }
 }
 
 /// 外部观测查询的 UTC 时间范围。
@@ -24,6 +33,25 @@ pub struct TimeRange {
 }
 
 impl TimeRange {
+    pub fn calendar_at(
+        period: CalendarPeriod,
+        end: DateTime<Utc>,
+        timezone: gateway_core::time::DeploymentTimeZone,
+    ) -> Result<Self, AdminModelError> {
+        let days = match period {
+            CalendarPeriod::Today => 0,
+            CalendarPeriod::SevenDays => 6,
+            CalendarPeriod::ThirtyDays => 29,
+        };
+        let start = timezone
+            .days_before(end, days)
+            .ok_or(AdminModelError::InvalidTimeRange)?;
+        // 自然日刚开始时允许空快照，不借用前一天或伪造未来终点。
+        if start == end {
+            return Ok(Self { start, end });
+        }
+        Self::new(start, end)
+    }
     /// 创建最长 366 天的正时间范围。
     ///
     /// # Errors

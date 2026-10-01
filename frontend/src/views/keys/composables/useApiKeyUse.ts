@@ -1,6 +1,6 @@
 import type { Ref, ShallowRef } from 'vue'
 import type { getApiKeys } from '@/api'
-import { computed, shallowRef, watch } from 'vue'
+import { computed, shallowRef } from 'vue'
 
 import { buildCodexCcSwitchImportDeeplink, resolveServiceRootUrl } from '@/utils/client'
 
@@ -49,11 +49,6 @@ export function useApiKeyUse(options: {
       providerName: apiKey.name || apiKey.prefix || 'codex-proxy-rs',
     })
   }
-
-  watch(showUseKeyModal, (open) => {
-    if (!open)
-      selectedUseKey.value = null
-  })
 
   return {
     showUseKeyModal,

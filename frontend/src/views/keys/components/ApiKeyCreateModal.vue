@@ -19,6 +19,8 @@ const emit = defineEmits<{
   save: []
   copy: [text: string]
   importCcs: []
+  afterLeave: []
+  createdAfterLeave: []
 }>()
 const open = defineModel<boolean>({ default: false })
 const createdOpen = defineModel<boolean>('createdOpen', { default: false })
@@ -34,6 +36,7 @@ const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
     tone="info"
     size="lg"
     :dismissible="!saving"
+    @after-leave="emit('afterLeave')"
   >
     <template #icon>
       <KeyRound class="text-cp-text" :size="20" aria-hidden="true" />
@@ -86,7 +89,6 @@ const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
 
       <BaseFormItem label="上游身份">
         <ProviderRequestProfilesEditor
-          v-if="open"
           v-model="form.providerRequestProfileOverrides"
           allow-inherit
           :active="open"
@@ -174,6 +176,7 @@ const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
     description="复制密钥，或直接导入 CCSwitch"
     tone="success"
     size="md"
+    @after-leave="emit('createdAfterLeave')"
   >
     <div class="flex flex-col gap-4">
       <div class="rounded-cp border border-cp-warning-border bg-cp-warning-container px-4 py-3">

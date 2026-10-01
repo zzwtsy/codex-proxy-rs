@@ -57,6 +57,7 @@ const {
   createdKeyName,
   editingKey,
   pendingDeleteKey,
+  deleteCount,
   savingKey,
   deletingKey,
   batchDeleting,
@@ -65,6 +66,8 @@ const {
   form,
   openCreate,
   openEdit,
+  clearCustomKey,
+  clearCreatedKey,
   requestSave,
   confirmAllAccountsScope,
   requestDeleteKey,
@@ -184,7 +187,7 @@ watch(
               <ApiKeyStatusBadge :api-key="row" />
             </template>
             <template #lastUsedAt="{ row }">
-              <LastUsedAtCell :value="row.lastUsedAt" />
+              <LastUsedAtCell :value="row.lastUsedAt" :display="row.lastUsedAtDisplay" :full-display="row.lastUsedAtFullDisplay" />
             </template>
             <template #actions="{ row }">
               <ApiKeyActions
@@ -223,6 +226,8 @@ watch(
       @copy="copyToClipboard"
       @save="requestSave"
       @import-ccs="importCreatedKeyToCcs"
+      @after-leave="clearCustomKey"
+      @created-after-leave="clearCreatedKey"
     />
 
     <ApiKeyBudgetResetModal
@@ -236,6 +241,7 @@ watch(
       :api-key="selectedUseKey"
       :api-base-url="openAiBaseUrl"
       @copy="copyToClipboard"
+      @after-leave="selectedUseKey = null"
     />
 
     <BaseConfirmModal
@@ -261,7 +267,7 @@ watch(
       @confirm="handleBatchDelete"
     >
       <p class="m-0">
-        确定删除选中的 {{ selectedIds.size }} 个 API Key 吗？
+        确定删除选中的 {{ deleteCount }} 个 API Key 吗？
       </p>
     </BaseConfirmModal>
 

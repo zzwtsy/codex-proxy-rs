@@ -31,13 +31,16 @@ export function useAccountOnboarding(options: {
     get: () => createModalOpen.value,
     set: (value: boolean) => {
       createModalOpen.value = value
-      if (!value) {
-        authorization.reset()
-        reauthorizingAccount.value = null
-        createForm.value = emptyAccountCreateForm()
-      }
+      if (!value)
+        authorization.cancel()
     },
   })
+
+  function clearCreate() {
+    authorization.reset()
+    reauthorizingAccount.value = null
+    createForm.value = emptyAccountCreateForm()
+  }
 
   function requireImportProvider(provider: string | undefined) {
     if (!provider)
@@ -177,5 +180,6 @@ export function useAccountOnboarding(options: {
     handleAuthorizeOAuth,
     openCreateAccount,
     openReauthorizeAccount,
+    clearCreate,
   }
 }

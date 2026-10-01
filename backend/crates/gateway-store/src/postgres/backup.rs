@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use gateway_admin::model::audit::MutationAuditOperation;
 use secrecy::{ExposeSecret as _, SecretString};
-use sqlx::{PgPool, Postgres, Row as _, Transaction};
+use sqlx::{Acquire as _, PgPool, Postgres, Row as _, Transaction};
 
 use gateway_admin::model::backup::{
     BackupRecord, BackupRecordListQuery, BackupRecordPage, BackupRecordSeed, BackupSettings,
@@ -155,6 +155,7 @@ impl BackupRepository for PgBackupRepository {
         command: UpdateBackupScheduleCommand,
         next_run_at: Option<DateTime<Utc>>,
         context: &MutationContext,
+        timezone: gateway_core::time::DeploymentTimeZone,
     ) -> AdminStoreResult<BackupSettings> {
         let mut transaction = self
             .pool
@@ -175,7 +176,7 @@ impl BackupRepository for PgBackupRepository {
             )
             .bind(command.schedule_enabled)
             .bind(&command.cron_expression)
-            .bind(&command.schedule_timezone)
+            .bind(timezone.name())
             .bind(i64::from(command.retention_days))
             .bind(i64::from(command.retention_count))
             .bind(next_run_at)
@@ -266,35 +267,78 @@ impl BackupRepository for PgBackupRepository {
         }
     }
 
-    async fn insert_scheduled_record(&self, seed: BackupRecordSeed) -> AdminStoreResult<bool> {
+    async fn insert_scheduled_record(
+        &self,
+        seed: BackupRecordSeed,
+        next_run_at: Option<DateTime<Utc>>,
+        expected_cron: &str,
+        expected_timezone: &str,
+        expected_next_run_at: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool> {
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(|_| store_unavailable("begin scheduled insert"))?;
-        match insert_queued_in_transaction(&mut transaction, &seed).await {
+        // 先锁定并核对计划，防止配置变更后仍排入旧计划任务。
+        let advanced = sqlx::query(
+            "update backup_settings set next_run_at = $1
+             where id = 1 and schedule_enabled and cron_expression = $2
+               and schedule_timezone = $3 and next_run_at is not distinct from $4",
+        )
+        .bind(next_run_at)
+        .bind(expected_cron)
+        .bind(expected_timezone)
+        .bind(expected_next_run_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| store_unavailable("guard scheduled insert"))?
+        .rows_affected()
+            > 0;
+        if !advanced {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| store_unavailable("rollback stale schedule"))?;
+            return Ok(false);
+        }
+        // 唯一约束冲突只跳过本次任务；保存点避免连带撤销游标推进。
+        let mut insertion = transaction
+            .begin()
+            .await
+            .map_err(|_| store_unavailable("begin scheduled savepoint"))?;
+        let inserted = match insert_queued_in_transaction(&mut insertion, &seed).await {
             Ok(_) => {
-                transaction
+                insertion
                     .commit()
                     .await
-                    .map_err(|_| store_unavailable("commit scheduled insert"))?;
-                Ok(true)
+                    .map_err(|_| store_unavailable("release scheduled savepoint"))?;
+                true
             }
             Err(error) if is_active_or_scheduled_conflict(&error) => {
-                transaction
+                insertion
                     .rollback()
                     .await
-                    .map_err(|_| store_unavailable("rollback scheduled insert"))?;
-                Ok(false)
+                    .map_err(|_| store_unavailable("rollback scheduled savepoint"))?;
+                false
             }
             Err(error) => {
+                insertion
+                    .rollback()
+                    .await
+                    .map_err(|_| store_unavailable("rollback scheduled savepoint"))?;
                 transaction
                     .rollback()
                     .await
                     .map_err(|_| store_unavailable("rollback scheduled insert"))?;
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|_| store_unavailable("commit scheduled insert"))?;
+        Ok(inserted)
     }
 
     async fn list_backup_records(
@@ -537,19 +581,24 @@ impl BackupRepository for PgBackupRepository {
         &self,
         next_run_at: DateTime<Utc>,
         expected_cron: &str,
-        expected_timezone: &str,
+        expected_timezone: Option<&str>,
+        expected_next_run_at: Option<DateTime<Utc>>,
+        timezone: &str,
     ) -> AdminStoreResult<bool> {
         let result = sqlx::query(
             "update backup_settings
-                set next_run_at = $1
+                set next_run_at = $1, schedule_timezone = $5
               where id = 1
                 and schedule_enabled
                 and cron_expression = $2
-                and schedule_timezone = $3",
+                and schedule_timezone is not distinct from $3
+                and next_run_at is not distinct from $4",
         )
         .bind(next_run_at)
         .bind(expected_cron)
         .bind(expected_timezone)
+        .bind(expected_next_run_at)
+        .bind(timezone)
         .execute(&self.pool)
         .await
         .map_err(|_| store_unavailable("advance backup schedule cursor"))?;

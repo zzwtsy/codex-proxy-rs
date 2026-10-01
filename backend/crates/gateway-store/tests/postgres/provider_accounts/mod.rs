@@ -957,7 +957,7 @@ async fn terminal_admin_usage_chunks_large_selections_and_preserves_exact_costs(
     assert_eq!(usage[0].total_tokens, Some(18));
     assert_eq!(usage[0].costs[0].currency, "USD");
     assert_eq!(usage[0].costs[0].amount.as_str(), "1.2345678901");
-    assert_eq!(usage[0].request_buckets.len(), 2);
+    assert_eq!(usage[0].request_buckets.len(), 24);
     assert_eq!(
         usage[0]
             .request_buckets

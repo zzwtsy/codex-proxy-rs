@@ -89,9 +89,9 @@ async function submit() {
 }
 
 watch(open, async (value) => {
-  secretValues.value = {}
   if (!value)
     return
+  secretValues.value = {}
   configuration.value = cloneJsonValue(props.draft?.configuration ?? props.instance?.configuration ?? {})
   bindings.value = cloneJsonValue(props.draft?.bindings ?? props.instance?.bindings ?? [])
   secretMode.value = existingSecretFields.value.length ? 'preserve' : 'replace'
@@ -102,10 +102,14 @@ watch(open, async (value) => {
   if (props.instance?.configurationRequired)
     await focusConfigurationInvalid()
 }, { immediate: true })
+
+function clearSecrets() {
+  secretValues.value = {}
+}
 </script>
 
 <template>
-  <BaseModal v-model="open" :title="versionChanged ? `切换至 ${artifact?.metadata.version}` : '插件设置'" :description="artifact ? `${artifact.metadata.displayName} · ${artifact.metadata.version}` : undefined" size="lg" :dismissible="!saving">
+  <BaseModal v-model="open" :title="versionChanged ? `切换至 ${artifact?.metadata.version}` : '插件设置'" :description="artifact ? `${artifact.metadata.displayName} · ${artifact.metadata.version}` : undefined" size="lg" :dismissible="!saving" @after-leave="clearSecrets">
     <div v-if="artifact && instance" class="grid gap-5">
       <div v-if="error" role="alert" class="grid gap-1 text-cp-sm text-cp-warning-text">
         <span>{{ error }}</span>
@@ -134,10 +138,12 @@ watch(open, async (value) => {
         />
       </div>
       <PluginBindingEditor
-        v-if="open && hasRequestBindings"
+        v-if="hasRequestBindings"
         v-show="section === 'requests'"
+        :key="`${instance.id}:${artifact.metadata.sha256}`"
         v-model="bindings"
         :metadata="artifact.metadata"
+        :active="open"
         :disabled="saving"
         @validity-change="bindingsValid = $event"
       />

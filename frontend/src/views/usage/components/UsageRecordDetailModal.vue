@@ -477,7 +477,7 @@ const tokenDonutOption = computed<EChartsOption>(() => {
       </section>
     </div>
 
-    <RequestDiagnosticsPanel v-if="open && record" :request-id="record.requestId" />
+    <RequestDiagnosticsPanel v-if="record" :request-id="record.requestId" :active="open" />
 
     <template #footer>
       <BaseButton variant="primary" @click="open = false">

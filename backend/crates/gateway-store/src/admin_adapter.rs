@@ -93,6 +93,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 max_waiting_per_key: command.max_waiting_per_key,
                 max_waiting_per_account: command.max_waiting_per_account,
                 concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
+                openai_guardian_reserved_concurrency: command.openai_guardian_reserved_concurrency,
                 responses_max_decompressed_body_bytes: command
                     .responses_max_decompressed_body_bytes,
                 smart_scheduling: command.smart_scheduling,
@@ -131,6 +132,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                     "max_waiting_per_key".to_owned(),
                     "max_waiting_per_account".to_owned(),
                     "concurrency_wait_timeout_seconds".to_owned(),
+                    "openai_guardian_reserved_concurrency".to_owned(),
                     "responses_max_decompressed_body_bytes".to_owned(),
                     "rotation_strategy".to_owned(),
                     "smart_scheduling_json".to_owned(),
@@ -238,6 +240,7 @@ pub(crate) fn admin_runtime_settings(
         max_waiting_per_key: settings.max_waiting_per_key,
         max_waiting_per_account: settings.max_waiting_per_account,
         concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
+        openai_guardian_reserved_concurrency: settings.openai_guardian_reserved_concurrency,
         responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
         smart_scheduling: settings.smart_scheduling,
         rotation_strategy,

@@ -4,7 +4,7 @@ import { BaseButton, BaseEmpty, BaseScrollbar, BaseSegmented } from '@codex-prox
 import { ArrowUpRight, Check, CircleAlert, Square, X } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
-import { itemDescription, itemStates, outcomeOrder, processed, taskLabel, taskTime } from './presenter'
+import { itemDescription, itemStates, outcomeOrder, processed, taskLabel } from './presenter'
 
 const props = defineProps<{ task: AccountImportTaskDetail, stopping: boolean }>()
 const emit = defineEmits<{ stop: [], viewAccounts: [] }>()
@@ -37,7 +37,7 @@ watch(hasAttention, (value) => {
           {{ taskLabel(task) }}
         </h3>
         <p class="mt-1 text-xs text-cp-text-secondary">
-          {{ taskTime(task.createdAt) }} 创建
+          {{ task.createdAtDisplay }} 创建
         </p>
       </div>
       <BaseButton

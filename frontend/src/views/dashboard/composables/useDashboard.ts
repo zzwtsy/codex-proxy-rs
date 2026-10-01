@@ -4,7 +4,7 @@ import { useIntervalFn } from '@vueuse/core'
 import { computed, onMounted, onScopeDispose, shallowRef } from 'vue'
 
 import { getDashboardSummary, getDashboardTrend } from '@/api'
-import { formatCompactNumber, formatDateTime, formatInteger } from '@/utils/format'
+import { formatCompactNumber, formatInteger } from '@/utils/format'
 import { errorMessage, withMinimumDuration } from '@/utils/operation'
 
 export function useDashboard() {
@@ -16,6 +16,7 @@ export function useDashboard() {
   const loading = shallowRef(false)
   const refreshing = shallowRef(false)
   const lastRefreshedAt = shallowRef('')
+  let rangeAsOf = Date.now()
   let trendRequestId = 0
   let disposed = false
   let summaryController: AbortController | undefined
@@ -82,7 +83,7 @@ export function useDashboard() {
     trendLoading.value = true
     trendError.value = ''
     try {
-      const result = await getDashboardTrend({ kind: trendKind }, { signal: trendController.signal })
+      const result = await getDashboardTrend({ kind: trendKind, period: 'today', asOf: rangeAsOf }, { signal: trendController.signal })
       if (isCurrentTrendRequest(requestId, trendKind))
         trend.value = result
     }
@@ -98,6 +99,7 @@ export function useDashboard() {
 
   async function loadDashboardSnapshot(silent = false) {
     const trendKind = activeTrendKind.value
+    const asOf = Date.now()
     const requestId = ++trendRequestId
     trendController?.abort()
     summaryController = new AbortController()
@@ -107,14 +109,19 @@ export function useDashboard() {
       trendError.value = ''
     }
     try {
-      const summary = await getDashboardSummary({ kind: trendKind }, { silent, signal: summaryController.signal })
+      const summary = await getDashboardSummary({ kind: trendKind, period: 'today', asOf }, { silent, signal: summaryController.signal })
       if (disposed)
         return
+      rangeAsOf = asOf
       snapshot.value = dashboardSnapshotView(summary)
-      lastRefreshedAt.value = formatDateTime()
+      lastRefreshedAt.value = summary.asOfDisplay
       if (isCurrentTrendRequest(requestId, trendKind)) {
         trend.value = summary.trend
         trendError.value = ''
+      }
+      else {
+        // 快照加载期间切换指标时，用已提交快照的同一锚点重新查询趋势。
+        void loadTrend(activeTrendKind.value)
       }
     }
     catch (error: unknown) {

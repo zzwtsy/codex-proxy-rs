@@ -1339,6 +1339,7 @@ fn contract_account_scope() -> Arc<FrozenAccountScope> {
         "acct_continuation_prefetch",
         "acct_disabled_scheduling",
         "acct_first_event_latency",
+        "acct_guardian",
         "acct_header_new",
         "acct_header_old",
         "acct_header_same",

@@ -90,6 +90,18 @@ impl AccountConcurrency {
             Self::Limited(limit) => Some(limit),
         }
     }
+
+    /// 扣除当前请求不可占用的预留名额；不限并发不受影响，有限上限至少保留 1 个名额。
+    #[must_use]
+    pub const fn excluding_reserved(self, reserved: u32) -> Self {
+        match self {
+            Self::Unlimited => Self::Unlimited,
+            Self::Limited(limit) => match NonZeroU32::new(limit.get().saturating_sub(reserved)) {
+                Some(remaining) => Self::Limited(remaining),
+                None => Self::Limited(NonZeroU32::MIN),
+            },
+        }
+    }
 }
 
 impl From<NonZeroU32> for AccountConcurrency {

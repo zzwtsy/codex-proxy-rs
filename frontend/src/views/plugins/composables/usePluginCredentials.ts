@@ -36,7 +36,6 @@ export function usePluginCredentials({ credentials, refresh, notifyError, runAct
     try {
       await deletePluginSourceCredential({ id: credential.id }, { silent: true })
       showCredentialDelete.value = false
-      pendingCredential.value = null
       toast.success('来源凭据已删除')
       await refresh(true)
     }

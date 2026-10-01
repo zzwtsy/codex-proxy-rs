@@ -60,7 +60,7 @@ const { profile, subscription, loading, error, load } = useAccountPersonalInfo({
           surface="none"
         />
         <template v-else>
-          <AccountProfileTokenActivity :daily-usage="profile.dailyUsage" />
+          <AccountProfileTokenActivity :calendar="profile.activityCalendar" />
           <AccountProfileActivityInsights :insights="profile.activityInsights" />
         </template>
         <p v-if="error" role="status" class="m-0 text-cp-sm text-cp-warning">

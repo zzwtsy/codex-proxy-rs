@@ -15,6 +15,8 @@ pub(crate) const X_CODEX_TURN_STATE_CLIENT_METADATA_KEY: &str = "x-codex-turn-st
 /// 本地生成 history unavailable 错误时使用的官方提示文本。
 pub(crate) const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE: &str =
     "Previous response was not found. Retrying the full request.";
+/// Codex 自动审批（Guardian）请求声明的子代理类型。
+const GUARDIAN_SUBAGENT_KIND: &str = "guardian";
 /// Codex Responses 上游请求体。
 ///
 /// 发往上游的 Responses 请求。`body` 持有客户端原始 JSON object，逐字段（含顺序、
@@ -692,6 +694,11 @@ impl CodexResponsesRequest {
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned)
             })
+    }
+
+    /// Codex 执行命令前的 Guardian 自动审批请求；客户端以 `guardian` 子代理类型声明。
+    pub fn is_guardian(&self) -> bool {
+        self.subagent_kind().as_deref() == Some(GUARDIAN_SUBAGENT_KIND)
     }
 
     /// 设置 / 合并 client metadata。

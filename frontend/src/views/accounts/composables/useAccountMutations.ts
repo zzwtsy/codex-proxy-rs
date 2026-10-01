@@ -2,7 +2,6 @@ import type { Ref } from 'vue'
 import type { AccountImportTask, getAccounts } from '@/api'
 import type { RequestOptions } from '@/api/request'
 import { toast } from '@codex-proxy/ui'
-import dayjs from 'dayjs'
 import { computed, ref, shallowReactive, watch } from 'vue'
 import {
   batchUpdateAccounts,
@@ -40,6 +39,7 @@ export function useAccountMutations(options: {
   const showDeleteModal = ref(false)
   const showSingleDeleteModal = ref(false)
   const pendingDeleteAccount = ref<AccountRow | null>(null)
+  const deleteCount = ref(0)
   const recoveringAccounts = useIdSet<string>()
   const refreshingAccounts = useIdSet<string>()
   const refreshingQuotaAccounts = useIdSet<string>()
@@ -56,6 +56,10 @@ export function useAccountMutations(options: {
   const deletingAccount = deletingAccountAction.loading
   const batchDeleting = batchDeletingAction.loading
   const exportingAccounts = exportingAccountsAction.loading
+  watch([showDeleteModal, batchDeleting], ([open, busy]) => {
+    if (open && !busy)
+      deleteCount.value = options.selectedIds.value.size
+  })
   const exportDisabledReason = computed(() => {
     if (options.selectedIds.value.size === 0)
       return ''
@@ -101,7 +105,6 @@ export function useAccountMutations(options: {
         remaining.delete(account.id)
         options.selectedIds.value = remaining
         showSingleDeleteModal.value = false
-        pendingDeleteAccount.value = null
         await loadAccounts()
         toast.success('账号已删除')
       },
@@ -162,7 +165,7 @@ export function useAccountMutations(options: {
           accountIds: selected.join(','),
           confirm: 'export_sensitive_accounts',
         })
-        const fileName = `cpr-accounts-selected-${selected.length}-${dayjs().format('YYYY-MM-DD')}.json`
+        const fileName = payload.fileName
         await downloadJson(payload, fileName)
         toast.success(`已导出 ${selected.length} 个账号`)
       },
@@ -306,6 +309,7 @@ export function useAccountMutations(options: {
     showDeleteModal,
     showSingleDeleteModal,
     pendingDeleteAccount,
+    deleteCount,
     recoveringAccountIds,
     refreshingAccountIds,
     refreshingQuotaAccountIds,

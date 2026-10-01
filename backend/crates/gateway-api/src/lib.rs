@@ -35,6 +35,9 @@ mod middleware;
 pub mod openai;
 mod provider;
 mod session_cookie;
+mod time;
+
+pub use time::{RequestBucketView, TimePresenter};
 
 /// API-owned HTTP 与静态资源配置。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

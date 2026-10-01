@@ -3,204 +3,11 @@ use std::{fs, process::Command};
 use codex_proxy_rs::bootstrap::GatewayConfig;
 use gateway_host::LoadableConfig;
 
-const CONFIG_EXAMPLE: &str = include_str!("../../../../deploy/config.example.yaml");
+const CONFIG_EXAMPLE: &str = include_str!("../../../../../deploy/config.example.yaml");
 const POSTGRES_PASSWORD: &str = "111111111111111111111111111111111111111111111111";
 const REDIS_PASSWORD: &str = "222222222222222222222222222222222222222222222222";
 const ADMIN_PASSWORD: &str = "test-admin-password";
 const TOPOLOGY_CHILD_ENV: &str = "CPR_TEST_TOPOLOGY_CHILD";
-
-#[test]
-fn basic_cli_options_do_not_load_configuration_and_reject_unexpected_arguments() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("deploy")).unwrap();
-    fs::write(directory.path().join("deploy/config.yaml"), "invalid: [").unwrap();
-    for flag in ["--help", "-h", "help", "--version", "-V"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
-            .arg(flag)
-            .current_dir(directory.path())
-            .env_clear()
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{flag}");
-        assert!(!output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
-    }
-    for args in [
-        vec!["unknown"],
-        vec!["--help", "extra"],
-        vec!["serve", "extra"],
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
-            .args(args)
-            .current_dir(directory.path())
-            .env_clear()
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("configuration"));
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn non_utf8_command_is_not_interpreted_as_serve() {
-    use std::os::unix::ffi::OsStringExt as _;
-
-    let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
-        .arg(std::ffi::OsString::from_vec(vec![0xff]))
-        .env_clear()
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("command must be UTF-8"));
-}
-
-#[tokio::test]
-async fn proxy_probe_should_use_provider_custom_ca_for_https_proxies() {
-    use gateway_admin::ports::proxy::ProxyProbe;
-    use gateway_core::account::OutboundProxy;
-    use gateway_host::proxy_probe::HttpProxyProbe;
-    use std::{sync::Arc, time::Duration};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio_rustls::{
-        TlsAcceptor,
-        rustls::{
-            ServerConfig,
-            pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
-        },
-    };
-
-    const CHILD_ENV: &str = "CPR_TEST_PROXY_TLS_DIRECTORY";
-    let Ok(directory) = std::env::var(CHILD_ENV) else {
-        let directory = tempfile::tempdir().unwrap();
-        generate_proxy_test_certificates(directory.path());
-        // 使用子进程隔离环境变量，避免并行测试读取到临时 CA 配置。
-        for ca_env in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
-            let mut child = Command::new(std::env::current_exe().unwrap());
-            child
-                .args([
-                    "--exact",
-                    "bootstrap::proxy_probe_should_use_provider_custom_ca_for_https_proxies",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, directory.path())
-                .env_remove("CODEX_CA_CERTIFICATE")
-                .env_remove("SSL_CERT_FILE")
-                .env(ca_env, directory.path().join("ca.pem"));
-            if ca_env == "CODEX_CA_CERTIFICATE" {
-                child.env(
-                    "SSL_CERT_FILE",
-                    directory.path().join("missing-fallback.pem"),
-                );
-            }
-            let output = child.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{ca_env}: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        return;
-    };
-    provider_openai::ensure_rustls_provider();
-    let directory = std::path::Path::new(&directory);
-    let certificate = CertificateDer::from_pem_file(directory.join("server.pem")).unwrap();
-    let key = PrivateKeyDer::from_pem_file(directory.join("server.key")).unwrap();
-    let acceptor = TlsAcceptor::from(Arc::new(
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate], key)
-            .unwrap(),
-    ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy =
-        OutboundProxy::parse(&format!("https://{}", listener.local_addr().unwrap())).unwrap();
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut stream = acceptor.accept(socket).await.unwrap();
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            assert!(request.len() < 8192);
-            request.push(stream.read_u8().await.unwrap());
-        }
-        assert!(request.starts_with(b"GET http://unresolvable.invalid/ip "));
-        let body = "{\"ip\":\"203.0.113.8\"}";
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-    });
-    let probe = HttpProxyProbe::new("http://unresolvable.invalid/ip")
-        .with_client_builder(provider_openai::build_reqwest_client_with_custom_ca);
-    let result = probe.test(&proxy, false).await;
-    assert!(result.success, "{}", result.message);
-    assert_eq!(result.exit_ip.unwrap().to_string(), "203.0.113.8");
-    tokio::time::timeout(Duration::from_secs(5), server)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-fn generate_proxy_test_certificates(directory: &std::path::Path) {
-    let openssl = |args: &[&str]| {
-        let output = Command::new("openssl")
-            .args(args)
-            .current_dir(directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    openssl(&[
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        "ca.key",
-        "-out",
-        "ca.pem",
-        "-days",
-        "1",
-        "-subj",
-        "/CN=Proxy Test CA",
-    ]);
-    openssl(&[
-        "req",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        "server.key",
-        "-out",
-        "server.csr",
-        "-subj",
-        "/CN=localhost",
-    ]);
-    fs::write(directory.join("extensions"), "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
-    openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        "server.csr",
-        "-CA",
-        "ca.pem",
-        "-CAkey",
-        "ca.key",
-        "-CAcreateserial",
-        "-out",
-        "server.pem",
-        "-days",
-        "1",
-        "-extfile",
-        "extensions",
-    ]);
-}
 
 #[test]
 fn config_loader_should_load_complete_terminal_example() {
@@ -230,7 +37,7 @@ fn config_loader_should_share_resolved_assets_with_system_update() {
             child
                 .args([
                     "--exact",
-                    "bootstrap::config_loader_should_share_resolved_assets_with_system_update",
+                    "bootstrap::config::config_loader_should_share_resolved_assets_with_system_update",
                 ])
                 .env(CHILD_ENV, case)
                 .env_remove("CPR_WEB_DIST_DIR");
@@ -292,7 +99,7 @@ fn config_loader_should_apply_only_explicit_topology_overrides() {
     let status = Command::new(std::env::current_exe().expect("current test executable"))
         .args([
             "--exact",
-            "bootstrap::config_loader_should_apply_only_explicit_topology_overrides",
+            "bootstrap::config::config_loader_should_apply_only_explicit_topology_overrides",
         ])
         .env(TOPOLOGY_CHILD_ENV, "1")
         .env("CPR_SERVER_HOST", "127.0.0.1")
@@ -374,7 +181,15 @@ fn config_loader_should_report_startup_configuration_diagnostics() {
         gateway_host::load_config::<GatewayConfig>().expect("startup configuration");
         return;
     }
-    for case in ["normal", "unused", "missing"] {
+    for case in [
+        "normal",
+        "unused",
+        "missing",
+        "timezoneEmpty",
+        "timezoneInvalid",
+        "timezoneNull",
+        "timezoneType",
+    ] {
         let mut document = valid_config_document();
         if case == "unused" {
             document["openai"]["wire_profile"]["location"] = serde_json::json!(UNUSED_SECRET);
@@ -383,6 +198,14 @@ fn config_loader_should_report_startup_configuration_diagnostics() {
                 .as_object_mut()
                 .unwrap()
                 .remove("port");
+        }
+        if case.starts_with("timezone") {
+            document["host"]["timezone"] = match case {
+                "timezoneEmpty" => serde_json::json!(""),
+                "timezoneInvalid" => serde_json::json!(UNUSED_SECRET),
+                "timezoneNull" => serde_json::json!(null),
+                _ => serde_json::json!(8),
+            };
         }
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("deploy")).unwrap();
@@ -394,7 +217,7 @@ fn config_loader_should_report_startup_configuration_diagnostics() {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "bootstrap::config_loader_should_report_startup_configuration_diagnostics",
+                "bootstrap::config::config_loader_should_report_startup_configuration_diagnostics",
                 "--nocapture",
             ])
             .env(CHILD_ENV, "1")
@@ -404,7 +227,7 @@ fn config_loader_should_report_startup_configuration_diagnostics() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.success(),
-            case != "missing",
+            case != "missing" && !case.starts_with("timezone"),
             "{case}: {stderr}"
         );
         match case {
@@ -413,6 +236,9 @@ fn config_loader_should_report_startup_configuration_diagnostics() {
                 "{stderr}"
             ),
             "missing" => assert!(stderr.contains("host.listen.port"), "{stderr}"),
+            case if case.starts_with("timezone") => {
+                assert!(stderr.contains("host.timezone"), "{stderr}")
+            }
             _ => assert!(!stderr.contains("警告"), "{stderr}"),
         }
         assert!(!stderr.contains(UNUSED_SECRET), "{stderr}");
@@ -579,4 +405,19 @@ fn parse_config(config: &str) -> Result<(GatewayConfig, tempfile::TempDir), Stri
         .resolve_and_validate(&deploy)
         .map_err(|error| error.to_string())?;
     Ok((config, directory))
+}
+
+#[test]
+fn deployment_timezone_defaults_and_valid_override_are_loaded() {
+    let mut document = valid_config_document();
+    document["host"].as_object_mut().unwrap().remove("timezone");
+    let (_config, _directory) = parse_config(&document.to_string()).unwrap();
+    let host: gateway_host::config::HostConfig =
+        serde_json::from_value(document["host"].clone()).unwrap();
+    assert_eq!(host.timezone.name(), "Asia/Shanghai");
+    document["host"]["timezone"] = serde_json::json!("Asia/Kathmandu");
+    let (_config, _directory) = parse_config(&document.to_string()).unwrap();
+    let host: gateway_host::config::HostConfig =
+        serde_json::from_value(document["host"].clone()).unwrap();
+    assert_eq!(host.timezone.name(), "Asia/Kathmandu");
 }

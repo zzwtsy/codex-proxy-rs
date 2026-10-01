@@ -121,7 +121,8 @@ async fn connect_pool(
                     "select set_config('statement_timeout', $1, false),
                             set_config('lock_timeout', $2, false),
                             set_config('idle_in_transaction_session_timeout', $3, false),
-                            set_config('default_transaction_read_only', $4, false)",
+                            set_config('default_transaction_read_only', $4, false),
+                            set_config('TimeZone', 'UTC', false)",
                 )
                 .bind(statement_timeout)
                 .bind(lock_timeout)

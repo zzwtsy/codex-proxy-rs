@@ -377,9 +377,12 @@ watch(open, (isOpen) => {
   }
   else {
     rememberDraft()
-    credentialDraft.value = null
   }
 })
+
+function clearCredentials() {
+  credentialDraft.value = null
+}
 watch(() => props.mode, () => {
   pendingAuthentication.value = false
   credentialDraft.value = null
@@ -420,6 +423,7 @@ watch(
     :description="acceptanceArtifact ? '确认来源与版本后安装' : updateSource ? '检查设置兼容性后切换版本' : '支持本地插件包、URL 与 GitHub'"
     size="md"
     :dismissible="!busy"
+    @after-leave="clearCredentials"
   >
     <BaseSegmented
       v-if="!acceptanceArtifact && !verified"
@@ -487,7 +491,6 @@ watch(
 
     <div v-if="!verified && mode !== 'upload'" class="mt-4 grid gap-4">
       <PluginDownloadAuthentication
-        v-if="open"
         :key="mode"
         v-model="connectionForm.credentialIds"
         v-model:pending="pendingAuthentication"

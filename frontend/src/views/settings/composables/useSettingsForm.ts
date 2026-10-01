@@ -32,6 +32,7 @@ export function useSettingsForm() {
     refreshMarginSeconds: null as number | null,
     refreshConcurrency: null as number | null,
     maxConcurrentPerAccount: null as number | null,
+    openaiGuardianReservedConcurrency: null as number | null,
     requestIntervalMs: null as number | null,
     maxWaitingPerKey: null as number | null,
     maxWaitingPerAccount: null as number | null,
@@ -84,7 +85,7 @@ export function useSettingsForm() {
     mappings.value = saved.value.mappings.map(row => ({ ...row }))
   }
 
-  function numericModel(key: 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'requestIntervalMs' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'responsesMaxDecompressedBodyMiB' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds') {
+  function numericModel(key: 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'openaiGuardianReservedConcurrency' | 'requestIntervalMs' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'responsesMaxDecompressedBodyMiB' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds') {
     return computed({
       get: () => (form[key] === null ? '' : String(form[key])),
       set: (value: string) => {
@@ -101,6 +102,7 @@ export function useSettingsForm() {
   const refreshMarginSecondsValue = numericModel('refreshMarginSeconds')
   const refreshConcurrencyValue = numericModel('refreshConcurrency')
   const maxConcurrentPerAccountValue = numericModel('maxConcurrentPerAccount')
+  const openaiGuardianReservedConcurrencyValue = numericModel('openaiGuardianReservedConcurrency')
   const requestIntervalMsValue = numericModel('requestIntervalMs')
   const maxWaitingPerKeyValue = numericModel('maxWaitingPerKey')
   const maxWaitingPerAccountValue = numericModel('maxWaitingPerAccount')
@@ -126,6 +128,7 @@ export function useSettingsForm() {
     form.refreshMarginSeconds = data.refreshMarginSeconds
     form.refreshConcurrency = data.refreshConcurrency
     form.maxConcurrentPerAccount = data.maxConcurrentPerAccount
+    form.openaiGuardianReservedConcurrency = data.openaiGuardianReservedConcurrency
     form.requestIntervalMs = data.requestIntervalMs
     form.maxWaitingPerKey = data.maxWaitingPerKey
     form.maxWaitingPerAccount = data.maxWaitingPerAccount
@@ -211,13 +214,17 @@ export function useSettingsForm() {
     const savedSettings = saved.value
     if (saving.value || loading.value || !savedRequestLocation.value || !savedSettings)
       return
-    const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, requestIntervalMs, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, responsesMaxDecompressedBodyMiB, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
-    if (refreshMarginSeconds === null || refreshConcurrency === null || maxConcurrentPerAccount === null || requestIntervalMs === null || !rotationStrategy || maxWaitingPerKey === null || maxWaitingPerAccount === null || concurrencyWaitTimeoutSeconds === null) {
+    const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, openaiGuardianReservedConcurrency, requestIntervalMs, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, responsesMaxDecompressedBodyMiB, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
+    if (refreshMarginSeconds === null || refreshConcurrency === null || maxConcurrentPerAccount === null || openaiGuardianReservedConcurrency === null || requestIntervalMs === null || !rotationStrategy || maxWaitingPerKey === null || maxWaitingPerAccount === null || concurrencyWaitTimeoutSeconds === null) {
       toast.warning('请完整填写并发、队列、凭据刷新参数和调度策略')
       return
     }
     if (!Number.isInteger(maxConcurrentPerAccount) || maxConcurrentPerAccount < 0 || maxConcurrentPerAccount > 4294967295) {
       toast.warning('默认账号并发上限应为 0～4294967295 的整数，0 表示不限制')
+      return
+    }
+    if (!Number.isInteger(openaiGuardianReservedConcurrency) || openaiGuardianReservedConcurrency < 0 || openaiGuardianReservedConcurrency > 4294967295) {
+      toast.warning('自动审批预留并发应为 0～4294967295 的整数，0 表示关闭')
       return
     }
     if (responsesMaxDecompressedBodyMiB === null || !Number.isInteger(responsesMaxDecompressedBodyMiB) || responsesMaxDecompressedBodyMiB < 1
@@ -286,6 +293,7 @@ export function useSettingsForm() {
         refreshMarginSeconds,
         refreshConcurrency,
         maxConcurrentPerAccount,
+        openaiGuardianReservedConcurrency,
         requestIntervalMs,
         maxWaitingPerKey,
         maxWaitingPerAccount,
@@ -334,6 +342,7 @@ export function useSettingsForm() {
     refreshMarginSecondsValue,
     refreshConcurrencyValue,
     maxConcurrentPerAccountValue,
+    openaiGuardianReservedConcurrencyValue,
     requestIntervalMsValue,
     maxWaitingPerKeyValue,
     maxWaitingPerAccountValue,

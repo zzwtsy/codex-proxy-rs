@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Utc};
 use gateway_core::account::{
     AccountErrorReason, CredentialCasUpdate, CredentialRevision, CredentialState, LoadedCredential,
     NewProviderAccount, ProviderAccount, ProviderAccountId, ProviderAccountIdentity,
@@ -680,8 +680,8 @@ impl CodexCredentialAdmin {
                 label: Some(account.name().to_owned()),
                 plan_type: account.plan_type().map(str::to_owned),
                 status: cpr_status(&account),
-                added_at: china_rfc3339(item.added_at),
-                updated_at: china_rfc3339(item.updated_at),
+                added_at: item.added_at.to_rfc3339(),
+                updated_at: item.updated_at.to_rfc3339(),
                 outbound_proxy_url: account
                     .outbound_proxy()
                     .map(|proxy| proxy.expose_url().to_owned()),
@@ -1216,12 +1216,6 @@ fn cpr_status(account: &ProviderAccount) -> &'static str {
         CredentialState::Banned => "banned",
         CredentialState::Unknown | CredentialState::Ready => "active",
     }
-}
-
-fn china_rfc3339(value: DateTime<Utc>) -> String {
-    value
-        .with_timezone(&FixedOffset::east_opt(8 * 60 * 60).expect("valid China offset"))
-        .to_rfc3339()
 }
 
 fn map_refresh_failure(error: RefreshFailure) -> CodexCredentialAdminError {

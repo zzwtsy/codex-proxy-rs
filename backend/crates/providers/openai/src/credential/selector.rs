@@ -11,7 +11,7 @@ use gateway_core::account::{
     AccountSelector, AccountStatus, CredentialState, PreferredAccountSelection, ProviderAccount,
     ProviderAccountId, QuotaEvidence,
 };
-use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue, QueueRejection};
+use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue, QueueRejection, WaitPriority};
 use gateway_core::engine::{AttemptContext, ContinuationAttempt, policy::AccountPolicyError};
 use gateway_core::provider_ports::{
     ProviderLeaseAcquisition, ProviderLeaseGuard, ProviderLeasePort, ProviderLeaseRequest,
@@ -106,6 +106,8 @@ struct CredentialSelectionInput<'a> {
     attempt: &'a AttemptContext,
     session_affinity_key: Option<&'a ProviderSessionAffinityKey>,
     session_affinity_observation: Option<&'a CodexSessionAffinity>,
+    /// Codex Guardian 自动审批请求；仅在配置了预留名额时获得预留与队列优先。
+    guardian: bool,
 }
 
 #[derive(Clone)]
@@ -299,6 +301,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation: None,
+            guardian: false,
         };
         self.select_inner(&input, None, Some(request.upstream_model))
             .await
@@ -310,6 +313,7 @@ impl CodexCredentialSelector {
         cyber_policy_session_key: Option<&ProviderSessionAffinityKey>,
         session_affinity_observation: Option<&CodexSessionAffinity>,
         requires_websocket: bool,
+        guardian: bool,
     ) -> Result<CodexCredentialLease, CredentialSelectionError> {
         let input = CredentialSelectionInput {
             requires_websocket,
@@ -317,6 +321,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation,
+            guardian,
         };
         self.select_inner(
             &input,
@@ -376,6 +381,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity.map(CodexSessionAffinity::key),
             session_affinity_observation: request.session_affinity,
+            guardian: false,
         };
         self.select_inner(&input, None, None).await
     }
@@ -387,12 +393,24 @@ impl CodexCredentialSelector {
         upstream_model: Option<&str>,
     ) -> Result<CodexCredentialLease, CredentialSelectionError> {
         let queue_policy = request.attempt.account_selection_policy().queue_policy();
+        // 预留名额只对普通请求生效；Guardian 可用满全部名额，并在账号队列中排在普通请求之前。
+        let reserve = request
+            .attempt
+            .account_selection_policy()
+            .openai_guardian_reserved_concurrency();
+        let prioritized = request.guardian && reserve > 0;
+        let reserved_concurrency = if prioritized { 0 } else { reserve };
         let mut waiting = CapacityWait::new(
             &self.waiting,
             queue_policy,
             request.attempt.deadline(),
             request.attempt.concurrency_wait_budget(),
-        );
+        )
+        .with_priority(if prioritized {
+            WaitPriority::High
+        } else {
+            WaitPriority::Normal
+        });
         let continuation_account = match request.attempt.continuation_attempt() {
             ContinuationAttempt::Native => request
                 .attempt
@@ -604,6 +622,7 @@ impl CodexCredentialSelector {
                         AccountEligibilityPolicy::Enforce
                     },
                     account_scope: request.attempt.account_scope().cloned(),
+                    reserved_concurrency,
                 };
                 let wait_context = AccountSelectionContext {
                     excluded_accounts: base_excluded.clone(),
@@ -724,6 +743,11 @@ impl CodexCredentialSelector {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                // 凭据重读和插件选号都可能挂起，取得租约前再次让位于新队首。
+                if !waiting.can_try(account.id()) {
+                    excluded.insert(account.id().clone());
+                    continue;
+                }
                 let allows_account_state_mutation = !diagnostic || account.enabled();
                 match self
                     .leases
@@ -732,7 +756,7 @@ impl CodexCredentialSelector {
                             self.provider_kind.clone(),
                             account.id().clone(),
                             account.revision(),
-                            account.effective_concurrency(policy.max_concurrent_per_account()),
+                            context.concurrency_limit(&account),
                             policy.request_interval(),
                             request.attempt.deadline(),
                         ),

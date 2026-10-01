@@ -61,7 +61,8 @@ export function usePluginUninstall(refresh: () => Promise<void>, notifyError: (t
     }
     finally {
       busy.value = false
-      progress.value = ''
+      if (open.value)
+        progress.value = ''
     }
   }
   return { open, pending, acknowledged, busy, progress, request, confirm }

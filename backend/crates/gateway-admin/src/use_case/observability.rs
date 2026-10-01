@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Timelike as _, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures::TryStreamExt;
 use gateway_core::{account::ProviderAccountId, routing::ProviderKind};
 
@@ -24,7 +24,7 @@ use crate::{
             UsageCalculatedBillingFact, UsageDetail, UsageFilter, UsageInsights, UsageInsightsCost,
             UsageInsightsCostPoint, UsageInsightsHealth, UsageInsightsHealthPoint,
             UsageInsightsPerformance, UsageInsightsPerformancePoint, UsageOverview, UsagePage,
-            UsageQuery, UsageSummary, china_day_start,
+            UsageQuery, UsageSummary,
         },
         provider_credentials::ProviderQuotaRequest,
     },
@@ -37,7 +37,6 @@ use crate::{
 use super::{map_provider_error, map_store_error};
 
 const HEALTH_TIMELINE_SLOT_MINUTES: i64 = 15;
-const HEALTH_TIMELINE_SLOTS: i64 = 24 * 4;
 const HEALTH_TIMELINE_MIN_SAMPLE_SIZE: u64 = 10;
 const HEALTH_TIMELINE_UNAVAILABLE_FAILURE_THRESHOLD: u64 = 3;
 const HEALTH_TIMELINE_STABLE_RELIABILITY: f64 = 99.0;
@@ -126,6 +125,7 @@ pub trait ObservabilityService: Send + Sync {
 }
 
 pub(crate) struct DefaultObservabilityService {
+    timezone: gateway_core::time::DeploymentTimeZone,
     store: Arc<dyn ObservabilityStore>,
     accounts: Arc<dyn AccountStore>,
     settings: Arc<dyn SettingsStore>,
@@ -140,8 +140,10 @@ impl DefaultObservabilityService {
         accounts: Arc<dyn AccountStore>,
         settings: Arc<dyn SettingsStore>,
         providers: ProviderAdminRegistry,
+        timezone: gateway_core::time::DeploymentTimeZone,
     ) -> Self {
         Self {
+            timezone,
             store,
             accounts,
             settings,
@@ -169,8 +171,14 @@ impl DefaultObservabilityService {
                 .providers
                 .plan_type_display(&account.provider_kind, account.plan_type.as_deref());
         }
-        let today_start = china_day_start(observation.range.end);
-        let yesterday_start = today_start - Duration::days(1);
+        let today_start = self
+            .timezone
+            .day_start(observation.range.end)
+            .ok_or_else(|| AdminError::internal("时间超出支持范围"))?;
+        let yesterday_start = self
+            .timezone
+            .days_before(observation.range.end, 1)
+            .ok_or_else(|| AdminError::internal("时间超出支持范围"))?;
         let today =
             dashboard_period_metrics(&observation.trend, today_start, observation.range.end);
         let yesterday = dashboard_period_metrics(&observation.trend, yesterday_start, today_start);
@@ -191,7 +199,8 @@ impl DefaultObservabilityService {
         let average_first_token_latency_ms =
             average(first_token_latency_sum_ms, first_token_latency_count);
         let trend = trend(TrendKind::Usage, observation.trend.clone())?;
-        let health_timeline = health_timeline_at(&observation.trend, Utc::now());
+        let health_timeline =
+            health_timeline_at(&observation.trend, observation.range.end, self.timezone)?;
         let wire_profiles = self
             .providers
             .dashboard_wire_profiles(&settings.request_profiles);
@@ -861,15 +870,28 @@ impl DefaultObservabilityService {
     }
 }
 
-/// 按指定时刻计算中国自然日的 96 个 15 分钟健康桶。
-#[must_use]
+/// 按部署时区的自然日计算 15 分钟健康桶，桶数随夏令时变化。
 pub(super) fn health_timeline_at(
     records: &[RequestMetricPoint],
     now: DateTime<Utc>,
-) -> HealthTimeline {
-    let current_slot = quarter_hour_start(now);
-    let start = china_day_start(now);
-    let mut buckets = (0..HEALTH_TIMELINE_SLOTS)
+    timezone: gateway_core::time::DeploymentTimeZone,
+) -> Result<HealthTimeline, AdminError> {
+    let start = timezone
+        .day_start(now)
+        .ok_or_else(|| AdminError::internal("时间超出支持范围"))?;
+    let end = timezone
+        .days_after(now, 1)
+        .ok_or_else(|| AdminError::internal("时间超出支持范围"))?;
+    let current_slot = start
+        + Duration::minutes(
+            (now - start)
+                .num_minutes()
+                .div_euclid(HEALTH_TIMELINE_SLOT_MINUTES)
+                * HEALTH_TIMELINE_SLOT_MINUTES,
+        );
+    let slots = ((end - start).num_minutes() + HEALTH_TIMELINE_SLOT_MINUTES - 1)
+        / HEALTH_TIMELINE_SLOT_MINUTES;
+    let mut buckets = (0..slots)
         .map(|index| {
             (
                 start + Duration::minutes(HEALTH_TIMELINE_SLOT_MINUTES * index),
@@ -881,7 +903,13 @@ pub(super) fn health_timeline_at(
         if record.bucket_start < start || record.bucket_start > now {
             continue;
         }
-        let record_slot = quarter_hour_start(record.bucket_start);
+        let record_slot = start
+            + Duration::minutes(
+                (record.bucket_start - start)
+                    .num_minutes()
+                    .div_euclid(HEALTH_TIMELINE_SLOT_MINUTES)
+                    * HEALTH_TIMELINE_SLOT_MINUTES,
+            );
         if let Some((_, bucket)) = buckets
             .iter_mut()
             .find(|(bucket_start, _)| *bucket_start == record_slot)
@@ -897,7 +925,7 @@ pub(super) fn health_timeline_at(
             totals.add_window(*bucket);
             totals
         });
-    HealthTimeline {
+    Ok(HealthTimeline {
         reliability_percent: health_reliability(totals),
         status: health_status(totals, false),
         success_requests: totals.success_requests,
@@ -918,7 +946,7 @@ pub(super) fn health_timeline_at(
                 caller_error_requests: bucket.caller_error_requests,
             })
             .collect(),
-    }
+    })
 }
 
 fn trend(kind: TrendKind, points: Vec<RequestMetricPoint>) -> Result<Trend, AdminError> {
@@ -1181,11 +1209,4 @@ fn service_failure_count(metrics: &RequestMetrics) -> u64 {
     metrics
         .failure_count
         .saturating_sub(metrics.caller_error_count)
-}
-
-fn quarter_hour_start(value: DateTime<Utc>) -> DateTime<Utc> {
-    let elapsed = value
-        .timestamp()
-        .rem_euclid(HEALTH_TIMELINE_SLOT_MINUTES * 60);
-    value - Duration::seconds(elapsed) - Duration::nanoseconds(i64::from(value.nanosecond()))
 }

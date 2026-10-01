@@ -1921,6 +1921,7 @@ impl Provider for PolicySelectingProvider {
             round_robin_cursor: 0,
             eligibility: AccountEligibilityPolicy::Enforce,
             account_scope: attempt.account_scope().cloned(),
+            reserved_concurrency: 0,
         };
         match attempt
             .select_account(

@@ -15,13 +15,8 @@ const props = defineProps<{
 const emit = defineEmits<{ removed: [] }>()
 const open = defineModel<boolean>({ required: true })
 const pendingRemove = shallowRef<OutboundProxyAccount | null>(null)
-const showRemove = computed({
-  get: () => pendingRemove.value !== null,
-  set: (value: boolean) => {
-    if (!value)
-      pendingRemove.value = null
-  },
-})
+const showRemove = shallowRef(false)
+const removeProxyName = shallowRef('')
 const { accounts, loading, error, pagination, search, setPage, setPageSize, removing, removeAccount } = useProxyAccounts({
   isOpen: () => open.value,
   proxyId: () => props.proxy?.id,
@@ -57,12 +52,18 @@ const tableHeight = computed(() => {
 
 async function confirmRemove() {
   const account = pendingRemove.value
-  if (account && await removeAccount(account.id))
-    pendingRemove.value = null
+  if (showRemove.value && account && await removeAccount(account.id))
+    showRemove.value = false
+}
+
+function requestRemove(account: OutboundProxyAccount) {
+  pendingRemove.value = account
+  removeProxyName.value = props.proxy?.name ?? ''
+  showRemove.value = true
 }
 
 watch([open, () => props.proxy?.id], () => {
-  pendingRemove.value = null
+  showRemove.value = false
 })
 </script>
 
@@ -108,7 +109,7 @@ watch([open, () => props.proxy?.id], () => {
             label="从当前代理移除账号"
             :disabled="removing"
             :loading="removing && pendingRemove?.id === row.id"
-            @click="pendingRemove = row"
+            @click="requestRemove(row)"
           >
             <Unlink class="size-3.5 text-cp-error" />
           </BaseIconButton>
@@ -118,8 +119,8 @@ watch([open, () => props.proxy?.id], () => {
     </div>
   </BaseModal>
   <BaseConfirmModal v-model="showRemove" title="移除关联账号" confirm-text="移除" :loading="removing" @confirm="confirmRemove">
-    <p class="m-0 break-words">
-      将“{{ pendingRemove?.name }}”从“{{ proxy?.name }}”移除后，该账号将改为直连
+    <p class="m-0 wrap-break-word">
+      将“{{ pendingRemove?.name }}”从“{{ removeProxyName }}”移除后，该账号将改为直连
     </p>
   </BaseConfirmModal>
 </template>

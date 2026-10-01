@@ -164,7 +164,10 @@ async fn connect(
                 observability_query_budget.clone(),
             )),
             admin_account_runtime,
-            Arc::new(postgres::PgAccountGroupRepository::new(pool.clone())),
+            Arc::new(
+                postgres::PgAccountGroupRepository::new(pool.clone())
+                    .with_timezone(config.timezone),
+            ),
             Arc::new(postgres::PgProxyRepository::new(pool.clone())),
         ),
         Arc::new(AuthStoreAdapter {
@@ -174,12 +177,15 @@ async fn connect(
             state: redis::RedisAuthStateRepository::new(redis_connection.clone(), REDIS_NAMESPACE)?,
         }),
         Arc::new(postgres::PgAdminClientKeyStore::new(pool.clone())),
-        Arc::new(postgres::PgAdminObservabilityStore::new(
-            pool.clone(),
-            Some(credential_leases.clone()),
-            Some(Arc::clone(&cooldowns) as Arc<dyn ProviderCooldownPort>),
-            observability_query_budget,
-        )),
+        Arc::new(
+            postgres::PgAdminObservabilityStore::new(
+                pool.clone(),
+                Some(credential_leases.clone()),
+                Some(Arc::clone(&cooldowns) as Arc<dyn ProviderCooldownPort>),
+                observability_query_budget,
+            )
+            .with_timezone(config.timezone),
+        ),
         Arc::new(AdminSettingsStoreAdapter {
             control_plane: postgres::PgControlPlaneRepository::new(pool.clone()),
         }),
@@ -225,7 +231,9 @@ async fn connect(
         ),
         Arc::new(client_key_usage),
     )
-    .with_budget(Arc::new(postgres::PgClientBudgetStore::new(pool.clone())))
+    .with_budget(Arc::new(
+        postgres::PgClientBudgetStore::new(pool.clone()).with_timezone(config.timezone),
+    ))
     .with_session_affinity(Arc::clone(&provider_session_affinity));
 
     let provider_ports = ProviderStorePorts::new(

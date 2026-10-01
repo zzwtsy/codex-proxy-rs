@@ -44,6 +44,7 @@ const PENDING_DELETION_BATCH: u32 = 20;
 
 /// 备份 Daemon 任务。
 pub struct BackupTask {
+    timezone: gateway_core::time::DeploymentTimeZone,
     repository: Arc<dyn BackupRepository>,
     dump: Arc<dyn DatabaseDumpPort>,
     object_store: Arc<dyn BackupObjectStorePort>,
@@ -58,10 +59,17 @@ impl BackupTask {
         object_store: Arc<dyn BackupObjectStorePort>,
     ) -> Self {
         Self {
+            timezone: Default::default(),
             repository,
             dump,
             object_store,
         }
+    }
+
+    #[must_use]
+    pub fn with_timezone(mut self, timezone: gateway_core::time::DeploymentTimeZone) -> Self {
+        self.timezone = timezone;
+        self
     }
 }
 
@@ -112,13 +120,29 @@ impl BackupTask {
             return Ok(());
         }
         let cron = settings.cron_expression.as_deref().unwrap_or_default();
-        let timezone = settings.schedule_timezone.as_deref().unwrap_or_default();
-        if cron.is_empty() || timezone.is_empty() {
+        let timezone = self.timezone.name();
+        if cron.is_empty() {
             return Ok(());
         }
-        let schedule = BackupSchedule::parse(cron, timezone)
+        let schedule = BackupSchedule::parse(cron, self.timezone)
             .map_err(|_| WorkerTaskError::safe("backup schedule is invalid"))?;
 
+        if settings.schedule_timezone.as_deref() != Some(timezone) {
+            // 时区切换只初始化未来游标，不把旧时区计划当作应补跑任务。
+            if let Some(next_run_at) = schedule.next_after(now) {
+                self.repository
+                    .advance_schedule_cursor(
+                        next_run_at,
+                        cron,
+                        settings.schedule_timezone.as_deref(),
+                        settings.next_run_at,
+                        timezone,
+                    )
+                    .await
+                    .map_err(repo_error)?;
+            }
+            return Ok(());
+        }
         let due = match settings.next_run_at {
             Some(next_run_at) if next_run_at <= now => true,
             Some(_) => false,
@@ -127,7 +151,13 @@ impl BackupTask {
                 if let Some(next_run_at) = schedule.next_after(now) {
                     let _ = self
                         .repository
-                        .advance_schedule_cursor(next_run_at, cron, timezone)
+                        .advance_schedule_cursor(
+                            next_run_at,
+                            cron,
+                            Some(timezone),
+                            settings.next_run_at,
+                            timezone,
+                        )
                         .await
                         .map_err(repo_error)?;
                 }
@@ -145,7 +175,13 @@ impl BackupTask {
                 if let Some(next_run_at) = schedule.next_after(now) {
                     let _ = self
                         .repository
-                        .advance_schedule_cursor(next_run_at, cron, timezone)
+                        .advance_schedule_cursor(
+                            next_run_at,
+                            cron,
+                            Some(timezone),
+                            settings.next_run_at,
+                            timezone,
+                        )
                         .await
                         .map_err(repo_error)?;
                 }
@@ -168,20 +204,19 @@ impl BackupTask {
         .map_err(infra_error)?;
         let inserted = self
             .repository
-            .insert_scheduled_record(seed)
+            .insert_scheduled_record(
+                seed,
+                schedule.next_after(now),
+                cron,
+                timezone,
+                settings.next_run_at,
+            )
             .await
             .map_err(repo_error)?;
         if inserted {
             info!(scheduled_at = %scheduled_at, "计划备份任务已创建");
         } else {
-            warn!(scheduled_at = %scheduled_at, "计划时间点冲突，跳过并推进游标");
-        }
-        if let Some(next_run_at) = schedule.next_after(now) {
-            let _ = self
-                .repository
-                .advance_schedule_cursor(next_run_at, cron, timezone)
-                .await
-                .map_err(repo_error)?;
+            warn!(scheduled_at = %scheduled_at, "计划已变化或存在冲突，本轮未创建任务");
         }
         Ok(())
     }

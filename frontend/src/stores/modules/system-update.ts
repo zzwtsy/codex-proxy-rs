@@ -29,6 +29,7 @@ interface SystemUpdateEvent {
   level: string
   message: string
   at: string
+  atDisplay: string
   step?: string
   terminal?: boolean
 }

@@ -98,6 +98,7 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/openai/usage.rs",
         "src/provider.rs",
         "src/session_cookie.rs",
+        "src/time.rs",
     ];
     expected.sort_unstable();
 

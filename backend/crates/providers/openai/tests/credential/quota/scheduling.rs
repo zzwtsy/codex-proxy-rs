@@ -106,6 +106,7 @@ async fn old_weekly_quota_should_outweigh_one_in_flight_title_request() {
             round_robin_cursor: cursor,
             eligibility: AccountEligibilityPolicy::Enforce,
             account_scope: None,
+            reserved_concurrency: 0,
         };
         let selected = AccountSelector
             .select(&candidates, &context)

@@ -22,7 +22,6 @@ export function usePluginArtifactActions({ refresh, notifyError }: Pick<PluginAc
     try {
       await deletePluginArtifact({ sha256: artifact.metadata.sha256 }, { silent: true })
       showArtifactDelete.value = false
-      pendingArtifact.value = null
       toast.success('插件制品已删除')
       await refresh(true)
     }

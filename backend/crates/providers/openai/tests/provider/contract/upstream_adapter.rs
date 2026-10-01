@@ -1,4 +1,5 @@
 use super::*;
+use gateway_core::account::AccountRuntimeSignals;
 use gateway_core::engine::upstream_adapter::{
     UpstreamAccountConnection, UpstreamAdapter, UpstreamAdapterInvocation, UpstreamAdapterPlan,
 };
@@ -255,6 +256,108 @@ async fn selected_adapter_connection(
         ProviderErrorKind::Cancelled
     );
     receiver.await.unwrap()
+}
+
+#[tokio::test]
+async fn guardian_reservation_survives_upstream_adapters_and_metadata_precedence() {
+    // 上限 2、已有 1 个在途请求：预留启用时只有 Guardian 能继续取得租约。
+    for (subagent, turn_kind, reserved, allowed) in [
+        (Some("guardian"), None, 1, true),
+        (None, Some("guardian"), 1, true),
+        (Some("collab_spawn"), Some("guardian"), 1, true),
+        (Some("guardian"), Some("collab_spawn"), 1, false),
+        (Some("collab_spawn"), None, 1, false),
+        (None, None, 1, false),
+        (None, None, 0, true),
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_provider_contract").await;
+        let leases = Arc::new(TestLeaseCoordinator::default());
+        leases.signals.lock().unwrap().insert(
+            ProviderAccountId::new("acct_provider_contract").unwrap(),
+            AccountRuntimeSignals {
+                in_flight: 1,
+                last_started_at: None,
+                quota_reset_at: None,
+                quota_remaining_rank: None,
+                cooldown: None,
+                failure_rate_basis_points: None,
+                first_output_latency_ms: None,
+            },
+        );
+        let server = MockServer::start().await;
+        let provider = provider_with_affinity_and_base_url_and_leases(
+            &store,
+            Arc::new(MemorySessionAffinity::default()),
+            server.uri(),
+            leases.clone(),
+        );
+        let (selected, receiver) = oneshot::channel();
+        let plan = gateway_core::engine::upstream_adapter::FrozenUpstreamAdapterPlan::new(
+            Arc::new(ConnectionProbe {
+                selected: Arc::new(Mutex::new(Some(selected))),
+            }),
+            ExtensionSetReference::new(
+                ExtensionSetId::new("guardian-adapter-test".to_owned()).unwrap(),
+                Arc::new(TestExtensionLease),
+            ),
+        );
+        let context = AttemptContext::new(
+            RequestAttemptContext::new(
+                ModelRequestId::new("req_guardian_adapter").unwrap(),
+                ClientApiKeyId::new("key_openai_contract").unwrap(),
+            )
+            .with_upstream_adapters(Some(plan)),
+            NonZeroU32::MIN,
+            SystemTime::now() + Duration::from_secs(5),
+            account_policy().with_openai_guardian_reserved_concurrency(reserved),
+            AccountAttemptContext::new(BTreeSet::new(), None, None)
+                .with_account_scope(contract_account_scope()),
+            None,
+            CancellationToken::new(),
+        );
+        let mut body = Map::from_iter([
+            ("model".into(), json!("gpt-5.4")),
+            ("input".into(), json!("guardian scheduling contract")),
+        ]);
+        if let Some(kind) = subagent {
+            body.insert("client_metadata".into(), json!({"x-openai-subagent": kind}));
+        }
+        let mut protocol_context = Map::new();
+        if let Some(kind) = turn_kind {
+            protocol_context.insert(
+                "turn_metadata".into(),
+                json!(json!({"subagent_kind": kind}).to_string()),
+            );
+        }
+        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+            ProtocolPayload::json_object("openai", body)
+                .unwrap()
+                .with_context(protocol_context),
+        ));
+        let result = provider
+            .execute(planned_request("openai", operation), context)
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{subagent:?}, {turn_kind:?}, reserve={reserved}"
+        );
+        if allowed {
+            let mut stream = result.unwrap();
+            assert_eq!(
+                stream.next().await.unwrap().unwrap_err().kind(),
+                ProviderErrorKind::Cancelled
+            );
+            drop(receiver.await.unwrap());
+            let requests = leases.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].max_concurrent().get(), 2);
+        } else {
+            assert!(leases.requests.lock().unwrap().is_empty());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

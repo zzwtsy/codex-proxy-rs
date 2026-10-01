@@ -678,6 +678,7 @@ impl OpenAiUpstreamProtocol {
 /// Codex HTTP/SSE 上游客户端。
 #[derive(Clone)]
 pub struct CodexBackendClient {
+    pub(super) timezone: gateway_core::time::DeploymentTimeZone,
     pub(super) response_control: Option<gateway_core::engine::response_control::ResponseControl>,
     pub(super) connection_budget: Option<gateway_core::engine::connection::ConnectionBudget>,
     pub(super) client: Client,
@@ -695,6 +696,15 @@ pub struct CodexBackendClient {
 }
 
 impl CodexBackendClient {
+    #[must_use]
+    pub(crate) fn with_timezone(
+        mut self,
+        timezone: gateway_core::time::DeploymentTimeZone,
+    ) -> Self {
+        self.timezone = timezone;
+        self
+    }
+
     pub(crate) fn with_response_control(
         mut self,
         control: Option<gateway_core::engine::response_control::ResponseControl>,

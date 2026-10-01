@@ -1145,3 +1145,65 @@ async fn plugin_budget_limits_revalidate_authority_and_rollback_with_audit() {
     assert_eq!(after.weekly_resets_at, None);
     database.close().await;
 }
+
+#[tokio::test]
+async fn timezone_cutover_preserves_open_windows_and_resumes_without_overlap() {
+    use gateway_core::time::DeploymentTimeZone;
+    let Some(database) = TestDatabase::create("budget_timezone_cutover").await else {
+        return;
+    };
+    seed(&database, "key", "10", "20").await;
+    let original = PgClientBudgetStore::new(database.pool.clone());
+    original.admit(key_id("key")).await.unwrap();
+    original
+        .settle(charge("key", "before-cutover", "1"))
+        .await
+        .unwrap();
+    let before: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select daily_start, daily_end, weekly_start, weekly_end from client_key_budget_windows where client_api_key_id = 'key'"
+    ).fetch_one(&database.pool).await.unwrap();
+    let timezone: DeploymentTimeZone = "UTC".parse().unwrap();
+    let changed = PgClientBudgetStore::new(database.pool.clone()).with_timezone(timezone);
+    changed.admit(key_id("key")).await.unwrap();
+    let after: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select daily_start, daily_end, weekly_start, weekly_end from client_key_budget_windows where client_api_key_id = 'key'"
+    ).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        status(&database, "key").await.daily_used_usd.canonical(),
+        "1"
+    );
+    let now = Utc::now();
+    let old_end = chrono::DateTime::from_timestamp_micros(now.timestamp_micros()).unwrap()
+        - chrono::Duration::seconds(1);
+    sqlx::query("update client_key_budget_windows set daily_start = $1, daily_end = $2, weekly_start = $1, weekly_end = $2")
+        .bind(old_end - chrono::Duration::hours(1)).bind(old_end).execute(&database.pool).await.unwrap();
+    changed.admit(key_id("key")).await.unwrap();
+    let resumed: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select daily_start, daily_end, weekly_start, weekly_end from client_key_budget_windows where client_api_key_id = 'key'"
+    ).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(resumed.0, old_end);
+    assert_eq!(resumed.2, old_end);
+    assert_eq!(resumed.1, timezone.days_after(now, 1).unwrap());
+    assert_eq!(resumed.3, timezone.days_after(now, 7).unwrap());
+    changed
+        .settle(ClientBudgetCharge {
+            completed_at: (old_end - chrono::Duration::seconds(1)).into(),
+            ..charge("key", "late-cutover", "2")
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&database, "key").await.daily_used_usd.canonical(),
+        "0"
+    );
+    changed
+        .settle(charge("key", "after-cutover", "3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&database, "key").await.daily_used_usd.canonical(),
+        "3"
+    );
+    database.close().await;
+}

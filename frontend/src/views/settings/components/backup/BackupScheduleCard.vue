@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { BaseButton, BaseCard, BaseCheckbox, BaseForm, BaseFormItem, BaseInput, BaseSelect } from '@codex-proxy/ui'
+import { BaseButton, BaseCard, BaseCheckbox, BaseForm, BaseFormItem, BaseInput } from '@codex-proxy/ui'
 
 import { CalendarClock, Save } from '@lucide/vue'
 
 interface ScheduleForm {
   scheduleEnabled: boolean
   cronExpression: string
-  scheduleTimezone: string
   retentionDays: string
   retentionCount: string
 }
@@ -22,14 +21,6 @@ const emit = defineEmits<{
 }>()
 
 const schedule = defineModel<ScheduleForm>('schedule', { required: true })
-
-const TIMEZONE_OPTIONS = [
-  { label: 'Asia/Shanghai（中国标准时间）', value: 'Asia/Shanghai' },
-  { label: 'UTC', value: 'UTC' },
-  { label: 'America/New_York（东部时间）', value: 'America/New_York' },
-  { label: 'Europe/London', value: 'Europe/London' },
-  { label: 'Asia/Tokyo', value: 'Asia/Tokyo' },
-]
 </script>
 
 <template>
@@ -56,10 +47,6 @@ const TIMEZONE_OPTIONS = [
             show-label
           />
         </div>
-
-        <BaseFormItem label="调度时区" description="用于解释 Cron 表达式的 IANA 时区">
-          <BaseSelect v-model="schedule.scheduleTimezone" :options="TIMEZONE_OPTIONS" />
-        </BaseFormItem>
 
         <BaseFormItem
           label="Cron 表达式"

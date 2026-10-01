@@ -43,6 +43,7 @@ export function useApiKeyMutations(options: {
   const createdKeyName = shallowRef('')
   const editingKey = shallowRef<ApiKeyRow | null>(null)
   const pendingDeleteKey = shallowRef<ApiKeyRow | null>(null)
+  const deleteCount = shallowRef(0)
   const savingKeyAction = useAsyncAction()
   const deletingKeyAction = useAsyncAction()
   const batchDeletingAction = useAsyncAction()
@@ -54,6 +55,10 @@ export function useApiKeyMutations(options: {
   const updatingStatusKeyIds = updatingStatusKeys.ids
   const revealingKeyIds = revealingKeys.ids
   const form = ref<ApiKeyFormValue>(emptyForm())
+  watch([showDeleteModal, batchDeleting], ([open, busy]) => {
+    if (open && !busy)
+      deleteCount.value = options.selectedIds.value.size
+  })
 
   function openCreate() {
     editingKey.value = null
@@ -129,8 +134,6 @@ export function useApiKeyMutations(options: {
         }
 
         showFormModal.value = false
-        editingKey.value = null
-        form.value = emptyForm()
         await options.reload()
         if (current) {
           toast.success('API Key 已更新')
@@ -191,7 +194,6 @@ export function useApiKeyMutations(options: {
         remaining.delete(keyId)
         options.selectedIds.value = remaining
         showSingleDeleteModal.value = false
-        pendingDeleteKey.value = null
         await options.reload()
         toast.success('删除成功')
       },
@@ -260,18 +262,14 @@ export function useApiKeyMutations(options: {
       await copyToClipboard(key)
   }
 
-  watch(showKeyModal, (open) => {
-    if (!open) {
-      createdKey.value = ''
-      createdKeyName.value = ''
-    }
-  })
-  watch(showFormModal, (open) => {
-    if (!open && !savingKey.value) {
-      editingKey.value = null
-      form.value = emptyForm()
-    }
-  })
+  function clearCreatedKey() {
+    createdKey.value = ''
+    createdKeyName.value = ''
+  }
+
+  function clearCustomKey() {
+    form.value.customKey = ''
+  }
 
   return {
     showFormModal,
@@ -283,6 +281,7 @@ export function useApiKeyMutations(options: {
     createdKeyName,
     editingKey,
     pendingDeleteKey,
+    deleteCount,
     savingKey,
     deletingKey,
     batchDeleting,
@@ -291,6 +290,8 @@ export function useApiKeyMutations(options: {
     form,
     openCreate,
     openEdit,
+    clearCustomKey,
+    clearCreatedKey,
     requestSave,
     confirmAllAccountsScope,
     requestDeleteKey,

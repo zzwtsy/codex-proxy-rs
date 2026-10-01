@@ -364,7 +364,7 @@ fn compiler_accepts_unlimited_default_account_concurrency() {
 }
 
 #[test]
-fn compiled_plans_keep_their_smart_config_after_a_new_snapshot_is_built() {
+fn compiled_plans_keep_their_scheduling_config_after_a_new_snapshot_is_built() {
     use gateway_core::account::SmartSchedulingConfig;
     let configs = [
         SmartSchedulingConfig::default(),
@@ -376,7 +376,8 @@ fn compiled_plans_keep_their_smart_config_after_a_new_snapshot_is_built() {
             revision(index as u64 + 1),
             revision(index as u64 + 1),
             SettingsValues::new(3, 0, "smart", BTreeMap::new(), None, None)
-                .with_smart_scheduling(config),
+                .with_smart_scheduling(config)
+                .with_openai_guardian_reserved_concurrency(index as u32),
             vec![],
             vec![],
             vec![SnapshotProviderAccountFacts::new(
@@ -401,7 +402,12 @@ fn compiled_plans_keep_their_smart_config_after_a_new_snapshot_is_built() {
                 .unwrap(),
         );
     }
-    for (plan, config) in plans.iter().zip(configs) {
+    for (index, (plan, config)) in plans.iter().zip(configs).enumerate() {
+        assert_eq!(
+            plan.account_selection_policy()
+                .openai_guardian_reserved_concurrency(),
+            index as u32
+        );
         assert_eq!(plan.account_selection_policy().smart_scheduling(), config);
     }
 }

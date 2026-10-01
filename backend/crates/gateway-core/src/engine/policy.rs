@@ -427,17 +427,13 @@ impl RequestPolicyContext {
         if eligible.is_empty() {
             return Ok(None);
         }
-        let policy = context.policy;
         let projected = eligible
             .iter()
             .map(|candidate| AccountScheduleCandidate {
                 account_id: candidate.account.id().clone(),
                 weight: candidate.account.weight().get(),
                 in_flight: candidate.signals.in_flight,
-                maximum_concurrency: candidate
-                    .account
-                    .effective_concurrency(policy.max_concurrent_per_account())
-                    .get(),
+                maximum_concurrency: context.concurrency_limit(&candidate.account).get(),
                 last_started_at: candidate.signals.last_started_at,
                 quota_reset_at: candidate.signals.quota_reset_at,
                 quota_remaining_rank: candidate.signals.quota_remaining_rank,

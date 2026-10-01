@@ -64,6 +64,7 @@ impl CodexBackendClient {
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
+            timezone: Default::default(),
             connection_budget: None,
             response_control: None,
             direct_client: client.clone(),
@@ -303,7 +304,9 @@ impl CodexBackendClient {
                 websocket_create.connection().opening_audit_snapshot(),
                 websocket_payload_audit_snapshot(&websocket_request),
             );
-            if let Err(error) = write_websocket_audit_artifact_from_env(&artifact).await {
+            if let Err(error) =
+                write_websocket_audit_artifact_from_env(&artifact, self.timezone).await
+            {
                 tracing::warn!(error = %error, "Failed to write Codex WebSocket audit artifact");
             }
         }

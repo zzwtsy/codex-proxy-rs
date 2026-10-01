@@ -5,6 +5,13 @@ use super::*;
 pub(crate) fn store_range(
     range: admin_observability::TimeRange,
 ) -> AdminStoreResult<ObservabilityRange> {
+    // 显式外部范围已经校验；自然日零点的空快照仍须返回零计数。
+    if range.start == range.end {
+        return Ok(ObservabilityRange {
+            start: range.start,
+            end: range.end,
+        });
+    }
     ObservabilityRange::new(range.start, range.end).map_err(observability_error)
 }
 

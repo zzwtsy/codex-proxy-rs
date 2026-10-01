@@ -157,14 +157,14 @@ async fn dashboard_summary_should_use_lifetime_totals_for_card_footers() {
 }
 
 #[tokio::test]
-async fn dashboard_summary_should_default_to_current_china_day() {
+async fn dashboard_summary_should_default_to_current_deployment_day() {
     use axum::{
         body::Body,
         http::{Request, StatusCode, header},
     };
     use chrono::{Duration, Utc};
     use gateway_admin::model::observability::{
-        AccountPoolMetrics, DashboardObservation, TimeRange, china_day_start,
+        AccountPoolMetrics, DashboardObservation, TimeRange,
     };
     use gateway_api::admin::observability;
     use tower::ServiceExt as _;
@@ -206,7 +206,12 @@ async fn dashboard_summary_should_default_to_current_china_day() {
         .expect("recorded dashboard summary range");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(range.start, china_day_start(range.end));
+    assert_eq!(
+        range.start,
+        gateway_core::time::DeploymentTimeZone::default()
+            .day_start(range.end)
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -980,4 +985,148 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         value["data"]["items"][2]["billing"]["totalAmountDisplay"],
         "$0.007"
     );
+}
+
+#[tokio::test]
+async fn calendar_queries_and_display_follow_deployment_timezone_with_one_anchor() {
+    use crate::admin::{AdminTestFixture, AdminTestState};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use gateway_admin::model::observability::{CalendarPeriod, DashboardObservation, TimeRange};
+    use gateway_api::admin::observability;
+    use gateway_core::time::DeploymentTimeZone;
+    use tower::ServiceExt as _;
+
+    for (name, anchor, start, display, slots) in [
+        (
+            "Asia/Shanghai",
+            "2026-10-01T00:00:00Z",
+            "2026-09-30T16:00:00Z",
+            "2026-10-01 08:00:00",
+            96,
+        ),
+        (
+            "UTC",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01 00:00:00",
+            96,
+        ),
+        (
+            "Asia/Kathmandu",
+            "2026-10-01T00:00:00Z",
+            "2026-09-30T18:15:00Z",
+            "2026-10-01 05:45:00",
+            96,
+        ),
+        (
+            "America/New_York",
+            "2026-03-09T03:59:00Z",
+            "2026-03-08T05:00:00Z",
+            "2026-03-08 23:59:00",
+            92,
+        ),
+        (
+            "America/New_York",
+            "2026-11-02T04:59:00Z",
+            "2026-11-01T04:00:00Z",
+            "2026-11-01 23:59:00",
+            100,
+        ),
+    ] {
+        let timezone: DeploymentTimeZone = name.parse().unwrap();
+        let end: chrono::DateTime<Utc> = anchor.parse().unwrap();
+        let range = TimeRange::calendar_at(CalendarPeriod::Today, end, timezone).unwrap();
+        let fixture = AdminTestFixture::with_timezone(timezone).await;
+        fixture.auth.insert_session("valid-session");
+        *fixture.dashboard_observation.lock().unwrap() = Some(DashboardObservation {
+            range,
+            totals: Default::default(),
+            provider_accounts: Default::default(),
+            trend: Vec::new(),
+            account_usage: Vec::new(),
+            recent_requests: Vec::new(),
+        });
+        let router = observability::router::<AdminTestState>().with_state(fixture.state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/admin/dashboard/summary?period=today&asOf={}",
+                        end.timestamp_millis()
+                    ))
+                    .header(header::COOKIE, "cpr_session=valid-session")
+                    .header("x-request-id", "req_timezone_calendar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{name}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let queried = fixture.dashboard_summary_range.lock().unwrap().unwrap();
+        assert_eq!(
+            queried.start,
+            start.parse::<chrono::DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(queried.end, end);
+        assert_eq!(value["data"]["asOf"], anchor);
+        assert_eq!(value["data"]["asOfDisplay"], display);
+        let points = value["data"]["healthTimeline"]["points"]
+            .as_array()
+            .unwrap();
+        assert_eq!(points.len(), slots);
+        let labels = points
+            .iter()
+            .map(|p| p["time"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(labels.len(), slots, "fold labels remain distinct");
+        let invalid = router.oneshot(Request::builder()
+            .uri(format!("/api/admin/dashboard/summary?period=today&asOf={}&startTime=2026-01-01T00%3A00%3A00Z", end.timestamp_millis()))
+            .header(header::COOKIE, "cpr_session=valid-session")
+            .header("x-request-id", "req_timezone_mixed_range")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn calendar_query_rejects_an_anchor_outside_the_local_calendar() {
+    use crate::admin::{AdminTestFixture, AdminTestState};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use gateway_api::admin::observability;
+    use tower::ServiceExt as _;
+
+    let fixture = AdminTestFixture::with_timezone(Default::default()).await;
+    fixture.auth.insert_session("valid-session");
+    let response = observability::router::<AdminTestState>()
+        .with_state(fixture.state())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/admin/dashboard/summary?period=today&asOf={}",
+                    chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis()
+                ))
+                .header(header::COOKIE, "cpr_session=valid-session")
+                .header("x-request-id", "req_timezone_out_of_range")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(fixture.dashboard_summary_range.lock().unwrap().is_none());
 }

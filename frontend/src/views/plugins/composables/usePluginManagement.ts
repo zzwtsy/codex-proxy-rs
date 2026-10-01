@@ -36,7 +36,8 @@ export function usePluginManagement() {
   const loading = shallowRef(false)
   const catalog = computed(() => groupInstalledPlugins(artifacts.value, instances.value, sources.value))
   const selectedPluginId = shallowRef('')
-  const selectedPlugin = computed(() => catalog.value.find(plugin => plugin.id === selectedPluginId.value) ?? null)
+  const currentPlugin = computed(() => catalog.value.find(plugin => plugin.id === selectedPluginId.value) ?? null)
+  const selectedPlugin = shallowRef<ReturnType<typeof groupInstalledPlugins>[number] | null>(null)
   const showDetail = shallowRef(false)
   const detailSection = shallowRef<'configurations' | 'versions'>('configurations')
 
@@ -174,8 +175,13 @@ export function usePluginManagement() {
     }
   }
   watch(instances, schedulePoll)
-  watch(selectedPlugin, (plugin) => {
-    if (!plugin)
+  watch([currentPlugin, showDetail], ([plugin, visible]) => {
+    if (!visible)
+      return
+    // 卸载或刷新使条目消失时，保留最后一帧详情直到窗口退场完成。
+    if (plugin)
+      selectedPlugin.value = plugin
+    else
       showDetail.value = false
   })
   onScopeDispose(() => {

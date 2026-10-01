@@ -166,11 +166,12 @@ impl BackupRepository for FakeBackupRepository {
         command: UpdateBackupScheduleCommand,
         next_run_at: Option<DateTime<Utc>>,
         _context: &MutationContext,
+        timezone: gateway_core::time::DeploymentTimeZone,
     ) -> AdminStoreResult<BackupSettings> {
         let mut settings = self.settings.lock().expect("settings");
         settings.schedule_enabled = command.schedule_enabled;
         settings.cron_expression = Some(command.cron_expression);
-        settings.schedule_timezone = Some(command.schedule_timezone);
+        settings.schedule_timezone = Some(timezone.name().to_owned());
         settings.retention_days = command.retention_days;
         settings.retention_count = command.retention_count;
         settings.next_run_at = next_run_at;
@@ -205,7 +206,23 @@ impl BackupRepository for FakeBackupRepository {
         Ok(record)
     }
 
-    async fn insert_scheduled_record(&self, seed: BackupRecordSeed) -> AdminStoreResult<bool> {
+    async fn insert_scheduled_record(
+        &self,
+        seed: BackupRecordSeed,
+        next_run_at: Option<DateTime<Utc>>,
+        expected_cron: &str,
+        expected_timezone: &str,
+        expected_next_run_at: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool> {
+        let mut settings = self.settings.lock().expect("settings");
+        if !settings.schedule_enabled
+            || settings.cron_expression.as_deref() != Some(expected_cron)
+            || settings.schedule_timezone.as_deref() != Some(expected_timezone)
+            || settings.next_run_at != expected_next_run_at
+        {
+            return Ok(false);
+        }
+        settings.next_run_at = next_run_at;
         let mut records = self.records.lock().expect("records");
         if records.iter().any(|record| record.status.is_active())
             || records.iter().any(|record| {
@@ -391,11 +408,21 @@ impl BackupRepository for FakeBackupRepository {
     async fn advance_schedule_cursor(
         &self,
         next_run_at: DateTime<Utc>,
-        _expected_cron: &str,
-        _expected_timezone: &str,
+        expected_cron: &str,
+        expected_timezone: Option<&str>,
+        expected_next_run_at: Option<DateTime<Utc>>,
+        timezone: &str,
     ) -> AdminStoreResult<bool> {
         let mut settings = self.settings.lock().expect("settings");
+        if !settings.schedule_enabled
+            || settings.cron_expression.as_deref() != Some(expected_cron)
+            || settings.schedule_timezone.as_deref() != expected_timezone
+            || settings.next_run_at != expected_next_run_at
+        {
+            return Ok(false);
+        }
         settings.next_run_at = Some(next_run_at);
+        settings.schedule_timezone = Some(timezone.to_owned());
         Ok(true)
     }
 

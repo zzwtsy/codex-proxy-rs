@@ -11,19 +11,21 @@ const props = withDefaults(
     status: AccountStatus
     errorReason?: AccountErrorReason | null
     errorMessage?: string | null
-    rateLimitedUntil?: string | null
+    rateLimitRecoveryDisplay?: string | null
     rateLimitReason?: 'upstream_rate_limit' | 'capacity_freeze' | null
     recoveryProbeRequired?: boolean
     nextRefreshAt?: string | null
+    nextRefreshAtDisplay?: string | null
     variant?: 'inline' | 'pill'
   }>(),
   {
     errorReason: null,
     errorMessage: null,
-    rateLimitedUntil: null,
+    rateLimitRecoveryDisplay: null,
     rateLimitReason: null,
     recoveryProbeRequired: false,
     nextRefreshAt: null,
+    nextRefreshAtDisplay: null,
     variant: 'inline',
   },
 )
@@ -34,10 +36,11 @@ const presentation = computed(() =>
     status: props.status,
     errorReason: props.errorReason,
     errorMessage: props.errorMessage,
-    rateLimitedUntil: props.rateLimitedUntil,
+    rateLimitRecoveryDisplay: props.rateLimitRecoveryDisplay,
     rateLimitReason: props.rateLimitReason,
     recoveryProbeRequired: props.recoveryProbeRequired,
     nextRefreshAt: props.nextRefreshAt,
+    nextRefreshAtDisplay: props.nextRefreshAtDisplay,
     now: now.value.getTime(),
   }),
 )

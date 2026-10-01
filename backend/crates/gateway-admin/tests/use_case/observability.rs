@@ -20,7 +20,7 @@ use gateway_admin::{
             DiagnosticsObservation, Granularity, HealthStatus, LatencyPercentiles, OpsErrorPage,
             OpsErrorQuery, PercentileMilliseconds, RequestMetricPoint, RequestMetrics, TimeRange,
             TrendKind, UsageBilling, UsageCalculatedBillingFact, UsageDetail, UsageFilter,
-            UsageListRecord, UsageOverview, UsagePage, UsageQuery, china_day_start,
+            UsageListRecord, UsageOverview, UsagePage, UsageQuery,
         },
         settings::{
             AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RotationStrategy,
@@ -49,7 +49,9 @@ fn external_observability_range_rejects_over_366_days_and_reversed_range() {
 #[tokio::test]
 async fn health_timeline_should_keep_exactly_china_day_quarter_hour_slots() {
     let now = Utc::now();
-    let day_start = china_day_start(now);
+    let day_start = gateway_core::time::DeploymentTimeZone::default()
+        .day_start(now)
+        .unwrap();
     let current_slot = quarter_hour_start(now);
     let store = Arc::new(FixtureObservabilityStore::new(observation_range(now)));
     store.replace_trend(vec![
@@ -300,9 +302,20 @@ async fn dashboard_summary_should_coalesce_concurrent_requests_in_one_short_wind
     let end_bucket = Utc::now().timestamp().div_euclid(2) * 2;
     let first_end = DateTime::from_timestamp(end_bucket, 100_000_000).expect("first end");
     let second_end = DateTime::from_timestamp(end_bucket, 900_000_000).expect("second end");
-    let first_range = TimeRange::new(china_day_start(first_end), first_end).expect("first range");
-    let second_range =
-        TimeRange::new(china_day_start(second_end), second_end).expect("second range");
+    let first_range = TimeRange::new(
+        gateway_core::time::DeploymentTimeZone::default()
+            .day_start(first_end)
+            .unwrap(),
+        first_end,
+    )
+    .expect("first range");
+    let second_range = TimeRange::new(
+        gateway_core::time::DeploymentTimeZone::default()
+            .day_start(second_end)
+            .unwrap(),
+        second_end,
+    )
+    .expect("second range");
     let store = Arc::new(FixtureObservabilityStore::new(first_range));
     store.set_dashboard_delay(StdDuration::from_millis(20));
     let services = observability_services(store.clone()).await;
@@ -323,9 +336,20 @@ async fn dashboard_summary_should_reload_after_the_short_window_changes() {
     let end_bucket = Utc::now().timestamp().div_euclid(2) * 2;
     let first_end = DateTime::from_timestamp(end_bucket, 100_000_000).expect("first end");
     let second_end = first_end + Duration::seconds(2);
-    let first_range = TimeRange::new(china_day_start(first_end), first_end).expect("first range");
-    let second_range =
-        TimeRange::new(china_day_start(second_end), second_end).expect("second range");
+    let first_range = TimeRange::new(
+        gateway_core::time::DeploymentTimeZone::default()
+            .day_start(first_end)
+            .unwrap(),
+        first_end,
+    )
+    .expect("first range");
+    let second_range = TimeRange::new(
+        gateway_core::time::DeploymentTimeZone::default()
+            .day_start(second_end)
+            .unwrap(),
+        second_end,
+    )
+    .expect("second range");
     let store = Arc::new(FixtureObservabilityStore::new(first_range));
     let services = observability_services(store.clone()).await;
     let observability = services.observability();
@@ -912,6 +936,7 @@ impl SettingsStore for FixtureSettingsStore {
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
+            openai_guardian_reserved_concurrency: 0,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
             rotation_strategy: RotationStrategy::Smart,

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 
 use crate::{
     AuthService, SystemService,
@@ -15,9 +14,7 @@ use crate::{
             KeyUsageOverview, KeyUsageQuery, KeyUsageRecordKind, KeyUsageRecords,
             KeyUsageRecordsQuery,
         },
-        observability::{
-            OpsErrorFilter, OpsErrorQuery, TimeRange, UsageFilter, UsageQuery, china_day_start,
-        },
+        observability::{OpsErrorFilter, OpsErrorQuery, TimeRange, UsageFilter, UsageQuery},
         system::SystemVersion,
     },
     ports::store::{ClientKeyStore, ObservabilityStore},
@@ -62,6 +59,7 @@ pub trait KeyUsageService: Send + Sync {
 }
 
 pub(crate) struct DefaultKeyUsageService {
+    timezone: gateway_core::time::DeploymentTimeZone,
     auth: Arc<dyn AuthService>,
     verifier: Arc<dyn ClientKeyVerifier>,
     keys: Arc<dyn ClientKeyStore>,
@@ -76,8 +74,10 @@ impl DefaultKeyUsageService {
         keys: Arc<dyn ClientKeyStore>,
         observations: Arc<dyn ObservabilityStore>,
         system: Arc<dyn SystemService>,
+        timezone: gateway_core::time::DeploymentTimeZone,
     ) -> Self {
         Self {
+            timezone,
             auth,
             verifier,
             keys,
@@ -181,10 +181,13 @@ impl KeyUsageService for DefaultKeyUsageService {
             return Ok(None);
         };
         let filter = usage_filter(&id, query.model);
-        let now = Utc::now();
-        // 健康条始终展示北京时间今日，不随历史范围或模型筛选改变。
+        let now = query.range.end;
+        // 健康条始终展示部署时区今日，不随历史范围或模型筛选改变。
         let today = TimeRange {
-            start: china_day_start(now),
+            start: self
+                .timezone
+                .day_start(now)
+                .ok_or_else(|| AdminError::internal("时间超出支持范围"))?,
             end: now,
         };
         let (overview, trend, health_points) = futures::try_join!(
@@ -198,7 +201,7 @@ impl KeyUsageService for DefaultKeyUsageService {
             key,
             overview,
             trend,
-            health_timeline: health_timeline_at(&health_points, now),
+            health_timeline: health_timeline_at(&health_points, now, self.timezone)?,
         }))
     }
 

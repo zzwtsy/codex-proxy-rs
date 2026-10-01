@@ -18,7 +18,6 @@ import { storeToRefs } from 'pinia'
 import { computed, nextTick, shallowRef, useTemplateRef, watch } from 'vue'
 import { checkSystemRestart } from '@/api'
 import { normalizeSystemVersion, useSystemUpdateStore } from '@/stores/modules/system-update'
-import { formatDateTime, formatTime } from '@/utils/format'
 import { errorMessage } from '@/utils/operation'
 import {
   resolveSystemUpdateLogClasses,
@@ -78,7 +77,7 @@ const presentation = computed(() => resolveSystemUpdatePresentation({
 const updateLogRows = computed(() =>
   updateLogs.value.map(item => ({
     ...item,
-    time: formatTime(item.at, '--:--:--'),
+    time: item.atDisplay || '--:--:--',
     classes: resolveSystemUpdateLogClasses(item.level),
   })),
 )
@@ -344,7 +343,7 @@ watch(
           <div class="grid w-80 max-w-[calc(100vw-2rem)] gap-2 p-3 text-cp-sm">
             <div v-if="lastFailedOperation.targetVersion || lastFailedOperation.finishedAt" class="flex flex-wrap gap-x-3 gap-y-1 text-cp-xs text-cp-text-quaternary">
               <span v-if="lastFailedOperation.targetVersion">目标版本 v{{ lastFailedOperation.targetVersion }}</span>
-              <span v-if="lastFailedOperation.finishedAt">{{ formatDateTime(lastFailedOperation.finishedAt) }}</span>
+              <span v-if="lastFailedOperation.finishedAt">{{ lastFailedOperation.finishedAtDisplay }}</span>
             </div>
             <p class="m-0 wrap-anywhere text-cp-text-secondary">
               {{ lastFailedOperation.error || lastFailedOperation.message || '操作失败' }}

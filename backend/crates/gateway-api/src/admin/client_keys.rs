@@ -353,10 +353,16 @@ pub struct ClientKeyView {
     daily_used_usd: String,
     weekly_used_usd: String,
     daily_resets_at: Option<DateTime<Utc>>,
+    daily_resets_at_display: Option<String>,
     weekly_resets_at: Option<DateTime<Utc>>,
+    weekly_resets_at_display: Option<String>,
     created_at: DateTime<Utc>,
+    created_at_display: String,
     updated_at: DateTime<Utc>,
+    updated_at_display: String,
     last_used_at: Option<DateTime<Utc>>,
+    last_used_at_display: String,
+    last_used_at_full_display: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -368,8 +374,8 @@ pub struct ClientKeyGroupView {
     enabled: bool,
 }
 
-impl From<ClientKeyRecord> for ClientKeyView {
-    fn from(record: ClientKeyRecord) -> Self {
+impl From<(ClientKeyRecord, crate::time::TimePresenter)> for ClientKeyView {
+    fn from((record, time): (ClientKeyRecord, crate::time::TimePresenter)) -> Self {
         let routing_scope = if record.groups.is_empty() {
             "all"
         } else {
@@ -413,10 +419,25 @@ impl From<ClientKeyRecord> for ClientKeyView {
             weekly_limit_usd: record.budget.limits.weekly_usd.canonical(),
             daily_used_usd: record.budget.daily_used_usd.canonical(),
             weekly_used_usd: record.budget.weekly_used_usd.canonical(),
+            daily_resets_at_display: record
+                .budget
+                .daily_resets_at
+                .map(|value| time.datetime(&value.into())),
             daily_resets_at: record.budget.daily_resets_at.map(DateTime::from),
+            weekly_resets_at_display: record
+                .budget
+                .weekly_resets_at
+                .map(|value| time.datetime(&value.into())),
             weekly_resets_at: record.budget.weekly_resets_at.map(DateTime::from),
+            created_at_display: time.datetime(&record.created_at),
             created_at: record.created_at,
+            updated_at_display: time.datetime(&record.updated_at),
             updated_at: record.updated_at,
+            last_used_at_display: time.relative_optional(record.last_used_at, time.now()),
+            last_used_at_full_display: record
+                .last_used_at
+                .as_ref()
+                .map(|value| time.datetime(value)),
             last_used_at: record.last_used_at,
         }
     }
@@ -443,10 +464,12 @@ impl ClientKeyListData {
     }
 }
 
-impl TryFrom<ClientKeyPage> for ClientKeyListData {
+impl TryFrom<(ClientKeyPage, crate::time::TimePresenter)> for ClientKeyListData {
     type Error = WireValidationError;
 
-    fn try_from(page: ClientKeyPage) -> Result<Self, Self::Error> {
+    fn try_from(
+        (page, time): (ClientKeyPage, crate::time::TimePresenter),
+    ) -> Result<Self, Self::Error> {
         let next_cursor = page
             .next_cursor
             .map(wire_cursor)
@@ -455,7 +478,10 @@ impl TryFrom<ClientKeyPage> for ClientKeyListData {
             .map(encode_client_key_cursor)
             .transpose()?;
         Ok(Self::new(
-            page.items.into_iter().map(Into::into).collect(),
+            page.items
+                .into_iter()
+                .map(|value| ClientKeyView::from((value, time)))
+                .collect(),
             next_cursor,
             page.total,
         ))
@@ -888,13 +914,14 @@ async fn list_client_keys<S>(
 where
     S: SessionState + Send + Sync,
 {
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
     let result = state
         .admin_services()
         .client_keys()
         .list(query.into_command().map_err(map_wire_error)?)
         .await
         .map_err(map_service_error)?;
-    let data = ClientKeyListData::try_from(result).map_err(|_| AdminError::internal())?;
+    let data = ClientKeyListData::try_from((result, time)).map_err(|_| AdminError::internal())?;
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
 }
 

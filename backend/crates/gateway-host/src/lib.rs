@@ -56,7 +56,7 @@ pub async fn initialize(config: HostConfig) -> Result<HostBundle, HostError> {
             .official_plugins_dir()
             .map_err(|_| HostError::OfficialPluginRelease)?,
     ));
-    let log_guard = initialize_logging(&config.logging)?;
+    let log_guard = initialize_logging(&config.logging, config.timezone)?;
     let cancellation = CancellationToken::new();
     let connections = Arc::new(ConnectionTracker::new(cancellation.clone()));
     let workers = WorkerSupervisor::new(cancellation.clone());

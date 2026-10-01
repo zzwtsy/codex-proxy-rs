@@ -64,13 +64,7 @@ impl PgAdminAccountStore {
         let mut observations = Vec::with_capacity(account_ids.len());
         for account_ids in account_ids.chunks(ADMIN_USAGE_CHUNK_SIZE) {
             let query = ProviderAccountUsageQuery::for_accounts(range, account_ids.to_vec())
-                .and_then(|query| {
-                    if range.end.signed_duration_since(range.start) <= TimeDelta::hours(24) {
-                        query.with_hourly_request_buckets()
-                    } else {
-                        Ok(query)
-                    }
-                })
+                .and_then(ProviderAccountUsageQuery::with_hourly_request_buckets)
                 .map_err(|error| admin_store_error(ENTITY, error))?;
             observations.extend(
                 self.observability
