@@ -72,7 +72,7 @@ services:
     logging: *json-logging
 
   codex-proxy-rs:
-    image: ${CPR_IMAGE:-ghcr.io/zyycn/codex-proxy-rs:latest}
+    image: ${CPR_IMAGE:-ghcr.io/zzwtsy/codex-proxy-rs:latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -131,7 +131,7 @@ services:
       CPR_REDIS_URL: redis://redis:6379/
       CPR_REDIS_PASSWORD: '${CPR_REDIS_PASSWORD:?Set CPR_REDIS_PASSWORD in the project root .env}'
       CPR_DEPLOYMENT_MODE: docker
-      CPR_UPDATE_REPOSITORY: zyycn/codex-proxy-rs
+      CPR_UPDATE_REPOSITORY: zzwtsy/codex-proxy-rs
       CPR_GITHUB_API_BASE: https://api.github.com/repos
       CPR_UPDATE_EXE_PATH: /app/bin/codex-proxy-rs
       CPR_WEB_DIST_DIR: /app/web/dist
