@@ -363,13 +363,13 @@ fn assert_rejected(config: String) {
 fn valid_config() -> String {
     CONFIG_EXAMPLE
         .replacen(
-            "password: &postgres_password ''",
-            &format!("password: &postgres_password '{POSTGRES_PASSWORD}'"),
+            "    password: ''",
+            &format!("    password: '{POSTGRES_PASSWORD}'"),
             1,
         )
         .replacen(
-            "password: &redis_password ''",
-            &format!("password: &redis_password '{REDIS_PASSWORD}'"),
+            "    password: ''",
+            &format!("    password: '{REDIS_PASSWORD}'"),
             1,
         )
         .replace(
