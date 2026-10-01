@@ -15,6 +15,8 @@ RUNTIME_DIR="${INSTALL_DIR}/.runtime"
 CONFIG_EXAMPLE="${DEPLOY_DIR}/config.example.yaml"
 CONFIG_FILE="${DEPLOY_DIR}/config.yaml"
 COMPOSE_FILE="${DEPLOY_DIR}/compose.yaml"
+ENV_FILE="${INSTALL_DIR}/.env"
+CREDENTIALS_TEMP_FILE=""
 
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
@@ -38,19 +40,27 @@ warn() {
 
 die() {
   printf '%b[x]%b %s\n' "$RED" "$NC" "$*" >&2
+  if [[ -n "$CREDENTIALS_TEMP_FILE" ]]; then
+    rm -f -- "$CREDENTIALS_TEMP_FILE" || true
+    CREDENTIALS_TEMP_FILE=""
+  fi
   exit 1
 }
 
 on_error() {
   local code=$?
 
+  if [[ -n "$CREDENTIALS_TEMP_FILE" ]]; then
+    rm -f -- "$CREDENTIALS_TEMP_FILE" || true
+    CREDENTIALS_TEMP_FILE=""
+  fi
   printf '\n' >&2
   warn "部署失败，退出码：${code}"
   warn "安装目录已保留：${INSTALL_DIR}"
   if [[ -f "$COMPOSE_FILE" ]]; then
     warn "可执行以下命令查看状态："
-    printf '    cd %q && docker compose -f deploy/compose.yaml ps\n' "$INSTALL_DIR" >&2
-    printf '    cd %q && docker compose -f deploy/compose.yaml logs --tail=200\n' "$INSTALL_DIR" >&2
+    printf '    cd %q && docker compose --env-file .env -f deploy/compose.yaml ps\n' "$INSTALL_DIR" >&2
+    printf '    cd %q && docker compose --env-file .env -f deploy/compose.yaml logs --tail=200\n' "$INSTALL_DIR" >&2
   fi
   exit "$code"
 }
@@ -151,34 +161,90 @@ yaml_single_quote() {
   printf "'%s'" "$value"
 }
 
+write_credentials_env() {
+  local database_key_pattern='^[[:blank:]]*(export[[:blank:]]+)?CPR_DATABASE_PASSWORD($|[^[:alnum:]_].*)$'
+  local redis_key_pattern='^[[:blank:]]*(export[[:blank:]]+)?CPR_REDIS_PASSWORD($|[^[:alnum:]_].*)$'
+  local database_value_pattern='^[[:blank:]]*(export[[:blank:]]+)?CPR_DATABASE_PASSWORD[[:blank:]]*=[[:blank:]]*([0-9A-Fa-f]{48})[[:space:]]*$'
+  local redis_value_pattern='^[[:blank:]]*(export[[:blank:]]+)?CPR_REDIS_PASSWORD[[:blank:]]*=[[:blank:]]*([0-9A-Fa-f]{48})[[:space:]]*$'
+  local database_count=0 redis_count=0
+  local database_password="" redis_password="" line
+
+  if [[ -L "$ENV_FILE" || ( -e "$ENV_FILE" && ! -f "$ENV_FILE" ) ]]; then
+    die "项目根目录 .env 必须是普通文件，未修改该路径。"
+  fi
+
+  if [[ -f "$ENV_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ $database_key_pattern ]]; then
+        database_count=$((database_count + 1))
+        if [[ "$line" =~ $database_value_pattern ]]; then
+          database_password="${BASH_REMATCH[2]}"
+        else
+          die ".env 中的 CPR_DATABASE_PASSWORD 格式无效；应为不带引号的 48 位十六进制值。"
+        fi
+      elif [[ "$line" =~ $redis_key_pattern ]]; then
+        redis_count=$((redis_count + 1))
+        if [[ "$line" =~ $redis_value_pattern ]]; then
+          redis_password="${BASH_REMATCH[2]}"
+        else
+          die ".env 中的 CPR_REDIS_PASSWORD 格式无效；应为不带引号的 48 位十六进制值。"
+        fi
+      fi
+    done < "$ENV_FILE"
+  fi
+
+  if (( database_count > 1 )); then
+    die ".env 中 CPR_DATABASE_PASSWORD 重复；请保留一个定义后重试。"
+  fi
+  if (( redis_count > 1 )); then
+    die ".env 中 CPR_REDIS_PASSWORD 重复；请保留一个定义后重试。"
+  fi
+
+  if [[ -z "$database_password" ]]; then
+    database_password="$(random_password)"
+  fi
+  if [[ -z "$redis_password" ]]; then
+    redis_password="$(random_password)"
+  fi
+
+  CREDENTIALS_TEMP_FILE="$(mktemp "${ENV_FILE}.XXXXXX")" \
+    || die "无法在安装目录创建临时凭据文件。"
+  chmod 0600 "$CREDENTIALS_TEMP_FILE"
+
+  if [[ -f "$ENV_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ $database_key_pattern || "$line" =~ $redis_key_pattern ]]; then
+        continue
+      fi
+      printf '%s\n' "$line" >> "$CREDENTIALS_TEMP_FILE"
+    done < "$ENV_FILE"
+  fi
+
+  printf 'CPR_DATABASE_PASSWORD=%s\nCPR_REDIS_PASSWORD=%s\n' \
+    "$database_password" "$redis_password" >> "$CREDENTIALS_TEMP_FILE"
+  chmod 0600 "$CREDENTIALS_TEMP_FILE"
+  mv -f -- "$CREDENTIALS_TEMP_FILE" "$ENV_FILE"
+  CREDENTIALS_TEMP_FILE=""
+}
+
 patch_config() {
-  local postgres_password redis_password admin_password
-  local postgres_count=0 redis_count=0 admin_count=0
+  local admin_password
+  local admin_count=0
   local line rendered=''
-  local postgres_pattern="^([[:blank:]]*password:[[:blank:]]*&postgres_password[[:blank:]]*)''[[:blank:]]*$"
-  local redis_pattern="^([[:blank:]]*password:[[:blank:]]*&redis_password[[:blank:]]*)''[[:blank:]]*$"
   local admin_pattern="^([[:blank:]]*default_password:[[:blank:]]*)''[[:blank:]]*$"
 
-  postgres_password="$(yaml_single_quote "$1")"
-  redis_password="$(yaml_single_quote "$2")"
-  admin_password="$(yaml_single_quote "$3")"
+  admin_password="$(yaml_single_quote "$1")"
 
-  # 按模板中的空密码占位替换；先完整检查，再写文件，避免留下半份配置。
+  # 只填入管理员初始密码；Compose 数据库凭据保存在独立 .env 中。
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" =~ $postgres_pattern ]]; then
-      line="${BASH_REMATCH[1]}${postgres_password}"
-      postgres_count=$((postgres_count + 1))
-    elif [[ "$line" =~ $redis_pattern ]]; then
-      line="${BASH_REMATCH[1]}${redis_password}"
-      redis_count=$((redis_count + 1))
-    elif [[ "$line" =~ $admin_pattern ]]; then
+    if [[ "$line" =~ $admin_pattern ]]; then
       line="${BASH_REMATCH[1]}${admin_password}"
       admin_count=$((admin_count + 1))
     fi
     rendered+="$line"$'\n'
   done < "$CONFIG_EXAMPLE"
 
-  if (( postgres_count != 1 || redis_count != 1 || admin_count != 1 )); then
+  if (( admin_count != 1 )); then
     die "config.example.yaml 结构与安装脚本预期不一致，已停止以免生成错误配置。"
   fi
   printf '%s' "$rendered" > "$CONFIG_FILE"
@@ -192,11 +258,11 @@ service_user_ids() {
 
   uid="$(
     cd "$INSTALL_DIR"
-    docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint id "$service" -u "$user"
+    docker compose --env-file .env -f deploy/compose.yaml run --rm --no-deps --entrypoint id "$service" -u "$user"
   )"
   gid="$(
     cd "$INSTALL_DIR"
-    docker compose -f deploy/compose.yaml run --rm --no-deps --entrypoint id "$service" -g "$user"
+    docker compose --env-file .env -f deploy/compose.yaml run --rm --no-deps --entrypoint id "$service" -g "$user"
   )"
 
   [[ "$uid" =~ ^[0-9]+$ ]] || die "无法读取 ${service} 容器用户 ${user} 的 UID。"
@@ -247,8 +313,6 @@ check_health() {
 
 main() {
   local existing_config=0
-  local postgres_password
-  local redis_password
 
   printf '\n'
   printf '%s\n' '============================================='
@@ -280,14 +344,13 @@ main() {
     fi
   else
     download_release_files
-    postgres_password="$(random_password)"
-    redis_password="$(random_password)"
     if [[ -z "$ADMIN_PASSWORD" ]]; then
       ADMIN_PASSWORD="$(openssl rand -hex 16)"
     fi
     validate_admin_password "$ADMIN_PASSWORD"
-    log "生成 PostgreSQL、Redis 和管理员密码"
-    patch_config "$postgres_password" "$redis_password" "$ADMIN_PASSWORD"
+    log "准备 PostgreSQL、Redis 凭据和管理员密码"
+    write_credentials_env
+    patch_config "$ADMIN_PASSWORD"
   fi
 
   log "创建运行目录"
@@ -300,13 +363,13 @@ main() {
   log "验证 Docker Compose 配置"
   (
     cd "$INSTALL_DIR"
-    docker compose -f deploy/compose.yaml config --quiet
+    docker compose --env-file .env -f deploy/compose.yaml config --quiet
   )
 
   log "拉取容器镜像"
   (
     cd "$INSTALL_DIR"
-    docker compose -f deploy/compose.yaml pull
+    docker compose --env-file .env -f deploy/compose.yaml pull
   )
 
   fix_runtime_permissions
@@ -314,13 +377,13 @@ main() {
   log "启动服务"
   (
     cd "$INSTALL_DIR"
-    docker compose -f deploy/compose.yaml up -d --no-build --wait
+    docker compose --env-file .env -f deploy/compose.yaml up -d --no-build --wait
   )
 
   log "检查容器状态"
   (
     cd "$INSTALL_DIR"
-    docker compose -f deploy/compose.yaml ps
+    docker compose --env-file .env -f deploy/compose.yaml ps
   )
 
   info "验证健康检查接口"
@@ -329,7 +392,7 @@ main() {
     warn "最近日志："
     (
       cd "$INSTALL_DIR"
-      docker compose -f deploy/compose.yaml logs --tail=100 codex-proxy-rs
+      docker compose --env-file .env -f deploy/compose.yaml logs --tail=100 codex-proxy-rs
     ) || true
     return 1
   fi
@@ -348,13 +411,14 @@ main() {
   fi
   printf '安装目录：      %s\n' "$INSTALL_DIR"
   printf '配置文件：      %s\n' "$CONFIG_FILE"
+  printf '凭据文件：      %s\n' "$ENV_FILE"
   printf '\n'
   printf '常用命令：\n'
   printf '  cd %q\n' "$INSTALL_DIR"
-  printf '  docker compose -f deploy/compose.yaml ps\n'
-  printf '  docker compose -f deploy/compose.yaml logs -f codex-proxy-rs\n'
-  printf '  docker compose -f deploy/compose.yaml restart codex-proxy-rs\n'
-  printf '  docker compose -f deploy/compose.yaml down\n'
+  printf '  docker compose --env-file .env -f deploy/compose.yaml ps\n'
+  printf '  docker compose --env-file .env -f deploy/compose.yaml logs -f codex-proxy-rs\n'
+  printf '  docker compose --env-file .env -f deploy/compose.yaml restart codex-proxy-rs\n'
+  printf '  docker compose --env-file .env -f deploy/compose.yaml down\n'
   printf '\n'
   if [[ "$existing_config" -eq 0 ]]; then
     printf '%b请立即保存管理员密码。%b\n' "$YELLOW" "$NC"

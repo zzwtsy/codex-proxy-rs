@@ -36,11 +36,13 @@ pnpm --dir frontend install --frozen-lockfile
 数据库及 Redis 可由 Compose 启动：
 
 ```bash
-docker compose -f deploy/compose.yaml up -d postgres redis
+docker compose --env-file .env -f deploy/compose.yaml up -d postgres redis
 cargo run --manifest-path backend/Cargo.toml -p codex-proxy-rs
 ```
 
-后端从当前目录向上查找 `deploy/config.yaml`，本机运行时数据库与 Redis 地址应指向可访问的本机端口
+后端从当前目录向上查找 `deploy/config.yaml`，本机运行时数据库与 Redis 地址应指向可访问的本机端口。
+上述 Compose 命令通过 `--env-file .env` 读取仓库根目录密码文件；宿主机直接运行的 `cargo run` 不会读取该文件。
+本机运行时请在配置文件填写密码，或为后端进程设置 `CPR_DATABASE_PASSWORD` 和 `CPR_REDIS_PASSWORD`
 
 `host.runtime_data_dir` 和日志的相对路径以该配置文件所在目录解析
 

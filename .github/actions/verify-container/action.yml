@@ -83,15 +83,15 @@ runs:
         ruby <<'RUBY'
         path = "deploy/config.example.yaml"
         content = File.read(path)
-        replacements = {
-          "password: &postgres_password ''" => "password: &postgres_password '#{ENV.fetch("CI_POSTGRES_PASSWORD")}'",
-          "password: &redis_password ''" => "password: &redis_password '#{ENV.fetch("CI_REDIS_PASSWORD")}'",
-          "default_password: ''" => "default_password: '#{ENV.fetch("CI_ADMIN_PASSWORD")}'",
-        }
-        replacements.each do |placeholder, configured|
-          raise "missing config placeholder: #{placeholder}" unless content.sub!(placeholder, configured)
-        end
+        placeholder = "default_password: ''"
+        configured = "default_password: '#{ENV.fetch("CI_ADMIN_PASSWORD")}'"
+        raise "missing config placeholder: #{placeholder}" unless content.sub!(placeholder, configured)
         File.write("deploy/config.yaml", content)
+        File.write(".env", <<~ENV)
+          CPR_DATABASE_PASSWORD=#{ENV.fetch("CI_POSTGRES_PASSWORD")}
+          CPR_REDIS_PASSWORD=#{ENV.fetch("CI_REDIS_PASSWORD")}
+        ENV
+        File.chmod(0o600, ".env")
         RUBY
         sudo chown "$(id -u):10001" deploy/config.yaml
         chmod 0640 deploy/config.yaml
@@ -100,7 +100,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+        docker compose --env-file .env --project-name "$COMPOSE_PROJECT_NAME" \
           -f deploy/compose.yaml config --quiet
 
     - name: Configure Redis host memory overcommit
@@ -114,7 +114,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+        compose=(docker compose --env-file .env --project-name "$COMPOSE_PROJECT_NAME" \
           -f deploy/compose.yaml)
         "${compose[@]}" up -d --no-build --wait postgres redis
         test "$("${compose[@]}" exec -T -e PGPASSWORD="$CI_POSTGRES_PASSWORD" postgres \
@@ -140,7 +140,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+        compose=(docker compose --env-file .env --project-name "$COMPOSE_PROJECT_NAME" \
           -f deploy/compose.yaml)
         "${compose[@]}" up -d --no-build --wait codex-proxy-rs
         status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
@@ -157,7 +157,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+        compose=(docker compose --env-file .env --project-name "$COMPOSE_PROJECT_NAME" \
           -f deploy/compose.yaml)
         "${compose[@]}" stop --timeout 30 codex-proxy-rs
         container_id="$("${compose[@]}" ps -a -q codex-proxy-rs)"
@@ -189,7 +189,7 @@ runs:
         set +e
         mkdir -p "$DIAGNOSTICS_DIR"
         raw_dir="$(mktemp -d)"
-        compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+        compose=(docker compose --env-file .env --project-name "$COMPOSE_PROJECT_NAME" \
           -f deploy/compose.yaml)
         "${compose[@]}" config > "$raw_dir/compose-config.yaml" 2>&1
         "${compose[@]}" ps -a > "$raw_dir/compose-ps.txt" 2>&1
@@ -237,6 +237,6 @@ runs:
       if: always()
       shell: bash
       run: |
-        docker compose --project-name "$COMPOSE_PROJECT_NAME" \
+        docker compose --env-file .env --project-name "$COMPOSE_PROJECT_NAME" \
           -f deploy/compose.yaml down --remove-orphans || true
         sudo rm -rf "$GITHUB_WORKSPACE/.runtime" "$GITHUB_WORKSPACE/deploy/config.yaml"

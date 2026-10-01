@@ -18,14 +18,16 @@
 
 | 位置 | 内容 | 修改方式 |
 | --- | --- | --- |
-| `deploy/config.yaml` | 监听、数据库/Redis 连接、部署凭据与日志等启动配置 | 从模板创建，已有部署合并修改，不覆盖原文件 |
+| `deploy/config.yaml` | 监听、数据库/Redis 地址、管理员初始密码与日志等应用启动配置 | 从模板创建，已有部署合并修改，不覆盖原文件 |
+| `.env` | Compose 使用的 `CPR_DATABASE_PASSWORD` 和 `CPR_REDIS_PASSWORD` | 安装器生成；手动安装设为 `0600` |
 | `deploy/compose.yaml` | 镜像、容器网络、端口、挂载与资源限制 | 调整 Compose 并重建受影响容器 |
 | PostgreSQL | 账号、Key、运行设置、上游身份、插件配置等业务数据 | 管理端或管理 API |
 | 浏览器本地 | 主题和界面偏好 | 当前浏览器的主题设置 |
 
-项目不使用 `.env` 配置文件。Compose 环境变量用于容器地址、镜像选择和构建发布。
-配置加载会忽略未知字段，并在启动控制台提示字段名；不输出对应值。缺少必填字段时会指出缺项并停止启动，
-已知字段的类型和取值仍需合法；可选字段省略时使用默认值
+Compose 命令从安装目录运行，并通过 `--env-file .env` 明确读取根目录中的数据库与 Redis 密码，分别传给应用和服务容器；
+后端进程本身不读取 `.env`。Compose 外启动时，应在 `store.*.password` 填写密码或设置对应进程环境变量。
+镜像、构建与发布选项仍通过 Compose 环境变量配置。配置加载会忽略未知字段，并在启动控制台提示字段名；
+不输出对应值。缺少必填字段时会指出缺项并停止启动，已知字段的类型和取值仍需合法；可选字段省略时使用默认值
 
 后端从当前目录向上查找 `deploy/config.yaml`，相对数据、日志和静态资源路径以该文件所在目录解析
 
@@ -79,35 +81,45 @@ openssl rand -hex 24
 openssl rand -hex 24
 ```
 
-把两个 48 位十六进制结果分别写入 `deploy/config.yaml` 的：
+把两个 48 位十六进制结果分别写入安装目录根目录的 `.env`：
 
-- `store.database.password`
-- `store.redis.password`
+```dotenv
+CPR_DATABASE_PASSWORD=<第一个 48 位十六进制密码>
+CPR_REDIS_PASSWORD=<第二个 48 位十六进制密码>
+```
 
-另行设置 `admin.default_password`。它至少需要 12 个字符，不能是常见弱口令，也不能包含 `$`。
+设置文件权限并另行填写 `deploy/config.yaml` 中的 `admin.default_password`：
+
+```bash
+chmod 0600 .env
+```
+
+管理员初始密码至少需要 12 个字符，不能是常见弱口令，也不能包含 `$`。
 `client.session_ttl_minutes` 控制统一登录中密钥身份的固定会话有效期，默认 1440 分钟；管理员有效期仍由
 `admin.session_ttl_minutes` 控制。两种身份共用一个 Cookie，成功登录替换旧会话；不改变 `/v1/*` 鉴权和限额
 
-PostgreSQL 与 Redis 密码必须是 48 位十六进制字符。Compose 通过 `config.yaml` 的凭据桥接区
-引用同一密码；三个值都不需要额外导出为环境变量，数据库和 Redis 密码也不能嵌入连接 URL
+PostgreSQL 与 Redis 密码必须是 48 位十六进制字符。Compose 用 `.env` 中的两个变量覆盖
+`store.*.password` 空占位，并传给对应服务；数据库和 Redis 密码不能嵌入连接 URL。
+直接运行二进制时，须在 `config.yaml` 填入密码或为进程设置 `CPR_DATABASE_PASSWORD`、
+`CPR_REDIS_PASSWORD`
 
-Linux 上应用容器以 `10001:10001` 运行。上述命令将应用数据和日志目录设为 `0770`，
-配置设为 `0640`，均由当前用户持有、容器组 `10001` 访问。
+Linux 上应用容器以 `10001:10001` 运行。应用数据和日志目录设为 `0770`，配置设为 `0640`，
+均由当前用户持有、容器组 `10001` 访问；`.env` 保持 `0600` 且不挂载进应用容器。
 `config.yaml` 通过 Compose `configs` 只读挂载，普通 Compose 保留宿主机文件的 UID/GID 和 mode
 
 ### Redis ACL 用户
 
-连接已配置 ACL 用户的 Redis 时，把用户名写在 `store.redis.url` 中，密码仍单独填写：
+连接已配置 ACL 用户的 Redis 时，把用户名写在 `store.redis.url` 中：
 
 ```yaml
 store:
   redis:
     url: 'redis://u1@redis-host:6379/0'
-    password: &redis_password '<u1 的 48 位十六进制密码>'
 ```
 
-将这两项合并到已有配置，保留其他配置和密码锚点；Redis 服务端需事先创建并授权该用户。
-用户名中的 `@`、`:` 等特殊字符需要 URL 百分号编码。未填写用户名时使用 Redis 的 `default` 用户
+将 URL 合并到已有配置，并把该用户的 48 位十六进制密码写入根目录 `.env` 的
+`CPR_REDIS_PASSWORD`。Redis 服务端需事先创建并授权该用户。用户名中的 `@`、`:` 等特殊字符
+需要 URL 百分号编码。未填写用户名时使用 Redis 的 `default` 用户
 
 环境变量 `CPR_REDIS_URL` 优先于 `store.redis.url`。默认 `deploy/compose.yaml` 已将它设为
 `redis://redis:6379/`，使用 ACL 用户时还需把应用服务的该环境变量改为
@@ -117,10 +129,10 @@ store:
 ## 启动
 
 ```bash
-docker compose -f deploy/compose.yaml config --quiet
-docker compose -f deploy/compose.yaml pull
-docker compose -f deploy/compose.yaml up -d --no-build --wait
-docker compose -f deploy/compose.yaml ps
+docker compose --env-file .env -f deploy/compose.yaml config --quiet
+docker compose --env-file .env -f deploy/compose.yaml pull
+docker compose --env-file .env -f deploy/compose.yaml up -d --no-build --wait
+docker compose --env-file .env -f deploy/compose.yaml ps
 ```
 
 健康检查：
@@ -341,7 +353,7 @@ Compose 使用以下绑定目录：
 | `.runtime/postgres` | PostgreSQL 持久化数据 |
 | `.runtime/redis` | Redis AOF |
 
-普通 `docker compose down` 不会删除这些目录。删除 `.runtime` 会永久清除本地状态
+普通 `docker compose --env-file .env -f deploy/compose.yaml down` 不会删除这些目录。删除 `.runtime` 会永久清除本地状态
 
 PostgreSQL 是账号、Client Key、运行设置、请求记录与审计的权威存储；账号 credential 按
 Provider schema 以明文 JSON 保存于 PostgreSQL。Redis 只保存可重建、可过期的协调状态，例如
@@ -430,12 +442,12 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 
 - `admin.default_password` 只在首次创建管理员时使用
 - 已有管理员在「系统设置 → 安全与访问 → 管理员密码」修改登录密码，需要验证当前密码；修改后所有管理员会话失效，使用新密码重新登录
-- PostgreSQL 官方镜像只在空数据目录初始化时使用 `database.password`
-- Redis 在每次容器创建时使用 `redis.password`
+- PostgreSQL 官方镜像只在空数据目录初始化时使用 `CPR_DATABASE_PASSWORD`
+- Redis 在每次容器创建时使用 `CPR_REDIS_PASSWORD`
 
-已有 PostgreSQL 数据目录后，直接修改 `database.password` 不会修改数据库用户密码，只会导致
-应用无法连接。轮换时必须先在 PostgreSQL 中修改用户密码，再同步更新 `config.yaml`。Redis
-密码变更后需要用新配置重新创建 Redis 和应用容器，不需要删除 Redis 数据目录。
+已有 PostgreSQL 数据目录后，直接修改 `.env` 不会修改数据库用户密码，只会导致应用无法连接。
+轮换时必须先在 PostgreSQL 中修改用户密码，再同步更新 `.env`。Redis 密码变更后需要用新配置重新创建
+Redis 和应用容器，不需要删除 Redis 数据目录。
 安排维护窗口，避免应用和 Redis 在过渡期间使用不同密码
 
 ## 镜像升级与源码构建
@@ -445,7 +457,12 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 使用二进制归档手动部署时，将模板中的 `api.asset_directory` 改为 `../web/dist`，指向归档内的静态资源。
 在线更新默认使用同一目录；如显式设置 `host.system_update.web_dist_dir`，应确保它指向实际提供页面的目录。
 升级时先阅读目标版本说明，下载同一 Release 的部署附件，对比模板并合并必要配置，保留已有凭据
-和 Compose 自定义项。不要用模板覆盖 `config.yaml`，也不要从 `main` 下载模板搭配旧镜像
+和 Compose 自定义项。不要用模板覆盖 `config.yaml`，也不要从 `main` 下载模板搭配旧镜像。
+
+从旧版 Compose 凭据桥接配置升级时，先把 `config.yaml` 中现有的数据库和 Redis 密码原样迁到根目录
+`.env` 的 `CPR_DATABASE_PASSWORD`、`CPR_REDIS_PASSWORD`，再将 YAML 密码字段清空，并把 `.env`
+权限设为 `0600`。保持密码值不变，不需要修改 PostgreSQL 用户密码或删除 Redis 数据。
+一键安装器遇到已有 `config.yaml` 会保留旧部署文件，不执行此迁移；请按本节手动升级步骤操作。
 
 按现有配置和接入方式检查以下升级条件：
 
@@ -458,15 +475,15 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 更新部署文件后，从安装目录拉取目标版本镜像并重建应用容器：
 
 ```bash
-docker compose -f deploy/compose.yaml pull codex-proxy-rs
-docker compose -f deploy/compose.yaml up -d --no-build --wait codex-proxy-rs
+docker compose --env-file .env -f deploy/compose.yaml pull codex-proxy-rs
+docker compose --env-file .env -f deploy/compose.yaml up -d --no-build --wait codex-proxy-rs
 ```
 
 源码构建需要克隆源码仓库并准备配置与数据目录，构建过程自动准备前端依赖，无需初始化子模块或准备额外 build context。以下命令从仓库根目录执行：
 
 ```bash
-docker compose -f deploy/compose.yaml build codex-proxy-rs
-docker compose -f deploy/compose.yaml up -d --no-build --wait
+docker compose --env-file .env -f deploy/compose.yaml build codex-proxy-rs
+docker compose --env-file .env -f deploy/compose.yaml up -d --no-build --wait
 ```
 
 升级后通过管理端版本接口或容器 image digest 确认运行实例的版本和 revision
@@ -477,7 +494,7 @@ docker compose -f deploy/compose.yaml up -d --no-build --wait
 CPR_VERSION="$(ruby -ryaml -e 'puts YAML.load_file("release/version.yaml").fetch("version").delete_prefix("v")')" \
 CPR_GIT_SHA="$(git rev-parse HEAD)" \
 CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-docker compose -f deploy/compose.yaml build codex-proxy-rs
+docker compose --env-file .env -f deploy/compose.yaml build codex-proxy-rs
 ```
 
 ### 版本命名与升级规则
@@ -594,14 +611,14 @@ macOS arm64 提供构建产物；部署前需验证目标平台的插件运行�
 | 需要保留的内容 | 备份方式 |
 | --- | --- |
 | 账号、Key、设置、请求、审计与插件数据 | 完整数据库归档，或停库后备份 `.runtime/postgres` |
-| 部署配置与凭据 | 单独备份 `deploy/config.yaml` 及 Compose 自定义配置 |
+| 部署配置与凭据 | 单独备份 `deploy/config.yaml`、根目录 `.env` 及 Compose 自定义配置 |
 | 应用日志与已启用的 OAuth 恢复记录 | 单独备份 `.runtime/logs`，不包含在数据库归档中 |
 | 会话锚点与节点运行文件 | 按需备份 `.runtime/data` |
 | 短期协调状态 | 按需备份 `.runtime/redis`，数据库冷恢复时使用空 Redis |
 
 OpenAI 主动额度重置卡及消费结果由上游持有，不属于本地备份内容
 
-数据库、配置、插件敏感设置和 OAuth 恢复日志均按凭据保护
+数据库、配置、根目录 `.env`、插件敏感设置和 OAuth 恢复日志均按凭据保护；恢复 `.env` 后设为 `0600`
 
 ### 备份内容与限制
 
