@@ -84,6 +84,15 @@ fn config_loader_should_accept_arbitrary_connection_passwords() {
 }
 
 #[test]
+fn config_loader_should_reject_empty_or_missing_database_password() {
+    let empty = valid_config().replace(POSTGRES_PASSWORD, "");
+    assert_rejected(empty);
+
+    let omitted = valid_config().replace(&format!("    password: '{POSTGRES_PASSWORD}'\n"), "");
+    assert_rejected(omitted);
+}
+
+#[test]
 fn config_loader_should_accept_empty_or_missing_redis_password() {
     let empty = valid_config().replace(REDIS_PASSWORD, "");
     parse_config(&empty).expect("empty Redis password");
