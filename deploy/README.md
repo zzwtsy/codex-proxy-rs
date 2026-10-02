@@ -25,7 +25,8 @@
 | 浏览器本地 | 主题和界面偏好 | 当前浏览器的主题设置 |
 
 Compose 命令从安装目录运行，并通过 `--env-file .env` 明确读取根目录中的数据库与 Redis 密码，分别传给应用和服务容器；
-后端进程本身不读取 `.env`。Compose 外启动时，应在 `store.*.password` 填写密码或设置对应进程环境变量。
+后端进程本身不读取 `.env`。直接运行时，PostgreSQL 密码须在 `store.database.password` 或
+`CPR_DATABASE_PASSWORD` 中设置；Redis 密码可留空、省略，或将 `CPR_REDIS_PASSWORD` 设为空以关闭认证。
 镜像、构建与发布选项仍通过 Compose 环境变量配置。配置加载会忽略未知字段，并在启动控制台提示字段名；
 不输出对应值。缺少必填字段时会指出缺项并停止启动，已知字段的类型和取值仍需合法；可选字段省略时使用默认值
 
@@ -94,14 +95,14 @@ sudo install -m 0640 -o "$(id -u)" -g 10001 deploy/config.example.yaml deploy/co
 也可将 `CPR_RELEASE_TAG` 设置为指定的发布标签。Release 附带的 `compose.yaml` 默认使用该版本镜像，
 配置模板和部署文件均包含在 `checksums.txt` 中；不要混用 `main` 分支模板与已发布镜像
 
-为 PostgreSQL 与 Redis 分别生成一个密码：
+默认 Compose 内置的 PostgreSQL 与 Redis 都启用密码认证，为它们分别生成密码：
 
 ```bash
 openssl rand -hex 24
 openssl rand -hex 24
 ```
 
-把两个 48 位十六进制结果分别写入安装目录根目录的 `.env`：
+把两个结果分别写入安装目录根目录的 `.env`。安装器生成并接受 48 位十六进制密码：
 
 ```dotenv
 CPR_DATABASE_PASSWORD=<第一个 48 位十六进制密码>
@@ -118,10 +119,10 @@ chmod 0600 .env
 `client.session_ttl_minutes` 控制统一登录中密钥身份的固定会话有效期，默认 1440 分钟；管理员有效期仍由
 `admin.session_ttl_minutes` 控制。两种身份共用一个 Cookie，成功登录替换旧会话；不改变 `/v1/*` 鉴权和限额
 
-PostgreSQL 与 Redis 密码必须是 48 位十六进制字符。Compose 用 `.env` 中的两个变量覆盖
-`store.*.password` 空占位，并传给对应服务；数据库和 Redis 密码不能嵌入连接 URL。
-直接运行二进制时，须在 `config.yaml` 填入密码或为进程设置 `CPR_DATABASE_PASSWORD`、
-`CPR_REDIS_PASSWORD`
+应用要求 PostgreSQL 密码非空，接受任意字符串；Redis 密码可留空或省略，留空时连接 URL 不包含密码认证。
+默认 Compose 的内置 PostgreSQL 与 Redis 仍要求密码，安装器为它们生成 48 位十六进制值并据此校验
+`.env`；数据库与 Redis 密码不能嵌入连接 URL。直接运行二进制时，可在 `config.yaml` 或进程环境中设置数据库密码；
+无密码 Redis 无需设置 `store.redis.password` 或 `CPR_REDIS_PASSWORD`
 
 Linux 上应用容器以 `10001:10001` 运行。应用数据和日志目录设为 `0770`，配置设为 `0640`，
 均由当前用户持有、容器组 `10001` 访问；`.env` 保持 `0600` 且不挂载进应用容器。
@@ -137,7 +138,7 @@ store:
     url: 'redis://u1@redis-host:6379/0'
 ```
 
-将 URL 合并到已有配置，并把该用户的 48 位十六进制密码写入根目录 `.env` 的
+将 URL 合并到已有配置，并把该用户的实际密码写入 `store.redis.password` 或进程环境变量
 `CPR_REDIS_PASSWORD`。Redis 服务端需事先创建并授权该用户。用户名中的 `@`、`:` 等特殊字符
 需要 URL 百分号编码。未填写用户名时使用 Redis 的 `default` 用户
 

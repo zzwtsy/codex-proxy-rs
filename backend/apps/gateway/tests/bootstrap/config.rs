@@ -75,8 +75,47 @@ fn config_loader_should_reject_missing_runtime_data_dir() {
 }
 
 #[test]
-fn config_loader_should_inject_connection_passwords_into_urls() {
-    parse_config(&valid_config()).expect("Store validates password injection into both URLs");
+fn config_loader_should_accept_arbitrary_connection_passwords() {
+    let config = valid_config()
+        .replace(POSTGRES_PASSWORD, "postgres p@ss/word")
+        .replace(REDIS_PASSWORD, "redis p@ss/word");
+
+    parse_config(&config).expect("arbitrary non-empty passwords");
+}
+
+#[test]
+fn config_loader_should_accept_empty_or_missing_redis_password() {
+    let empty = valid_config().replace(REDIS_PASSWORD, "");
+    parse_config(&empty).expect("empty Redis password");
+
+    let omitted = valid_config().replace(&format!("    password: '{REDIS_PASSWORD}'\n"), "");
+    parse_config(&omitted).expect("omitted Redis password");
+}
+
+#[test]
+fn config_loader_should_allow_empty_redis_password_environment_override() {
+    const CHILD_ENV: &str = "CPR_TEST_EMPTY_REDIS_PASSWORD_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        parse_config(&valid_config()).expect("empty Redis password environment override");
+        return;
+    }
+
+    let status = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "bootstrap::config::config_loader_should_allow_empty_redis_password_environment_override",
+        ])
+        .env(CHILD_ENV, "1")
+        .env_remove("CPR_SERVER_HOST")
+        .env_remove("CPR_SERVER_PORT")
+        .env_remove("CPR_DATABASE_URL")
+        .env_remove("CPR_REDIS_URL")
+        .env_remove("CPR_DATABASE_PASSWORD")
+        .env("CPR_REDIS_PASSWORD", "")
+        .env_remove("CPR_WEB_DIST_DIR")
+        .status()
+        .expect("run isolated empty-password configuration test");
+    assert!(status.success());
 }
 
 #[test]
@@ -282,16 +321,6 @@ fn config_loader_should_reject_embedded_database_password() {
         "postgres://codex_proxy@127.0.0.1:5432/codex_proxy",
         "postgres://codex_proxy:embedded@127.0.0.1:5432/codex_proxy",
     ));
-}
-
-#[test]
-fn config_loader_should_reject_non_hex_postgres_password() {
-    assert_rejected(valid_config().replace(POSTGRES_PASSWORD, &"g".repeat(48)));
-}
-
-#[test]
-fn config_loader_should_reject_wrong_length_redis_password() {
-    assert_rejected(valid_config().replace(REDIS_PASSWORD, "1234"));
 }
 
 #[test]

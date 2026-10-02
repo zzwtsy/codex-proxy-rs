@@ -51,7 +51,8 @@ export CPR_TEST_REDIS_URL='redis://:<password>@127.0.0.1:6379'
 PostgreSQL 的临时 schema 测试连接使用异步提交，保留事务可见性、回滚和完整迁移检查
 需要验证数据库崩溃后的持久性时，使用独立数据库与生产连接配置，不复用这类 fixture
 
-运行包含 `StoreBundle` 初始化的完整集成测试时，两条测试 URL 都须包含密码，且密码满足 Store
-启动配置的 48 位十六进制要求；仅能连接数据库并不代表该初始化合同通过。专用服务使用对应测试密码，
-并在测试进程中清除 `CPR_DATABASE_URL`、`CPR_REDIS_URL`、`CPR_DATABASE_PASSWORD` 和
+运行包含 `StoreBundle` 初始化的完整集成测试时，测试 URL 的认证信息须与专用测试服务匹配。应用配置要求 PostgreSQL
+密码非空，但不限制长度或字符，Redis 密码可选。个别集成测试夹具会从 URL 中拆分密码，
+应按对应测试的连接约定配置。
+测试进程还应清除 `CPR_DATABASE_URL`、`CPR_REDIS_URL`、`CPR_DATABASE_PASSWORD` 和
 `CPR_REDIS_PASSWORD`，避免启动配置被部署环境覆盖

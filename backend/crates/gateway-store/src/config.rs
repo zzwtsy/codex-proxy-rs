@@ -96,14 +96,14 @@ impl StoreConfig {
         if let Some(url) = optional_environment_value(REDIS_URL_ENV)? {
             self.redis.url = url;
         }
-        if let Some(password) = optional_environment_value(DATABASE_PASSWORD_ENV)? {
+        if let Some(password) = optional_environment_value_allow_empty(DATABASE_PASSWORD_ENV)? {
             self.database.password = password;
         }
-        if let Some(password) = optional_environment_value(REDIS_PASSWORD_ENV)? {
+        if let Some(password) = optional_environment_value_allow_empty(REDIS_PASSWORD_ENV)? {
             self.redis.password = password;
         }
-        self.database.validate("database")?;
-        self.redis.validate("redis")?;
+        self.database.validate("database", true)?;
+        self.redis.validate("redis", false)?;
         self.pool.validate()?;
         if self.backup_staging_dir.as_os_str().is_empty() {
             return Err(StoreError::InvalidData {
@@ -130,11 +130,17 @@ impl StoreConfig {
 }
 
 pub(crate) fn optional_environment_value(name: &'static str) -> StoreResult<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) if value.trim().is_empty() => Err(StoreError::InvalidData {
+    match optional_environment_value_allow_empty(name)? {
+        Some(value) if value.trim().is_empty() => Err(StoreError::InvalidData {
             entity: "store config",
             message: format!("environment variable {name} is empty"),
         }),
+        value => Ok(value),
+    }
+}
+
+fn optional_environment_value_allow_empty(name: &'static str) -> StoreResult<Option<String>> {
+    match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidData {
@@ -158,17 +164,17 @@ impl fmt::Debug for StoreConfig {
 #[derive(Clone, Deserialize)]
 pub(crate) struct StoreConnectionConfig {
     pub(crate) url: String,
+    #[serde(default)]
     pub(crate) password: String,
 }
 
 impl StoreConnectionConfig {
-    fn validate(&self, field: &'static str) -> StoreResult<()> {
+    fn validate(&self, field: &'static str, password_required: bool) -> StoreResult<()> {
         require_nonempty("store config", field, &self.url)?;
-        if self.password.len() != 48 || !self.password.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
+        if password_required && self.password.is_empty() {
             return Err(StoreError::InvalidData {
                 entity: "store config",
-                message: format!("{field}.password must be exactly 48 hexadecimal characters"),
+                message: format!("{field}.password must not be empty"),
             });
         }
         self.connection_url(field).map(|_| ())
@@ -185,11 +191,57 @@ impl StoreConnectionConfig {
                 message: format!("{field}.url must not contain a password"),
             });
         }
-        url.set_password(Some(&self.password))
-            .map_err(|()| StoreError::InvalidData {
-                entity: "store config",
-                message: format!("{field}.url cannot carry credentials"),
-            })?;
+        if !self.password.is_empty() {
+            url.set_password(Some(&self.password))
+                .map_err(|()| StoreError::InvalidData {
+                    entity: "store config",
+                    message: format!("{field}.url cannot carry credentials"),
+                })?;
+        }
         Ok(url.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreConnectionConfig;
+
+    fn config(password: Option<&str>) -> StoreConnectionConfig {
+        StoreConnectionConfig {
+            url: "redis://127.0.0.1:6379/".to_owned(),
+            password: password.unwrap_or_default().to_owned(),
+        }
+    }
+
+    #[test]
+    fn store_connection_config_accepts_arbitrary_passwords() {
+        let config = config(Some("p@ss/word"));
+
+        config
+            .validate("database", true)
+            .expect("non-empty arbitrary password");
+        let url = config
+            .connection_url("database")
+            .expect("password can be encoded in URL");
+        assert!(url.contains("p%40ss%2Fword"), "{url}");
+    }
+
+    #[test]
+    fn store_connection_config_omits_empty_or_missing_password() {
+        for config in [config(None), config(Some(""))] {
+            config
+                .validate("redis", false)
+                .expect("Redis password is optional");
+            let url = config
+                .connection_url("redis")
+                .expect("unauthenticated Redis URL");
+            assert!(url::Url::parse(&url).unwrap().password().is_none());
+        }
+    }
+
+    #[test]
+    fn store_connection_config_still_requires_database_password() {
+        assert!(config(None).validate("database", true).is_err());
+        assert!(config(Some("")).validate("database", true).is_err());
     }
 }

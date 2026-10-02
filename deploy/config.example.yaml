@@ -3,7 +3,8 @@
 # 使用：
 #   sudo install -m 0640 -o "$(id -u)" -g 10001 deploy/config.example.yaml deploy/config.yaml
 #
-# PostgreSQL 与 Redis 密码分别执行 `openssl rand -hex 24` 生成；管理员初始密码单独设置。
+# PostgreSQL 密码必须非空；Redis 密码可留空。
+# 可用 `openssl rand -hex 24` 生成高强度密码；管理员初始密码单独设置。
 
 schema_version: 1
 
@@ -43,12 +44,14 @@ host:
 store:
   database:
     # Docker 内由 CPR_DATABASE_URL 覆盖；密码不要写进 URL。
-    # Compose 部署的密码由 CPR_DATABASE_PASSWORD 覆盖；非 Compose 部署在此填写或设置环境变量。
+    # 必填，应用接受任意非空字符串。Compose 由 CPR_DATABASE_PASSWORD 覆盖；
+    # 非 Compose 部署可在此填写或设置环境变量。
     url: 'postgres://codex_proxy@127.0.0.1:5432/codex_proxy'
     password: ''
   redis:
     # Docker 内由 CPR_REDIS_URL 覆盖；密码不要写进 URL。
-    # Compose 部署的密码由 CPR_REDIS_PASSWORD 覆盖；非 Compose 部署在此填写或设置环境变量。
+    # 可选；留空或省略时不进行密码认证。Compose 由 CPR_REDIS_PASSWORD 覆盖；
+    # 空环境变量也表示无密码。
     # ACL 用户写在 URL 中，例如 redis://u1@redis-host:6379/0；配置步骤见 deploy/README.md。
     url: 'redis://127.0.0.1:6379/'
     password: ''
