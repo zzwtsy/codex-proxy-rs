@@ -21,7 +21,7 @@ use gateway_store::{
 };
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
-static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./src/sqlite/migrations");
+static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/sqlite");
 
 fn context(request_id: &str) -> MutationContext {
     MutationContext {

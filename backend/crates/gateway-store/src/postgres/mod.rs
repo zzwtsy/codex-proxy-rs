@@ -58,7 +58,7 @@ pub(crate) use usage_facts::{
     push_unrecovered_request_filter,
 };
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/postgres");
 
 /// 建立 PostgreSQL pool 并只执行冻结的 migration 集。
 pub async fn connect_and_migrate(

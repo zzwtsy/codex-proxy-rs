@@ -117,7 +117,7 @@ pub fn account_runtime_store(
     std::sync::Arc::new(crate::AccountRuntimeStoreAdapter::new(state, leases))
 }
 
-static MIGRATOR: Migrator = sqlx::migrate!("./src/sqlite/migrations");
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations/sqlite");
 
 /// 创建或打开 SQLite 数据库并应用独立迁移集。
 pub async fn connect_and_migrate(

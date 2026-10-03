@@ -383,7 +383,7 @@ Compose 的 `stop_grace_period` 为 75 秒，覆盖默认 30 秒 HTTP drain、30
 
 源码环境、前后端启动与组件库联调见 [开发与源码联调](../docs/development.md)
 
-本机开发可使用 Compose 提供 PostgreSQL 和 Redis，集成测试另用[专用测试库](../backend/migrations/README.md#本地测试库)
+本机开发可使用 Compose 提供 PostgreSQL 和 Redis，集成测试另用[专用测试库](../backend/migrations/postgres/README.md#本地测试库)
 
 ## 持久化与备份
 
@@ -569,7 +569,7 @@ exp 不进入正式版、alpha、beta 或 rc，普通实例也不能选择 Exp�
 其他通道的版本及发布说明，手动检查显示“当前没有可用更新”。检查失败单独报告，不能当作没有更新
 
 alpha、beta、rc、exp 在 GitHub 标记为 Pre-release，不覆盖 GitHub Latest 或镜像 `latest`。
-允许连续升级的发行线从首次发布起遵守[迁移冻结规则](../backend/migrations/README.md#冻结规则)，
+允许连续升级的发行线从首次发布起遵守所选数据库的迁移冻结规则，详见 [PostgreSQL](../backend/migrations/postgres/README.md#冻结规则) 与 [SQLite](../backend/migrations/sqlite/README.md)。
 包括预发行到正式版的晋级；发版前验证对应升级路径，不能仅凭版本号认定数据库兼容
 
 ### 管理端在线更新

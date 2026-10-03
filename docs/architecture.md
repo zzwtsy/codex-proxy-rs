@@ -686,7 +686,7 @@ revision；credential 轮换只推进账号自己的 `credential_revision`。Pos
 普通推理成功不能解除。Admin 恢复任务按冻结代次原子提交探测结果，避免旧结果覆盖手动恢复或新冻结；
 自动降低并发通过现有管理事务与快照发布链路，仅按数据库最新设置更新并发上限
 
-PostgreSQL 和 SQLite 分别使用独立迁移目录与冻结清单。已应用迁移按字节冻结，后续 schema 变化只能在对应目录新增编号迁移；SQLite 从空文件建库，不会导入 PostgreSQL 数据。详见 [PostgreSQL 迁移规则](../backend/migrations/README.md) 与 [SQLite 迁移规则](../backend/crates/gateway-store/src/sqlite/migrations/README.md)
+PostgreSQL 和 SQLite 分别使用独立迁移目录与冻结清单。已应用迁移按字节冻结，后续 schema 变化只能在对应目录新增编号迁移；SQLite 从空文件建库，不会导入 PostgreSQL 数据。详见 [PostgreSQL 迁移规则](../backend/migrations/postgres/README.md) 与 [SQLite 迁移规则](../backend/migrations/sqlite/README.md)
 
 ## 9. Credential、额度与主动重置
 
@@ -883,7 +883,7 @@ RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml --
 ```
 
 线程栈设置与当前 CI 一致。PostgreSQL/Redis 集成测试需按
-[迁移文档](../backend/migrations/README.md#本地测试库) 配置专用测试库；未设置环境变量时，本地相关测试会跳过。
+[PostgreSQL 迁移文档](../backend/migrations/postgres/README.md#本地测试库) 配置专用测试库；未设置环境变量时，本地相关测试会跳过。
 其他检查与界面验证按 [贡献与审查](../CONTRIBUTING.md#验证) 执行
 
 插件 Runtime 的真实子进程与持久化测试使用 `CPR_PLUGIN_TEST_DATABASE_URL` 和

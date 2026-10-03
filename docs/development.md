@@ -52,7 +52,7 @@ pnpm --dir frontend dev
 
 后端代理由 `frontend/vite.config.ts` 配置，验证 WebSocket 时直接连接后端
 
-前后端检查见 [贡献与审查](../CONTRIBUTING.md#验证)，数据库集成测试使用[专用测试库](../backend/migrations/README.md#本地测试库)
+前后端检查见 [贡献与审查](../CONTRIBUTING.md#验证)，数据库集成测试使用[专用测试库](../backend/migrations/postgres/README.md#本地测试库)
 
 ## 源码联调
 
