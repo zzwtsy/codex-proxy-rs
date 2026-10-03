@@ -410,17 +410,28 @@ jobs:
           shutil.rmtree(release_dir, ignore_errors=True)
           release_dir.mkdir(parents=True)
           config_template = pathlib.Path("deploy/config.example.yaml")
+          sqlite_config_template = pathlib.Path("deploy/config.example.sqlite.yaml")
           shutil.copy2(config_template, release_dir / config_template.name)
-          compose = pathlib.Path("deploy/compose.yaml").read_text()
+          shutil.copy2(sqlite_config_template, release_dir / sqlite_config_template.name)
           image = f"{os.environ['REGISTRY']}/{os.environ['IMAGE_NAME']}"
           default_image = "${CPR_IMAGE:-" + image + ":latest}"
-          if compose.count(default_image) != 1:
-              raise SystemExit("Expected exactly one default application image in deploy/compose.yaml")
-          # 发布附件固定镜像版本，防止后续 pull 与随包配置模板脱节。
           versioned_image = "${CPR_IMAGE:-" + f"{image}:{os.environ['DOCKER_VERSION']}" + "}"
-          compose = compose.replace(default_image, versioned_image)
-          (release_dir / "compose.yaml").write_text(compose)
-          assets = [release_dir / config_template.name, release_dir / "compose.yaml"]
+          compose_assets = []
+          for source_name in ("compose.yaml", "compose.sqlite.yaml"):
+              source_path = pathlib.Path("deploy") / source_name
+              compose = source_path.read_text()
+              if compose.count(default_image) != 1:
+                  raise SystemExit(f"Expected exactly one default application image in {source_path}")
+              # 发布附件固定镜像版本，防止后续 pull 与随包配置模板脱节。
+              compose = compose.replace(default_image, versioned_image)
+              destination = release_dir / source_name
+              destination.write_text(compose)
+              compose_assets.append(destination)
+          assets = [
+              release_dir / config_template.name,
+              release_dir / sqlite_config_template.name,
+              *compose_assets,
+          ]
           shutil.rmtree(package_dir, ignore_errors=True)
           release_packages = []
 
@@ -442,6 +453,7 @@ jobs:
               deploy_dir = package_root / "deploy"
               deploy_dir.mkdir()
               shutil.copy2(config_template, deploy_dir / config_template.name)
+              shutil.copy2(sqlite_config_template, deploy_dir / sqlite_config_template.name)
 
               archive_name = f"{APP_NAME}_{version}_{platform['os']}_{platform['arch']}.{platform['archive']}"
               archive_path = release_dir / archive_name
@@ -790,7 +802,7 @@ jobs:
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.release-info.outputs.docker_version }}
             ```
 
-            请从本版本附件下载 `compose.yaml` 和 `config.example.yaml`。Compose 默认固定到本版本镜像；升级前请对比模板与已有配置。
+            请从本版本附件下载 PostgreSQL 默认组合的 `compose.yaml`、`config.example.yaml`，或 SQLite 组合的 `compose.sqlite.yaml`、`config.example.sqlite.yaml`。Compose 固定到本版本镜像；升级前请对比模板与已有配置。
 
             **手动下载：**
             请从下方附件中下载适合当前平台的归档包。

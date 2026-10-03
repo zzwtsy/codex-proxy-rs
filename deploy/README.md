@@ -18,16 +18,14 @@
 
 | 位置 | 内容 | 修改方式 |
 | --- | --- | --- |
-| `deploy/config.yaml` | 监听与数据库/Redis 连接地址、管理员初始密码、时区与日志等应用启动配置 | 从模板创建，已有部署合并修改，不覆盖原文件 |
-| `.env` | Compose 使用的 `CPR_DATABASE_PASSWORD` 和 `CPR_REDIS_PASSWORD` | 安装器生成；手动安装设为 `0600` |
-| `deploy/compose.yaml` | 镜像、容器网络、端口、挂载与资源限制 | 调整 Compose 并重建受影响容器 |
-| PostgreSQL | 账号、Key、运行设置、上游身份、插件配置等业务数据 | 管理端或管理 API |
+| `deploy/config.yaml` | 存储 backend、对应连接选项、管理员初始密码、时区与日志等启动配置 | 从匹配的模板创建，已有部署合并修改，不覆盖原文件 |
+| `.env` | PostgreSQL + Redis Compose 的两个服务密码；SQLite 不需要 | PostgreSQL 安装器生成；手动安装设为 `0600` |
+| `deploy/compose.yaml` / `deploy/compose.sqlite.yaml` | PostgreSQL + Redis 或 SQLite 单服务的镜像、网络、端口、挂载与资源限制 | 新安装选择；已有部署修改 Compose 并重建受影响容器 |
+| PostgreSQL 或 SQLite 文件 | 账号、Key、运行设置、上游身份、插件配置等业务数据 | 管理端或管理 API |
 | 浏览器本地 | 主题和界面偏好 | 当前浏览器的主题设置 |
 
-Compose 命令从安装目录运行，并通过 `--env-file .env` 明确读取根目录中的数据库与 Redis 密码，分别传给应用和服务容器；
-后端进程本身不读取 `.env`。直接运行时，PostgreSQL 密码须在 `store.database.password` 或
-`CPR_DATABASE_PASSWORD` 中设置；Redis 密码可留空、省略，或将 `CPR_REDIS_PASSWORD` 设为空以关闭认证。
-镜像、构建与发布选项仍通过 Compose 环境变量配置。配置加载会忽略未知字段，并在启动控制台提示字段名；
+Compose 命令从安装目录运行，并通过 `--env-file .env` 显式加载 Compose 插值。PostgreSQL + Redis 模式将服务密码传给应用和基础设施容器；SQLite 模式不读取数据库或 Redis 密码，也不声明这些服务。后端进程本身不读取 `.env`。
+PostgreSQL 模式的密码从 `store.database.password` 或 `CPR_DATABASE_PASSWORD` 读取；Redis 密码可留空、省略，或将 `CPR_REDIS_PASSWORD` 设为空以关闭认证。镜像、构建与发布选项仍通过 Compose 环境变量配置。配置加载会忽略未知字段，并在启动控制台提示字段名；
 不输出对应值。缺少必填字段时会指出缺项并停止启动，已知字段的类型和取值仍需合法；可选字段省略时使用默认值
 
 后端从当前目录向上查找 `deploy/config.yaml`，相对数据、日志和静态资源路径以该文件所在目录解析
@@ -60,13 +58,15 @@ host:
 flowchart LR
   Client[客户端 / 管理浏览器] -->|HTTPS| Proxy[反向代理]
   Proxy -->|HTTP / SSE / WebSocket| App[网关：单副本]
-  App --> PG[(PostgreSQL)]
-  App --> Redis[(Redis)]
+  App --> Backend{存储组合}
+  Backend -->|postgres| PG[(PostgreSQL)]
+  Backend -->|postgres| Redis[(Redis)]
+  Backend -->|sqlite| SQLite[(本地 SQLite 文件)]
   App --> Upstream[上游服务]
   App -. 数据库备份 .-> Backup[S3 / R2]
 ```
 
-网关端口默认只绑定本机；数据库和 Redis 不对公网开放。插件以网关同一系统身份运行，不能作为不可信代码沙箱
+网关端口默认只绑定本机；PostgreSQL 和 Redis 不对公网开放。SQLite 数据文件保存在网关本地持久卷，只支持单副本。插件以网关同一系统身份运行，不能作为不可信代码沙箱
 
 ## 手动安装
 
@@ -124,6 +124,31 @@ chmod 0600 .env
 `.env`；数据库与 Redis 密码不能嵌入连接 URL。直接运行二进制时，可在 `config.yaml` 或进程环境中设置数据库密码；
 无密码 Redis 无需设置 `store.redis.password` 或 `CPR_REDIS_PASSWORD`
 
+### SQLite 新安装
+
+一键安装器的新安装可通过 `CPR_STORAGE_BACKEND=sqlite` 选择 SQLite：
+
+```bash
+CPR_STORAGE_BACKEND=sqlite bash install.sh
+```
+
+手动安装时从同一 Release 下载 `compose.sqlite.yaml` 和 `config.example.sqlite.yaml`，分别保存为
+`deploy/compose.yaml` 与 `deploy/config.example.sqlite.yaml`，再复制配置模板为 `deploy/config.yaml`。
+SQLite Compose 只启动网关，数据库缺省为 `.runtime/data/codex-proxy.sqlite3`；无需生成数据库或 Redis 密码。
+配置中的 `store.sqlite.path` 相对于 `host.runtime_data_dir` 解析。Compose 透传可选的 `CPR_SQLITE_PATH`；该环境变量只能指定 `.runtime/data` 下的相对路径，未设置时使用默认数据库路径
+
+手动使用 SQLite 时，Compose 启动命令仍需根目录 `.env` 文件。创建权限为 `0600` 的空文件后再启动：
+
+```bash
+touch .env
+chmod 0600 .env
+```
+
+Unix 下可写启动会在打开数据库前，将主库及已有 WAL/SHM 自动收紧为 `0600`；无法设置权限时停止启动，新建伴随文件继承主库权限。服务与 CLI 必须使用同一运行用户，原有跨用户或组共享读取权限会被移除。只读检查不会修改权限；非 Unix 平台仍需部署者配置适当的文件访问控制
+
+SQLite 模式用于单网关实例和本地持久卷。它创建独立空库，不导入 PostgreSQL 数据；切换模式会连接到另一份数据库，
+不会自动复制或覆盖原数据。恢复 PostgreSQL 部署前先停止网关，再按下文保留原数据库
+
 Linux 上应用容器以 `10001:10001` 运行。应用数据和日志目录设为 `0770`，配置设为 `0640`，
 均由当前用户持有、容器组 `10001` 访问；`.env` 保持 `0600` 且不挂载进应用容器。
 `config.yaml` 通过 Compose `configs` 只读挂载，普通 Compose 保留宿主机文件的 UID/GID 和 mode
@@ -162,10 +187,9 @@ docker compose --env-file .env -f deploy/compose.yaml ps
 curl -i http://127.0.0.1:8080/healthz
 ```
 
-`204 No Content` 表示应用、PostgreSQL、Redis 和后台任务的健康检查通过，不代表每个上游账号都可用
+`204 No Content` 表示应用及当前存储 backend 和后台任务的健康检查通过，不代表每个上游账号都可用
 
-不要把未脱敏的 `docker compose config` 或 `docker inspect` 输出上传到工单；它们会包含
-PostgreSQL/Redis 启动密码。日常校验使用 `config --quiet`
+不要把未脱敏的 `docker compose config` 或 `docker inspect` 输出上传到工单；PostgreSQL + Redis Compose 会包含服务密码。日常校验使用 `config --quiet`
 
 ### 启动后的运行设置
 
@@ -369,16 +393,14 @@ Compose 使用以下绑定目录：
 
 | 目录 | 内容 |
 | --- | --- |
-| `.runtime/data` | OpenAI 会话锚点密钥、更新状态、临时更新目录与备份暂存区 |
+| `.runtime/data` | SQLite 数据库（SQLite 模式）、OpenAI 会话锚点密钥、更新状态、临时更新目录与备份暂存区 |
 | `.runtime/logs` | 应用文件日志、按需启用的 OAuth 恢复记录与请求转储 |
-| `.runtime/postgres` | PostgreSQL 持久化数据 |
-| `.runtime/redis` | Redis AOF |
+| `.runtime/postgres` | PostgreSQL 持久化数据（PostgreSQL + Redis 模式） |
+| `.runtime/redis` | Redis AOF（PostgreSQL + Redis 模式） |
 
 普通 `docker compose --env-file .env -f deploy/compose.yaml down` 不会删除这些目录。删除 `.runtime` 会永久清除本地状态
 
-PostgreSQL 是账号、Client Key、运行设置、请求记录与审计的权威存储；账号 credential 按
-Provider schema 以明文 JSON 保存于 PostgreSQL。Redis 只保存可重建、可过期的协调状态，例如
-会话亲和、lease、cooldown、OAuth pending flow 与套餐模型目录 cache
+两种 backend 提供相同的业务存储端口。PostgreSQL + Redis 模式以 PostgreSQL 保存账号、Client Key、运行设置、请求记录与审计，Redis 保存跨进程协调状态。SQLite 模式把持久业务事实和 Provider 跨进程协调状态保存在同一 SQLite 文件；进程专属准入、continuation、认证会话及可重建缓存保存在当前进程。账号 credential 均按 Provider schema 以明文 JSON 保存，数据库文件和备份必须按敏感数据保护
 
 备份应覆盖哪些目录、如何生成一致性数据库归档，见 [备份与恢复](#备份与恢复)
 
@@ -474,8 +496,8 @@ Redis 和应用容器，不需要删除 Redis 数据目录。
 
 ## 镜像升级与源码构建
 
-每个 Release 独立提供 `config.example.yaml`、默认镜像固定到该版本的 `compose.yaml` 和校验和；
-各平台归档也包含 `deploy/config.example.yaml`。配置模板来自构建该版本的同一提交。
+每个 Release 提供 PostgreSQL + Redis 的 `compose.yaml` / `config.example.yaml`，以及 SQLite 的
+`compose.sqlite.yaml` / `config.example.sqlite.yaml`，并附带校验和。Compose 镜像固定到该版本；各平台归档包含两种配置模板。配置模板来自构建该版本的同一提交。
 使用二进制归档手动部署时，将模板中的 `api.asset_directory` 改为 `../web/dist`，指向归档内的静态资源。
 在线更新默认使用同一目录；如显式设置 `host.system_update.web_dist_dir`，应确保它指向实际提供页面的目录。
 升级时先阅读目标版本说明，下载同一 Release 的部署附件，对比模板并合并必要配置，保留已有凭据
@@ -626,17 +648,17 @@ macOS arm64 提供构建产物；部署前需验证目标平台的插件运行�
 
 ## 备份与恢复
 
-数据库可用管理端的 S3/R2 逻辑备份，或停止 PostgreSQL 后备份数据目录
+数据库可用管理端的 S3/R2 逻辑备份。PostgreSQL 可在停止服务后备份数据目录；SQLite 可在停止网关后备份数据库文件。
 
-不要在 PostgreSQL 写入期间直接复制数据目录作为一致性备份
+不要在 PostgreSQL 写入期间直接复制数据目录，也不要在 SQLite 运行期间只复制主数据库文件作为一致性备份；SQLite 写入期间应使用管理端备份生成的 `VACUUM INTO` 快照
 
 | 需要保留的内容 | 备份方式 |
 | --- | --- |
-| 账号、Key、设置、请求、审计与插件数据 | 完整数据库归档，或停库后备份 `.runtime/postgres` |
+| 账号、Key、设置、请求、审计与插件数据 | PostgreSQL 完整数据库归档或停库后的 `.runtime/postgres`；SQLite 管理端快照或停服后的 `.sqlite3` 文件 |
 | 部署配置与凭据 | 单独备份 `deploy/config.yaml`、根目录 `.env` 及 Compose 自定义配置 |
 | 应用日志与已启用的 OAuth 恢复记录 | 单独备份 `.runtime/logs`，不包含在数据库归档中 |
 | 会话锚点与节点运行文件 | 按需备份 `.runtime/data` |
-| 短期协调状态 | 按需备份 `.runtime/redis`，数据库冷恢复时使用空 Redis |
+| 短期协调状态 | Redis 模式按需备份 `.runtime/redis`；SQLite 模式的跨进程协调表随数据库文件备份 |
 
 OpenAI 主动额度重置卡及消费结果由上游持有，不属于本地备份内容
 
@@ -645,7 +667,7 @@ OpenAI 主动额度重置卡及消费结果由上游持有，不属于本地备�
 ### 备份内容与限制
 
 - 插件包体、固定来源、下载凭据、制品接受事实、实例配置、版本配置快照、敏感配置、功能范围绑定和私有状态都保存在
-  PostgreSQL，随数据库一起备份。插件通过宿主回调读写的内置平台账号保存在同库的通用账号表。
+  PostgreSQL 或 SQLite，随所选数据库一起备份。插件通过宿主回调读写的内置平台账号保存在同库的通用账号表。
   来源使用的出站代理及其认证也须随库恢复，不能只备份 `plugin_*` 表；来源代理与账号代理独立选择，
   不依赖进程代理环境，故障时不会自动回退直连。
   包体单个上限为 32 MiB，需要计入数据库及备份容量；解压运行目录和 Redis 协调状态是可重建数据，
@@ -656,12 +678,26 @@ OpenAI 主动额度重置卡及消费结果由上游持有，不属于本地备�
 - 备份暂存目录为 `host.runtime_data_dir/backup-staging`；Compose 默认对应
   `/app/.runtime/data/backup-staging`，由 `.runtime/data` 卷持久化，权限 `0700`（仅 `cpr`
   用户可读写）。部署卷至少预留一个最大数据库归档的空间
-- S3/R2 存储、Cron 计划、保留策略与备份记录都保存在 PostgreSQL（`backup_settings` /
+- S3/R2 存储、Cron 计划、保留策略与备份记录都保存在所选持久数据库（`backup_settings` /
   `backup_records`），备份记录行在删除成功后硬删除，操作历史进入 `admin_audit_events`
 - 手工备份的 `expiresInDays` 在创建时生成独立 `expires_at`；计划备份按当前 `retentionDays` 生成
   `expires_at`，并同时受 `retentionCount` 清理规则约束。到期只进入删除流程，不构成在线恢复点
 
-### 人工恢复数据库
+### SQLite 文件恢复
+
+SQLite 模式可恢复管理端对象存储中的 `.sqlite3` 快照，或在网关停止后恢复文件备份。更换数据库文件前：
+
+1. 停止网关容器，确认没有其他进程打开数据库
+2. 备份当前 `.runtime/data/codex-proxy.sqlite3`，再检查目标文件：`sqlite3 <目标文件> 'PRAGMA integrity_check;'` 应返回 `ok`
+3. 替换数据库文件时同时处理同目录的 `codex-proxy.sqlite3-wal` 和 `codex-proxy.sqlite3-shm`。只有确认目标库已完整 checkpoint 且没有旧进程时，才可清理旧 WAL/SHM 文件；不要把旧伴随文件与新主库混合
+4. 保持网关停止，离线核对目标库的 `backup_settings`、`backup_records` 和本地备份暂存文件。禁用旧计划，处置 `queued/dumping/uploading/deleting` 非终态记录，核对旧调度游标、到期时间及保留天数和数量条件，逐项决定哪些任务和记录保留
+5. 恢复数据库文件的所有者与网关容器用户一致，Unix 下数据库及 WAL/SHM 权限设为 `0600`。确认启动不会重放旧任务或误删远端对象后，再启动并核对健康检查和关键业务数据，重新测试 S3 连接并设置计划
+
+只关闭计划不能阻止备份 Worker 恢复任务或删除到期对象。无法确认目标快照及暂存文件的影响时，保持服务停止；不要直接启动旧快照，也不要套用清空生产记录的通用 SQL
+
+SQLite 数据库是本地单文件部署，不支持 PostgreSQL 数据导入或多实例共享卷写入。切换到 PostgreSQL 或 SQLite 会连接到该模式自己的数据库；切换不会自动迁移、删除或覆盖原数据库
+
+### PostgreSQL 人工恢复数据库
 
 备份归档由 `pg_dump --format=custom --no-owner --no-privileges` 生成，可通过标准 PostgreSQL
 工具离线恢复：

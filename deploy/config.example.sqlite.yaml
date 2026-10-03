@@ -1,0 +1,49 @@
+# SQLite 应用配置模板。SQLite 数据存放在 .runtime/data 的本地持久卷中。
+# SQLite 模式仅适用于单网关实例；不需要 PostgreSQL 或 Redis。
+
+schema_version: 1
+
+host:
+  timezone: 'Asia/Shanghai'
+  listen:
+    host: '127.0.0.1'
+    port: 8080
+  runtime_data_dir: '../.runtime/data'
+  logging:
+    level: 'info'
+    stdout: true
+    oauth_recovery: false
+    request_dump: false
+    request_dump_retention_days: 1
+    file:
+      enabled: true
+      directory: '../.runtime/logs'
+      retention_days: 7
+      max_file_size_mb: 20
+  drain_timeout_seconds: 30
+  worker_shutdown_timeout_seconds: 30
+
+store:
+  backend: sqlite
+  sqlite:
+    path: 'codex-proxy.sqlite3'
+    max_connections: 5
+    acquire_timeout_seconds: 5
+    busy_timeout_ms: 5000
+
+admin:
+  session_ttl_minutes: 1440
+  default_username: 'admin@cpr.local'
+  default_password: ''
+
+client:
+  session_ttl_minutes: 1440
+
+api:
+  asset_directory: '../frontend/dist'
+  cors_allowed_origins: []
+  request_timeout_seconds: null
+  request_id_header: 'x-request-id'
+
+openai:
+  residency: us
