@@ -476,30 +476,77 @@ impl BackupError {
 /// 构造稳定错误码常量。
 pub mod code;
 
-/// 构建对象 key：`{prefix}/YYYY/MM/DD/codex-proxy-rs_{UTC seconds}_{backup id}.dump`。
-///
-/// 规范化规则：prefix 不得为空、不得以前导 `/` 开头、不得包含 `..`、反斜杠或控制字符；
-/// 输出统一使用 `/` 分隔且不含空段。
+/// 数据库归档格式；用于稳定区分对象存储中的 SQLite 文件与 PostgreSQL dump。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupArchiveFormat {
+    PostgresCustom,
+    Sqlite,
+}
+
+impl BackupArchiveFormat {
+    #[must_use]
+    pub const fn file_extension(self) -> &'static str {
+        match self {
+            Self::PostgresCustom => "dump",
+            Self::Sqlite => "sqlite3",
+        }
+    }
+
+    #[must_use]
+    pub const fn storage_marker(self) -> Option<&'static str> {
+        match self {
+            Self::PostgresCustom => None,
+            Self::Sqlite => Some("sqlite"),
+        }
+    }
+}
+
+/// 构建对象 key：PostgreSQL 归档沿用 `{prefix}/YYYY/MM/DD/...dump`，SQLite 归档使用
+/// `{prefix}/sqlite/YYYY/MM/DD/...sqlite3`，便于在对象存储中识别文件格式。
 pub fn build_object_key(
     prefix: &str,
     backup_id: &str,
     at: DateTime<Utc>,
 ) -> Result<String, BackupError> {
+    build_object_key_for_format(prefix, backup_id, at, BackupArchiveFormat::PostgresCustom)
+}
+
+/// 根据实际数据库 dump 端口生成对象 key。
+pub fn build_object_key_for_format(
+    prefix: &str,
+    backup_id: &str,
+    at: DateTime<Utc>,
+    format: BackupArchiveFormat,
+) -> Result<String, BackupError> {
     let prefix = normalize_prefix(prefix)?;
+    let marker = format
+        .storage_marker()
+        .map_or_else(String::new, |value| format!("{value}/"));
     Ok(format!(
-        "{prefix}/{}/{:02}/{:02}/codex-proxy-rs_{}_{}.dump",
+        "{prefix}/{marker}{}/{:02}/{:02}/codex-proxy-rs_{}_{}.{}",
         at.format("%Y"),
         at.format("%m"),
         at.format("%d"),
         at.format("%Y%m%d_%H%M%S"),
         short_backup_id(backup_id),
+        format.file_extension(),
     ))
 }
 
-/// 下载文件名：`codex-proxy-rs_{短 id}.dump`，与对象 key 的文件名一致。
+/// 下载文件名保持 PostgreSQL `.dump` 的兼容默认值。
 #[must_use]
 pub fn build_download_file_name(backup_id: &str) -> String {
-    format!("codex-proxy-rs_{}.dump", short_backup_id(backup_id))
+    build_download_file_name_for_format(backup_id, BackupArchiveFormat::PostgresCustom)
+}
+
+/// 按实际数据库归档格式生成下载文件名。
+#[must_use]
+pub fn build_download_file_name_for_format(backup_id: &str, format: BackupArchiveFormat) -> String {
+    format!(
+        "codex-proxy-rs_{}.{}",
+        short_backup_id(backup_id),
+        format.file_extension(),
+    )
 }
 
 /// 截取备份 id 的可读短标识：去掉 `backup_` 前缀，最多保留 8 位 hex。
@@ -548,8 +595,27 @@ pub fn build_backup_seed(
     at: DateTime<Utc>,
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<BackupRecordSeed, BackupError> {
+    build_backup_seed_for_format(
+        trigger_kind,
+        scheduled_at,
+        prefix,
+        at,
+        expires_at,
+        BackupArchiveFormat::PostgresCustom,
+    )
+}
+
+/// 按实际数据库 dump 格式创建任务 id 与远端对象 key。
+pub fn build_backup_seed_for_format(
+    trigger_kind: BackupTriggerKind,
+    scheduled_at: Option<DateTime<Utc>>,
+    prefix: &str,
+    at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    format: BackupArchiveFormat,
+) -> Result<BackupRecordSeed, BackupError> {
     let id = new_backup_id();
-    let object_key = build_object_key(prefix, &id, at)?;
+    let object_key = build_object_key_for_format(prefix, &id, at, format)?;
     Ok(BackupRecordSeed {
         id,
         trigger_kind,

@@ -107,3 +107,126 @@ async fn inspection_bundle_does_not_migrate_and_rejects_business_writes() {
         .unwrap();
     admin.close().await;
 }
+
+#[tokio::test]
+async fn sqlite_runtime_bundle_exposes_health_and_worker_contributions() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("runtime.sqlite3");
+    let mut config: StoreConfig = serde_json::from_value(json!({
+        "backend": "sqlite",
+        "sqlite": { "path": path },
+    }))
+    .unwrap();
+    config.resolve_and_validate(root.path()).unwrap();
+
+    let mut bundle = gateway_store::initialize(config).await.unwrap();
+    assert!(root.path().join("backup-staging").is_dir());
+    let probes = bundle.health_probes();
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].name(), "sqlite");
+    assert_eq!(
+        probes[0].check().await,
+        gateway_core::health::HealthState::Healthy
+    );
+    let workers = bundle.take_worker_contributions();
+    assert_eq!(workers.len(), 4);
+    assert!(workers.iter().any(|worker| matches!(worker,
+        gateway_core::task::WorkerContribution::Registration(registration)
+        if registration.id.kind() == gateway_core::task::WorkerKind::Retention
+            && registration.id.owner() == "sqlite_sessions"
+    )));
+    assert!(bundle.take_worker_contributions().is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_bundle_migrates_writable_cli_and_opens_existing_file_read_only() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("gateway.sqlite3");
+    let mut config: StoreConfig = serde_json::from_value(json!({
+        "backend": "sqlite",
+        "sqlite": { "path": path },
+    }))
+    .unwrap();
+    config.resolve_and_validate(root.path()).unwrap();
+
+    assert!(
+        gateway_store::initialize_read_only(config.clone())
+            .await
+            .is_err()
+    );
+    assert!(!path.exists(), "只读帮助不得创建 SQLite 文件");
+
+    std::fs::File::create(&path).unwrap();
+    let empty_inspection = gateway_store::initialize_read_only(config.clone())
+        .await
+        .unwrap();
+    assert!(
+        empty_inspection
+            .admin_ports()
+            .plugins()
+            .load_instances()
+            .await
+            .is_err(),
+        "只读帮助不得迁移一个已有空数据库"
+    );
+    drop(empty_inspection);
+    let empty_pool = gateway_store::sqlite::connect_read_only(
+        &path,
+        &gateway_store::SqliteStoreConfig::default(),
+    )
+    .await
+    .unwrap();
+    let table_count: i64 =
+        sqlx::query_scalar("select count(*) from sqlite_master where type = 'table'")
+            .fetch_one(&empty_pool)
+            .await
+            .unwrap();
+    assert_eq!(table_count, 0);
+    empty_pool.close().await;
+
+    let mut command = gateway_store::initialize_command_line(config.clone())
+        .await
+        .unwrap();
+    assert!(path.is_file());
+    assert_eq!(command.health_probes().len(), 1);
+    assert_eq!(command.health_probes()[0].name(), "sqlite");
+    assert_eq!(
+        command.health_probes()[0].check().await,
+        gateway_core::health::HealthState::Healthy
+    );
+    assert!(
+        command
+            .admin_ports()
+            .plugins()
+            .load_instances()
+            .await
+            .is_ok()
+    );
+    assert!(
+        command
+            .provider_ports()
+            .accounts()
+            .list_accounts()
+            .await
+            .is_ok()
+    );
+    assert!(command.take_worker_contributions().is_empty());
+    command.start_command_line_writes().unwrap();
+    command.shutdown_command_line_writes().await.unwrap();
+    drop(command);
+
+    let staging = root.path().join("backup-staging");
+    std::fs::remove_dir_all(&staging).unwrap();
+    let mut inspection = gateway_store::initialize_read_only(config).await.unwrap();
+    assert!(!staging.exists(), "只读帮助不得创建备份暂存目录");
+    assert!(inspection.take_worker_contributions().is_empty());
+    assert_eq!(inspection.health_probes().len(), 1);
+    assert!(
+        inspection
+            .admin_ports()
+            .plugins()
+            .load_instances()
+            .await
+            .is_ok()
+    );
+}

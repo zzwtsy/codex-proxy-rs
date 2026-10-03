@@ -7,6 +7,7 @@ use super::*;
 pub enum StoreBackend {
     PostgreSql,
     Redis,
+    Sqlite,
 }
 
 /// 上层状态机需要区分的稳定冲突类型。
@@ -65,13 +66,13 @@ pub(crate) fn mutation_audit(
     operation: gateway_admin::model::audit::MutationAuditOperation,
     entity_ref: &str,
     changed_fields: Vec<String>,
-) -> postgres::AdminAuditEvent {
+) -> AdminAuditEvent {
     let event = gateway_admin::model::audit::MutationAuditIntent {
         operation,
         entity_ref,
     }
     .event(context, changed_fields);
-    postgres::AdminAuditEvent {
+    AdminAuditEvent {
         id: event.id,
         actor_kind: event.actor_kind.into(),
         actor_admin_user_id: event.actor_admin_user_id,

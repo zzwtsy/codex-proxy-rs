@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use crate::{
     model::backup::{
         BackupError, BackupObjectMetadata, BackupRecord, BackupStatus, BackupStatusTransition,
-        BackupStorageConfig, BackupTriggerKind, build_backup_seed, code,
+        BackupStorageConfig, BackupTriggerKind, build_backup_seed_for_format, code,
     },
     ports::backup::{
         BackupObjectStorePort, BackupRepository, DatabaseDumpPort, DumpRequest,
@@ -194,12 +194,13 @@ impl BackupTask {
         } else {
             None
         };
-        let seed = build_backup_seed(
+        let seed = build_backup_seed_for_format(
             BackupTriggerKind::Scheduled,
             Some(scheduled_at),
             prefix,
             now,
             expires_at,
+            self.dump.archive_format(),
         )
         .map_err(infra_error)?;
         let inserted = self

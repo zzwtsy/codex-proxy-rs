@@ -19,7 +19,7 @@ Codex Proxy RS 是单进程、单副本运行的多 Provider AI 网关，同时�
 - 面向管理员的 `/api/admin/*` 控制面和 Vue 管理端
 - 面向 Key 持有者的 `/api/key-usage/*` 用量与客户端配置接口、独立 `/key-usage` 页面，以及复用数据面认证的 `/v1/usage` 额度查询
 - 固定的 OpenAI 与 xAI 两个编译期 Provider，以及插件提供的认证、中间件和管理扩展
-- PostgreSQL 持久化、Redis 协调状态以及 S3/R2 数据库备份
+- PostgreSQL + Redis 或 SQLite 两种封闭存储组合，以及 S3/R2 数据库备份
 
 系统不提供 `/v1/chat/completions`，不存在 Provider Instance 层，也不支持通过复制应用容器进行多副本
 扩容。Client Key 限定账号分组，而不是绑定某个 Provider；一次请求的 Provider 候选由账号范围、模型
@@ -42,14 +42,25 @@ flowchart TB
   Core --> Store[gateway-store]
   Admin --> Store
   Builtin --> Store
-  Store --> PG[(PostgreSQL)]
-  Store --> Redis[(Redis)]
+  Store --> Backend{存储组合}
+  Backend -->|postgres| PG[(PostgreSQL)]
+  Backend -->|postgres| Redis[(Redis)]
+  Backend -->|sqlite| SQLite[(SQLite 文件)]
   Store --> Object[(S3 / R2)]
 ```
 
 图中表示运行时协作，不是 crate 的直接依赖。`backend/apps/gateway` 是网关的唯一组合根，
 按 Host → Store → Provider → Core → Admin → API → Worker 的顺序
 初始化具体实现。其余 crate 只暴露自己的配置、端口和 Bundle，不自行定位别的实现
+
+系统只接受两种完整存储组合：
+
+| `store.backend` | 持久数据库 | 协调状态 | 使用边界 |
+| --- | --- | --- | --- |
+| `postgres`（默认） | PostgreSQL | Redis | 保持现有部署合同；两项依赖都必须连接 |
+| `sqlite` | 本地 SQLite 文件 | SQLite 表和进程内状态 | 不读取或连接 Redis；适用于单网关实例和本地持久卷 |
+
+PostgreSQL 不配 Redis、SQLite 再配 Redis 都属于无效配置。SQLite 的 Provider lease、cooldown、刷新退避、会话亲和和排除状态由文件中的带期限记录跨进程共享；准入、continuation、认证会话和可重建缓存仅在当前服务或命令进程内有效。SQLite 文件不能由多个网关副本并发写入
 
 ## 3. Workspace 边界
 
@@ -61,7 +72,7 @@ flowchart TB
 | `gateway-core` | operation、canonical event、请求快照、路由、admission、attempt 协调、交付边界和计量 |
 | `gateway-admin` | 管理领域、Key 用量查询、Provider/Store 端口、审计语义、备份与历史保留策略 |
 | `gateway-api` | HTTP/WS/SSE 解码与交付、Admin 与 Key 用量 wire、静态 Web UI；不直接访问 Store 或具体 Provider |
-| `gateway-store` | PostgreSQL、Redis、S3/R2、`pg_dump` 适配器；不拥有业务策略 |
+| `gateway-store` | PostgreSQL + Redis、SQLite、S3/R2、数据库快照适配器；不拥有业务策略 |
 | `gateway-host` | 配置加载、日志、HTTP 生命周期、Worker 监督与历史保留任务、系统更新及外部价格源适配 |
 | `gateway-plugin/sdk`（包名 `gateway-plugin-sdk`） | 公开插件清单与线协议，独立于网关领域；异步收发通过可选 `io` feature 提供 |
 | `gateway-plugin/runtime`（包名 `gateway-plugin-runtime`） | 插件包校验、能力适配、双向 RPC 与发布集合；通过 Host 管理子进程和受管 HTTP |
@@ -634,20 +645,19 @@ Arc 随 RoutingPlan 冻结并进入所有 attempt，不在推理请求中读取�
 HTTP validation
   -> Admin use case
   -> Provider prepare/verify when needed
-  -> PostgreSQL transaction + audit
+  -> selected database transaction + audit
   -> invalidate affected Provider-derived facts when needed
   -> publish committed runtime snapshot
   -> best-effort observations when needed
 ```
 
-会改变路由快照或安全配置的 mutation 在同一 PostgreSQL 事务中提交业务事实、推进内部
+会改变路由快照或安全配置的 mutation 在当前 backend 的同一数据库事务中提交业务事实、推进内部
 `config_revision` 并写入脱敏审计。`configRevision` 不作为客户端写入的乐观并发前置条件；
 少数账号/分组响应返回它用于标识已提交的配置。插件配置等资源另有 `revision` / `expectedRevision` 检查，
 不能与全局配置版本混用
 
 额度、cooldown、目录 generation、请求统计和自动 credential refresh 属于运行时观测，不推进全局
-revision；credential 轮换只推进账号自己的 `credential_revision`。Redis 通知用于缩短收敛延迟，
-PostgreSQL 周期对账才是正确性基础
+revision；credential 轮换只推进账号自己的 `credential_revision`。PostgreSQL + Redis 模式通过 Redis 通知加速收敛，持久 revision 对账保证正确性；SQLite 模式使用进程内通知与数据库 revision 一秒轮询，并保留五秒周期对账作为恢复路径
 
 同一 publisher 的管理提交、订阅通知与周期对账共享编译到发布/暂停的临界区，避免旧结果覆盖新授权或
 晚到的失败暂停新快照；请求读取不等待刷新锁。对账仍允许持久 revision 回退，不能只比较版本大小。
@@ -657,17 +667,18 @@ PostgreSQL 周期对账才是正确性基础
 
 | 状态 | 唯一权威 | 说明 |
 | --- | --- | --- |
-| 账号、credential、分组、Client Key、设置、审计、请求与备份记录 | PostgreSQL | 业务持久化事实 |
-| Client Key 金额窗口与费用事件 | PostgreSQL | 准入与幂等结算的权威账本，独立于请求观测与日志保留策略 |
-| 插件包体、安装来源、制品接受事实、实例配置与私有状态 | PostgreSQL | 完整信任决定绑定已接受摘要；进程内发布集合由持久化事实构建 |
-| admission、lease、cooldown、circuit、会话亲和、continuation、OAuth pending、目录 cache | Redis | 可重建、可过期的协调状态 |
-| 控制面统一登录会话与登录限流桶 | Redis | AuthService 唯一拥有；保存 Admin / Key 身份、绑定 ID、绝对有效期和计数，不保存原始凭据 |
+| 账号、credential、分组、Client Key、设置、审计、请求与备份记录 | 当前 backend 的持久数据库 | PostgreSQL + Redis 模式使用 PostgreSQL；SQLite 模式使用本地 SQLite 文件 |
+| Client Key 金额窗口与费用事件 | 当前 backend 的持久数据库 | 准入与幂等结算的权威账本，独立于请求观测与日志保留策略 |
+| 插件包体、安装来源、制品接受事实、实例配置与私有状态 | 当前 backend 的持久数据库 | 完整信任决定绑定已接受摘要；进程内发布集合由持久化事实构建 |
+| admission、continuation、认证会话、Provider 目录与制品画像缓存 | 当前服务或命令进程 | 可丢失或可重建状态；进程退出后失效 |
+| Provider lease、cooldown、刷新退避、会话亲和与排除 | Redis 或 SQLite | Redis 用于 PostgreSQL 组合；SQLite 模式在数据库中共享并按到期时间清理 |
+| 控制面统一登录会话与登录限流桶 | Redis 或当前进程 | PostgreSQL + Redis 模式使用 Redis；SQLite 模式只供本服务或 CLI 进程使用 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
 | 重置卡库存与消费结果 | 对应 Provider 的上游 | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
 | Provider 公开模型与官方发布资料 | Provider/runtime cache | 由官方目录或发布源刷新，与 PostgreSQL 中的用户身份选择分别管理 |
 | Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
 
-账号对外状态不是独立列，而是 PostgreSQL credential/quota 事实与 Redis cooldown 的统一投影：
+账号对外状态不是独立列，而是所选数据库中的 credential/quota 事实与运行时 cooldown 的统一投影：
 `normal`、`quota_exhausted`、`rate_limited`、`disabled`、`error`。只有明确上游证据才能恢复或终态化账号，
 本地时钟和不确定响应不能伪造事实
 
@@ -675,8 +686,7 @@ PostgreSQL 周期对账才是正确性基础
 普通推理成功不能解除。Admin 恢复任务按冻结代次原子提交探测结果，避免旧结果覆盖手动恢复或新冻结；
 自动降低并发通过现有管理事务与快照发布链路，仅按数据库最新设置更新并发上限
 
-PostgreSQL schema 由迁移目录按编号管理。已应用迁移按字节冻结，后续 schema 变化只能新增编号迁移，
-详见 [迁移规则](../backend/migrations/README.md)
+PostgreSQL 和 SQLite 分别使用独立迁移目录与冻结清单。已应用迁移按字节冻结，后续 schema 变化只能在对应目录新增编号迁移；SQLite 从空文件建库，不会导入 PostgreSQL 数据。详见 [PostgreSQL 迁移规则](../backend/migrations/postgres/README.md) 与 [SQLite 迁移规则](../backend/migrations/sqlite/README.md)
 
 ## 9. Credential、额度与主动重置
 
@@ -788,14 +798,13 @@ worker 复用连接测试探针执行真实上游调用，并按冻结代次处�
 自适应并发下调按观测峰值的 80%（下限 2）原子更新最新有效账号上限，只降不升，不覆盖其他账号
 设置，审计标注为系统变更；该上限持久保存，恢复调度后不自动调高
 
-周期任务的 Redis lease 只保证单周期互斥，不构成多副本 leader 选举。备份 daemon 依赖单副本部署边界，
-自更新也只替换处理请求的当前进程，因此整个应用必须保持单副本
+PostgreSQL + Redis 模式的周期任务 Redis lease 只保证单周期互斥，不构成多副本 leader 选举；SQLite 模式的 Worker leader lease 只在当前进程内协调。备份 daemon 依赖单副本部署边界，自更新也只替换处理请求的当前进程，因此两种模式都必须保持单副本。SQLite 还要求数据库位于本地持久卷，不能由多个网关进程并发写入共享网络文件系统
 
 ## 11. 生命周期、安全与恢复
 
 ### 启动与关闭
 
-启动只有在配置、PostgreSQL、Redis、Provider、Core、Admin、API 和 Worker 全部初始化成功后才进入服务。
+启动只有在配置、所选持久数据库、对应协调依赖、Provider、Core、Admin、API 和 Worker 全部初始化成功后才进入服务。PostgreSQL + Redis 是默认组合；SQLite 模式不建立 PostgreSQL 或 Redis 连接，写启动执行 SQLite 迁移，插件帮助等只读启动只打开已有文件而不迁移或写业务数据
 健康检查综合 Core、Store 与 Worker 状态，但不会把单个 Provider 的业务降级等同于整个进程失活。
 客户端下载解析由 Host 的 `ClientDistributionResolver` 实现，组合根注入 Admin；只在管理员请求时访问外部来源，
 不阻塞启动。失败时使用官方稳定地址，临时直链不持久化或代理下载，字段与来源规则见 [客户端下载 API](api.md#windows-客户端下载)
@@ -805,7 +814,7 @@ worker 复用连接测试探针执行真实上游调用，并按冻结代次处�
 
 ### 凭据、日志与诊断
 
-- Provider credential 以 Provider schema 的明文 JSON 保存在 PostgreSQL；数据库和备份必须按敏感数据保护
+- Provider credential 以 Provider schema 的明文 JSON 保存在所选持久数据库；数据库文件和备份必须按敏感数据保护
 - `host.logging.oauth_recovery` 默认关闭，开启后将 OAuth 原始 AT/RT 写入独立文件；
   与普通文件日志开关分别控制，不输出到普通日志或 stdout。`.runtime/logs` 同样属于敏感数据
 - `host.logging.request_dump` 默认关闭；开启后独立请求转储包含原始请求头和正文，
@@ -842,10 +851,9 @@ Admin/API 只转发策略事实，前端分别展示运行版本、通道候选�
 
 ### 数据库恢复
 
-PostgreSQL 备份恢复属于人工维护操作。当前没有部署级维护模式开关，需要先停止应用，
-离线处理快照中的非终态任务、计划游标和到期清理条件，再重新验证对象存储并恢复计划。
+数据库备份恢复属于人工维护操作。PostgreSQL 与 SQLite 都没有部署级在线恢复开关，需要先停止应用。两种后端恢复时都须离线处理快照中的非终态任务、计划游标和到期清理条件；SQLite 恢复还需检查数据库完整性并按 WAL 规则处理伴随文件。
 关闭计划开关只阻止新计划任务，不会停止 Worker 的任务恢复和删除流程。
-未经核对就启动旧快照，可能触发远端对象删除；操作步骤见 [部署文档](../deploy/README.md#人工恢复数据库)
+未经核对就启动旧快照，可能触发远端对象删除；操作步骤见 [部署文档](../deploy/README.md#备份与恢复)
 
 ## 12. 修改与验收
 
@@ -875,7 +883,7 @@ RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml --
 ```
 
 线程栈设置与当前 CI 一致。PostgreSQL/Redis 集成测试需按
-[迁移文档](../backend/migrations/README.md#本地测试库) 配置专用测试库；未设置环境变量时，本地相关测试会跳过。
+[PostgreSQL 迁移文档](../backend/migrations/postgres/README.md#本地测试库) 配置专用测试库；未设置环境变量时，本地相关测试会跳过。
 其他检查与界面验证按 [贡献与审查](../CONTRIBUTING.md#验证) 执行
 
 插件 Runtime 的真实子进程与持久化测试使用 `CPR_PLUGIN_TEST_DATABASE_URL` 和

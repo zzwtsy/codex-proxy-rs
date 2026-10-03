@@ -4,8 +4,9 @@ use chrono::{TimeZone as _, Utc};
 use secrecy::SecretString;
 
 use gateway_admin::model::backup::{
-    BackupSettings, BackupStatus, BackupStatusTransition, BackupStorageConfig, BackupTriggerKind,
-    build_object_key,
+    BackupArchiveFormat, BackupSettings, BackupStatus, BackupStatusTransition, BackupStorageConfig,
+    BackupTriggerKind, build_download_file_name_for_format, build_object_key,
+    build_object_key_for_format,
 };
 
 #[test]
@@ -124,4 +125,24 @@ fn config_from_settings_redacts_secret_in_debug() {
     assert!(!format!("{config:?}").contains("sk-secret"));
     settings.endpoint = None;
     assert!(BackupStorageConfig::from_settings(&settings).is_none());
+}
+
+#[test]
+fn sqlite_archive_keys_include_backend_marker_and_file_extension() {
+    let at = Utc.with_ymd_and_hms(2026, 8, 1, 12, 30, 0).unwrap();
+    let key = build_object_key_for_format(
+        "production/backups",
+        "backup_abc",
+        at,
+        BackupArchiveFormat::Sqlite,
+    )
+    .unwrap();
+    assert_eq!(
+        key,
+        "production/backups/sqlite/2026/08/01/codex-proxy-rs_20260801_123000_abc.sqlite3"
+    );
+    assert_eq!(
+        build_download_file_name_for_format("backup_abc", BackupArchiveFormat::Sqlite),
+        "codex-proxy-rs_abc.sqlite3"
+    );
 }

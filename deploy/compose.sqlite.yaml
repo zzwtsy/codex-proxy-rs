@@ -1,0 +1,69 @@
+name: codex-proxy-rs
+
+x-json-logging: &json-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '5'
+
+services:
+  codex-proxy-rs:
+    image: ${CPR_IMAGE:-ghcr.io/zzwtsy/codex-proxy-rs:latest}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: runtime
+      args:
+        CPR_VERSION: ${CPR_VERSION:-}
+        CPR_GIT_SHA: ${CPR_GIT_SHA:-unknown}
+        CPR_BUILD_TIME: ${CPR_BUILD_TIME:-unknown}
+        CPR_BUILD_TYPE: ${CPR_BUILD_TYPE:-release}
+    restart: unless-stopped
+    user: '10001:10001'
+    init: true
+    stop_grace_period: 75s
+    pids_limit: 256
+    ports:
+      - '127.0.0.1:8080:8080'
+    volumes:
+      - type: bind
+        source: ../.runtime/data
+        target: /app/.runtime/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../.runtime/logs
+        target: /app/.runtime/logs
+        bind:
+          create_host_path: false
+    configs:
+      - source: cpr_config
+        target: /app/deploy/config.yaml
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8080/healthz]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      HOME: /app
+      CPR_SERVER_HOST: 0.0.0.0
+      CPR_SERVER_PORT: '8080'
+      CPR_DEPLOYMENT_MODE: docker
+      CPR_UPDATE_REPOSITORY: zzwtsy/codex-proxy-rs
+      CPR_GITHUB_API_BASE: https://api.github.com/repos
+      CPR_UPDATE_EXE_PATH: /app/bin/codex-proxy-rs
+      CPR_WEB_DIST_DIR: /app/web/dist
+      CPR_ENABLE_SELF_RESTART: 'true'
+      CPR_SQLITE_PATH:
+    logging: *json-logging
+
+configs:
+  cpr_config:
+    file: ./config.yaml

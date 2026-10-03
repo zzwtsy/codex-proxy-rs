@@ -126,7 +126,7 @@ PR 不接受以下协作规则文件的新增、修改、删除或重命名：
 | [管理端主题](docs/theme.md) | 界面如何保持一致，主题如何扩展 | 文案与视觉约束、Token 合同、实现入口和验收范围 |
 | [插件使用](docs/plugins.md) | 如何安装、授权、配置和使用插件 | 管理员操作与影响，不展开 SDK 调用或宿主事务实现 |
 | [插件 SDK](backend/crates/gateway-plugin/sdk/README.md) / [CLI](backend/apps/plugin-cli/README.md) | 如何编写和打包插件 | 作者合同、权限边界、示例与打包验证 |
-| [数据库迁移](backend/migrations/README.md) | 如何维护 schema 和准备测试库 | 冻结规则、升级约束和测试环境，不罗列迁移历史 |
+| [数据库迁移](backend/migrations/README.md) | PostgreSQL 与 SQLite 迁移集的入口 | 分别链接到两套迁移规则及 PostgreSQL 测试环境说明 |
 | 本文 | 如何协作、审查和交付 | 流程、判断标准与验证要求，任务入口由 [开发技能](.agents/skills/cpr-dev-guide/SKILL.md) 串联 |
 
 - 同一事实只在所属文档完整说明，其他位置按读者任务保留必要摘要和链接
@@ -191,7 +191,7 @@ git diff --check
 
 `build` 已包含类型检查；不维护独立前端测试代码。后端的工具链、命令与线程栈设置统一见 [修改与验收](docs/architecture.md#12-修改与验收)
 
-依赖 PostgreSQL / Redis 的测试使用 [专用测试环境](backend/migrations/README.md#本地测试库)，未配置导致跳过时明确记录。CI 中已有对应服务和检查，见 [质量工作流](.github/workflows/_quality.yml) 与 [安全扫描](.github/workflows/security.yml)
+依赖 PostgreSQL / Redis 的测试使用 [专用测试环境](backend/migrations/postgres/README.md#本地测试库)，未配置导致跳过时明确记录。CI 中已有对应服务和检查，见 [质量工作流](.github/workflows/_quality.yml) 与 [安全扫描](.github/workflows/security.yml)
 
 集成变更应验证实际业务路径及结果，不能只凭健康检查或探测成功认定全链路正常。协议和网络改动按需核对认证、证书、代理、流式交付及客户端结果；记录影响复现的环境条件。缺少运行条件时说明缺口，不用模拟结果代替真实集成结论
 

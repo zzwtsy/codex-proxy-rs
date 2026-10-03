@@ -13,7 +13,7 @@
 
 ## 环境与依赖
 
-需要 Node.js 24、pnpm、[Rust 工具链](architecture.md#验证命令)、PostgreSQL 和 Redis
+需要 Node.js 24、pnpm 和 [Rust 工具链](architecture.md#验证命令)。服务可使用 PostgreSQL + Redis，也可用单文件 SQLite 本地运行
 
 各前端的 `packageManager` 固定 pnpm 版本，宿主 CI 和 Docker 从 `frontend/package.json` 读取
 
@@ -33,16 +33,14 @@ pnpm --dir frontend install --frozen-lockfile
 
 使用源码仓库自带的 Compose 与配置模板，按[手动安装](../deploy/README.md#手动安装)中的配置与权限要求准备 `deploy/config.yaml` 和 `.runtime/` 目录
 
-数据库及 Redis 可由 Compose 启动：
+默认 backend 的数据库及 Redis 可由 Compose 启动：
 
 ```bash
 docker compose --env-file .env -f deploy/compose.yaml up -d postgres redis
 cargo run --manifest-path backend/Cargo.toml -p codex-proxy-rs
 ```
 
-后端从当前目录向上查找 `deploy/config.yaml`，本机运行时数据库与 Redis 地址应指向可访问的本机端口。
-上述 Compose 命令通过 `--env-file .env` 读取仓库根目录密码文件；宿主机直接运行的 `cargo run` 不会读取该文件。
-本机运行时请在配置文件填写密码，或为后端进程设置 `CPR_DATABASE_PASSWORD` 和 `CPR_REDIS_PASSWORD`
+本机也可在 `deploy/config.yaml` 选择 `store.backend: sqlite`，设置 `host.runtime_data_dir`，然后直接运行网关；无需启动外部存储服务。后端从当前目录向上查找 `deploy/config.yaml`。PostgreSQL + Redis 模式的宿主机进程不读取 `.env`，须在配置中填写密码或设置 `CPR_DATABASE_PASSWORD` / `CPR_REDIS_PASSWORD`
 
 `host.runtime_data_dir` 和日志的相对路径以该配置文件所在目录解析
 
@@ -54,7 +52,7 @@ pnpm --dir frontend dev
 
 后端代理由 `frontend/vite.config.ts` 配置，验证 WebSocket 时直接连接后端
 
-前后端检查见 [贡献与审查](../CONTRIBUTING.md#验证)，数据库集成测试使用[专用测试库](../backend/migrations/README.md#本地测试库)
+前后端检查见 [贡献与审查](../CONTRIBUTING.md#验证)，数据库集成测试使用[专用测试库](../backend/migrations/postgres/README.md#本地测试库)
 
 ## 源码联调
 

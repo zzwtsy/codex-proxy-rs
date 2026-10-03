@@ -32,7 +32,7 @@ mod schema_integrity;
 mod snapshot;
 mod snapshots;
 
-static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/postgres");
 
 pub(super) struct TestDatabase {
     admin: PgPool,

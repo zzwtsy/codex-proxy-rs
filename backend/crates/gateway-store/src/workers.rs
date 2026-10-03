@@ -6,16 +6,15 @@ use gateway_core::task::DaemonTask;
 const COMMAND_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub(crate) struct CommandStoreWriters {
-    pub(crate) execution: postgres::ExecutionObservationWriter<postgres::PgExecutionStore>,
-    pub(crate) client_key_usage: postgres::PgClientApiKeyUsageWriter,
-    pub(crate) admission_release: redis::ClientAdmissionReleaseWriter,
+    pub(crate) writers: Vec<Box<dyn DaemonTask>>,
+    pub(crate) execution_idle: Option<postgres::ExecutionBufferIdle>,
 }
 
 /// 短生命周期 CLI 只运行数据面必需的三个写泵，不注册恢复、保留或维护 Worker。
 pub struct CommandStoreDrain {
     cancellation: gateway_core::lifecycle::CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<Result<(), WorkerTaskError>>>,
-    execution_idle: postgres::ExecutionBufferIdle,
+    execution_idle: Option<postgres::ExecutionBufferIdle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -25,32 +24,23 @@ pub struct CommandStoreDrainError;
 impl CommandStoreWriters {
     pub(crate) fn start(self) -> CommandStoreDrain {
         let cancellation = gateway_core::lifecycle::CancellationToken::new();
-        let Self {
-            execution,
-            client_key_usage,
-            admission_release,
-        } = self;
-        let execution_idle = execution.idle();
-        let tasks = vec![
-            spawn_command_writer(execution, cancellation.child_token()),
-            spawn_command_writer(client_key_usage, cancellation.child_token()),
-            spawn_command_writer(admission_release, cancellation.child_token()),
-        ];
+        let tasks = self
+            .writers
+            .into_iter()
+            .map(|writer| spawn_command_writer(writer, cancellation.child_token()))
+            .collect();
         CommandStoreDrain {
             cancellation,
             tasks,
-            execution_idle,
+            execution_idle: self.execution_idle,
         }
     }
 }
 
-fn spawn_command_writer<T>(
-    writer: T,
+fn spawn_command_writer(
+    writer: Box<dyn DaemonTask>,
     cancellation: gateway_core::lifecycle::CancellationToken,
-) -> tokio::task::JoinHandle<Result<(), WorkerTaskError>>
-where
-    T: DaemonTask + Send + 'static,
-{
+) -> tokio::task::JoinHandle<Result<(), WorkerTaskError>> {
     tokio::spawn(async move { writer.run(cancellation).await })
 }
 
@@ -59,7 +49,10 @@ impl CommandStoreDrain {
         let deadline = std::time::Instant::now() + COMMAND_DRAIN_TIMEOUT;
         // CLI 调用方已结束数据面会话；先让已接收的 execution 写入在正常 writer
         // 路径完成，避免立即取消后落入更短的常驻进程关闭丢弃窗口。
-        let mut failed = !self.execution_idle.wait_until(deadline).await;
+        let mut failed = match self.execution_idle.take() {
+            Some(execution_idle) => !execution_idle.wait_until(deadline).await,
+            None => false,
+        };
         self.cancellation.cancel();
         for mut task in self.tasks.drain(..) {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -151,6 +144,57 @@ pub(crate) fn store_worker_contributions(
     ])
 }
 
+/// SQLite 不启动 Redis 准入写泵；其余持久写入与过期账本恢复仍由服务 Worker 承担。
+pub(crate) fn sqlite_store_worker_contributions(
+    pool: sqlx::SqlitePool,
+    execution: Arc<dyn gateway_core::engine::ExecutionStore>,
+    execution_writer: Box<dyn DaemonTask>,
+    client_key_usage_writer: Box<dyn DaemonTask>,
+) -> StoreResult<Vec<WorkerContribution>> {
+    let cleanup_id = WorkerId::try_new(WorkerKind::Retention, "sqlite_sessions")
+        .map_err(worker_definition_error)?;
+    let stale_id = WorkerId::try_new(WorkerKind::StaleModelRequestRecovery, "sqlite")
+        .map_err(worker_definition_error)?;
+    let execution_id = WorkerId::try_new(WorkerKind::OpsFlush, "sqlite_execution")
+        .map_err(worker_definition_error)?;
+    let client_key_usage_id = WorkerId::try_new(WorkerKind::OpsFlush, "sqlite_client_key_usage")
+        .map_err(worker_definition_error)?;
+    let restart = DaemonRestartPolicy::try_new(Duration::from_secs(1), Duration::from_secs(60))
+        .map_err(worker_definition_error)?;
+    Ok(vec![
+        WorkerContribution::Registration(scheduled_worker(
+            cleanup_id,
+            Duration::from_secs(30),
+            Box::new(sqlite::session_cleanup::SqliteSessionCleanupTask::new(pool)),
+        )?),
+        WorkerContribution::Registration(scheduled_worker(
+            stale_id,
+            Duration::from_secs(30),
+            Box::new(StaleModelRequestRecoveryTask { execution }),
+        )?),
+        WorkerContribution::Registration(
+            WorkerRegistration::try_new(
+                execution_id,
+                WorkerRunnable::Daemon {
+                    restart,
+                    task: execution_writer,
+                },
+            )
+            .map_err(worker_definition_error)?,
+        ),
+        WorkerContribution::Registration(
+            WorkerRegistration::try_new(
+                client_key_usage_id,
+                WorkerRunnable::Daemon {
+                    restart,
+                    task: client_key_usage_writer,
+                },
+            )
+            .map_err(worker_definition_error)?,
+        ),
+    ])
+}
+
 pub(crate) fn scheduled_worker(
     id: WorkerId,
     interval: Duration,
@@ -187,7 +231,7 @@ pub(crate) fn worker_definition_error(
 }
 
 pub(crate) struct StaleModelRequestRecoveryTask {
-    execution: Arc<postgres::PgExecutionStore>,
+    execution: Arc<dyn gateway_core::engine::ExecutionStore>,
 }
 
 impl ScheduledTask for StaleModelRequestRecoveryTask {
@@ -247,6 +291,76 @@ impl PostgresHealthProbe {
             Ok(Err(_)) => HealthState::Unhealthy("PostgreSQL is unavailable".to_owned()),
             Err(_) => HealthState::Unhealthy("PostgreSQL health query timed out".to_owned()),
         }
+    }
+}
+
+pub struct SqliteHealthProbe {
+    pool: sqlx::SqlitePool,
+    max_connections: u32,
+}
+
+impl SqliteHealthProbe {
+    #[must_use]
+    pub const fn new(pool: sqlx::SqlitePool, max_connections: u32) -> Self {
+        Self {
+            pool,
+            max_connections,
+        }
+    }
+
+    async fn check_once(&self) -> HealthState {
+        let deadline = tokio::time::Instant::now() + POSTGRES_HEALTH_ATTEMPT_TIMEOUT;
+        let mut connection = match tokio::time::timeout_at(deadline, self.pool.acquire()).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(_)) => {
+                return HealthState::Unhealthy("SQLite is unavailable".to_owned());
+            }
+            Err(_) => {
+                return sqlite_acquire_timeout_state(
+                    self.pool.size(),
+                    self.pool.num_idle(),
+                    self.max_connections,
+                );
+            }
+        };
+        match tokio::time::timeout_at(
+            deadline,
+            sqlx::query_scalar::<_, i32>("select 1").fetch_one(&mut *connection),
+        )
+        .await
+        {
+            Ok(Ok(1)) => HealthState::Healthy,
+            Ok(Ok(_)) => HealthState::Unhealthy("SQLite health result is invalid".to_owned()),
+            Ok(Err(_)) => HealthState::Unhealthy("SQLite is unavailable".to_owned()),
+            Err(_) => HealthState::Unhealthy("SQLite health query timed out".to_owned()),
+        }
+    }
+}
+
+impl HealthProbe for SqliteHealthProbe {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn check(&self) -> futures::future::BoxFuture<'_, HealthState> {
+        Box::pin(health_state_with_one_retry(
+            || self.check_once(),
+            POSTGRES_HEALTH_RETRY_DELAY,
+        ))
+    }
+}
+
+fn sqlite_acquire_timeout_state(
+    pool_size: u32,
+    idle_connections: usize,
+    max_connections: u32,
+) -> HealthState {
+    if pool_size >= max_connections && idle_connections == 0 {
+        HealthState::Degraded(format!(
+            "SQLite pool is saturated ({pool_size}/{max_connections} connections in use)"
+        ))
+    } else {
+        HealthState::Unhealthy("SQLite connection acquisition timed out".to_owned())
     }
 }
 

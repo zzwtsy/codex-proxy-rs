@@ -2,4 +2,5 @@
 
 pub mod pg_dump;
 pub mod s3;
+pub mod sqlite_dump;
 pub mod staging;

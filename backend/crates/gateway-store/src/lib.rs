@@ -30,18 +30,41 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 mod admin_adapter;
+mod admin_audit;
+mod admission_recovery;
+mod billing;
+pub use admission_recovery::{
+    ClientAdmissionRecentRequest, ClientAdmissionRecovery, ClientAdmissionRecoveryRepository,
+    ClientAdmissionRunningRequest,
+};
 mod bundle;
+mod client_key_usage;
 mod config;
+mod coordination;
+mod local_runtime;
+pub use local_runtime::{
+    LocalClientAdmissionPort, LocalNativeContinuationRepository, LocalWorkerLeaderLeasePort,
+};
 mod value;
 mod workers;
 
 pub mod backup;
+mod plugin_state_rules;
 pub mod postgres;
+mod pricing_validation;
 pub mod redis;
+pub(crate) mod runtime_change;
+pub(crate) mod runtime_settings;
+pub use runtime_settings::{RuntimeSettingsRepository, RuntimeSettingsUpdate};
+pub(crate) mod runtime_snapshot;
+pub mod sqlite;
+pub use runtime_snapshot::RuntimeSnapshotRepository;
 
 pub(crate) use admin_adapter::*;
+pub(crate) use admin_audit::*;
 pub use bundle::*;
 pub use config::*;
+pub use coordination::*;
 pub use value::*;
 pub(crate) use workers::*;
-pub use workers::{CommandStoreDrainError, PostgresHealthProbe};
+pub use workers::{CommandStoreDrainError, PostgresHealthProbe, SqliteHealthProbe};

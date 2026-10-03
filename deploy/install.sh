@@ -16,6 +16,7 @@ CONFIG_EXAMPLE="${DEPLOY_DIR}/config.example.yaml"
 CONFIG_FILE="${DEPLOY_DIR}/config.yaml"
 COMPOSE_FILE="${DEPLOY_DIR}/compose.yaml"
 ENV_FILE="${INSTALL_DIR}/.env"
+STORAGE_BACKEND="${CPR_STORAGE_BACKEND:-postgres}"
 CREDENTIALS_TEMP_FILE=""
 
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
@@ -70,6 +71,10 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
 }
 
+config_uses_sqlite_backend() {
+  grep -Eq "^[[:blank:]]*backend:[[:blank:]]*(sqlite|'sqlite'|\"sqlite\")[[:blank:]]*(#.*)?$" "$1"
+}
+
 run_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@"
@@ -117,20 +122,36 @@ download() {
 }
 
 download_release_files() {
-  local base_url
+  local base_url compose_asset config_asset
+
+  case "$STORAGE_BACKEND" in
+    postgres)
+      compose_asset="compose.yaml"
+      config_asset="config.example.yaml"
+      CONFIG_EXAMPLE="${DEPLOY_DIR}/${config_asset}"
+      ;;
+    sqlite)
+      compose_asset="compose.sqlite.yaml"
+      config_asset="config.example.sqlite.yaml"
+      CONFIG_EXAMPLE="${DEPLOY_DIR}/${config_asset}"
+      ;;
+    *)
+      die "CPR_STORAGE_BACKEND 仅支持 postgres 或 sqlite。"
+      ;;
+  esac
 
   resolve_release_tag
   base_url="https://github.com/${REPO}/releases/download/${CPR_RELEASE_TAG}"
 
-  log "下载 ${CPR_RELEASE_TAG} compose.yaml"
-  download "${base_url}/compose.yaml" "$COMPOSE_FILE"
-  log "下载 ${CPR_RELEASE_TAG} config.example.yaml"
-  download "${base_url}/config.example.yaml" "$CONFIG_EXAMPLE"
+  log "下载 ${CPR_RELEASE_TAG} ${compose_asset}"
+  download "${base_url}/${compose_asset}" "$COMPOSE_FILE"
+  log "下载 ${CPR_RELEASE_TAG} ${config_asset}"
+  download "${base_url}/${config_asset}" "$CONFIG_EXAMPLE"
 
   grep -q '^name: codex-proxy-rs$' "$COMPOSE_FILE" \
-    || die "下载到的 compose.yaml 内容异常。"
+    || die "下载到的 ${compose_asset} 内容异常。"
   grep -q '^schema_version:' "$CONFIG_EXAMPLE" \
-    || die "下载到的 config.example.yaml 内容异常。"
+    || die "下载到的 ${config_asset} 内容异常。"
 }
 
 random_password() {
@@ -271,29 +292,32 @@ service_user_ids() {
 }
 
 fix_runtime_permissions() {
-  local postgres_ids
-  local redis_ids
-  local app_ids
-  local app_gid
+  local app_ids app_gid
 
   log "读取容器用户 UID/GID"
-  postgres_ids="$(service_user_ids postgres postgres)"
-  redis_ids="$(service_user_ids redis redis)"
   app_ids="$(service_user_ids codex-proxy-rs cpr)"
   app_gid="${app_ids#*:}"
-
-  info "PostgreSQL postgres = ${postgres_ids}"
-  info "Redis redis         = ${redis_ids}"
   info "codex-proxy-rs cpr  = ${app_ids}"
 
   log "设置运行目录权限"
-  run_root chown -R "$postgres_ids" -- "${RUNTIME_DIR}/postgres"
-  run_root chmod 0750 -- "${RUNTIME_DIR}/postgres"
-  run_root chown -R "$redis_ids" -- "${RUNTIME_DIR}/redis"
-  run_root chmod 0750 -- "${RUNTIME_DIR}/redis"
-
-  # 保留安装用户对应用目录的所有权，并向容器实际运行组授予读写权限。
-  run_root chown -R "$(id -u):${app_gid}" -- "${RUNTIME_DIR}/data" "${RUNTIME_DIR}/logs"
+  if [[ "$STORAGE_BACKEND" == "postgres" ]]; then
+    local postgres_ids redis_ids
+    postgres_ids="$(service_user_ids postgres postgres)"
+    redis_ids="$(service_user_ids redis redis)"
+    info "PostgreSQL postgres = ${postgres_ids}"
+    info "Redis redis         = ${redis_ids}"
+    run_root chown -R "$postgres_ids" -- "${RUNTIME_DIR}/postgres"
+    run_root chmod 0750 -- "${RUNTIME_DIR}/postgres"
+    run_root chown -R "$redis_ids" -- "${RUNTIME_DIR}/redis"
+    run_root chmod 0750 -- "${RUNTIME_DIR}/redis"
+    # PostgreSQL/Redis 在独立 UID 下运行；应用只需写入自身运行数据和日志。
+    run_root chown -R "$(id -u):${app_gid}" -- "${RUNTIME_DIR}/data" "${RUNTIME_DIR}/logs"
+  else
+    # SQLite 数据文件和 WAL 伴随文件必须始终归容器应用用户所有；重复运行安装器也不能
+    # 把已创建的数据库改成宿主 UID，否则容器内的固定 UID 将失去写权限。
+    run_root chown -R "$app_ids" -- "${RUNTIME_DIR}/data"
+    run_root chown -R "$(id -u):${app_gid}" -- "${RUNTIME_DIR}/logs"
+  fi
   run_root chmod 0770 -- "${RUNTIME_DIR}/data" "${RUNTIME_DIR}/logs"
   run_root chown "$(id -u):${app_gid}" -- "$CONFIG_FILE"
   run_root chmod 0640 -- "$CONFIG_FILE"
@@ -335,30 +359,52 @@ main() {
   prepare_install_dir
   if [[ -e "$CONFIG_FILE" ]]; then
     existing_config=1
-    [[ -f "$COMPOSE_FILE" && -f "$CONFIG_EXAMPLE" ]] \
-      || die "已有 config.yaml，但 compose.yaml 或 config.example.yaml 缺失。"
+    [[ -f "$COMPOSE_FILE" ]] \
+      || die "已有 config.yaml，但 compose.yaml 缺失。"
     warn "发现已有配置：${CONFIG_FILE}"
-    info "将保留现有 config.yaml、compose.yaml 和 config.example.yaml，不执行版本升级。"
+    info "将保留现有 config.yaml、compose.yaml 和示例配置，不执行版本升级。"
+    if config_uses_sqlite_backend "$CONFIG_FILE"; then
+      STORAGE_BACKEND="sqlite"
+      CONFIG_EXAMPLE="${DEPLOY_DIR}/config.example.sqlite.yaml"
+    else
+      STORAGE_BACKEND="postgres"
+      CONFIG_EXAMPLE="${DEPLOY_DIR}/config.example.yaml"
+    fi
+    [[ -f "$CONFIG_EXAMPLE" ]] \
+      || die "已有 config.yaml，但对应的示例配置缺失。"
     if [[ -n "$ADMIN_PASSWORD" ]]; then
       warn "已有 config.yaml，因此忽略本次传入的 ADMIN_PASSWORD。"
     fi
   else
+    case "$STORAGE_BACKEND" in
+      postgres|sqlite) ;;
+      *) die "CPR_STORAGE_BACKEND 仅支持 postgres 或 sqlite。" ;;
+    esac
     download_release_files
     if [[ -z "$ADMIN_PASSWORD" ]]; then
       ADMIN_PASSWORD="$(openssl rand -hex 16)"
     fi
     validate_admin_password "$ADMIN_PASSWORD"
-    log "准备 PostgreSQL、Redis 凭据和管理员密码"
-    write_credentials_env
+    if [[ "$STORAGE_BACKEND" == "postgres" ]]; then
+      log "准备 PostgreSQL、Redis 凭据和管理员密码"
+      write_credentials_env
+    else
+      log "准备 SQLite 配置和管理员密码"
+      if [[ -L "$ENV_FILE" || ( -e "$ENV_FILE" && ! -f "$ENV_FILE" ) ]]; then
+        die "项目根目录 .env 必须是普通文件，未修改该路径。"
+      fi
+      if [[ ! -f "$ENV_FILE" ]]; then
+        install -m 0600 /dev/null "$ENV_FILE"
+      fi
+    fi
     patch_config "$ADMIN_PASSWORD"
   fi
 
   log "创建运行目录"
-  mkdir -p -- \
-    "${RUNTIME_DIR}/postgres" \
-    "${RUNTIME_DIR}/redis" \
-    "${RUNTIME_DIR}/data" \
-    "${RUNTIME_DIR}/logs"
+  if [[ "$STORAGE_BACKEND" == "postgres" ]]; then
+    mkdir -p -- "${RUNTIME_DIR}/postgres" "${RUNTIME_DIR}/redis"
+  fi
+  mkdir -p -- "${RUNTIME_DIR}/data" "${RUNTIME_DIR}/logs"
 
   log "验证 Docker Compose 配置"
   (
@@ -386,6 +432,7 @@ main() {
     docker compose --env-file .env -f deploy/compose.yaml ps
   )
 
+  info "存储模式：${STORAGE_BACKEND}"
   info "验证健康检查接口"
   if ! check_health; then
     warn "Compose 已启动，但 http://127.0.0.1:8080/healthz 未返回 204。"

@@ -67,7 +67,7 @@ jobs:
       # 已应用迁移的字节被 sqlx 启动校验钉死：改动已发布迁移会让所有
       # 存量部署重启即失败。冻结清单保证旧文件不被改、新文件必须入册。
       - name: Migration freeze check
-        working-directory: backend/migrations
+        working-directory: backend/migrations/postgres
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -76,7 +76,7 @@ jobs:
           sha256sum --check --strict .frozen-sha256
           for file in *.sql; do
             if ! awk '{print $2}' .frozen-sha256 | grep -Fxq "$file"; then
-              echo "::error file=backend/migrations/$file::migration $file is not frozen; append its sha256 to backend/migrations/.frozen-sha256"
+              echo "::error file=backend/migrations/postgres/$file::migration $file is not frozen; append its sha256 to backend/migrations/postgres/.frozen-sha256"
               exit 1
             fi
           done
@@ -84,13 +84,49 @@ jobs:
           # 对 PR，断言 .frozen-sha256 相对 base 只增不改——base 里的每一行
           # 必须原样保留（改哈希＝删行，删迁移＝删行，都会被挡）。
           if [ -n "${BASE_SHA:-}" ]; then
-            base_manifest="$(git show "${BASE_SHA}:backend/migrations/.frozen-sha256" 2>/dev/null || true)"
+            base_manifest="$(git show "${BASE_SHA}:backend/migrations/postgres/.frozen-sha256" 2>/dev/null || true)"
+            if [ -z "$base_manifest" ]; then
+              # 兼容迁移目录调整前的目标分支清单。
+              base_manifest="$(git show "${BASE_SHA}:backend/migrations/.frozen-sha256" 2>/dev/null || true)"
+            fi
             if [ -n "$base_manifest" ]; then
               while IFS= read -r line; do
                 [ -z "$line" ] && continue
                 if ! grep -Fxq "$line" .frozen-sha256; then
                   file="$(printf '%s' "$line" | awk '{print $2}')"
-                  echo "::error file=backend/migrations/.frozen-sha256::frozen migration $file was modified or removed; released migrations are append-only — add a new numbered migration instead"
+                  echo "::error file=backend/migrations/postgres/.frozen-sha256::frozen migration $file was modified or removed; released migrations are append-only — add a new numbered migration instead"
+                  exit 1
+                fi
+              done <<< "$base_manifest"
+            fi
+          fi
+
+      - name: SQLite migration freeze check
+        working-directory: backend/migrations/sqlite
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict .frozen-sha256
+          for file in *.sql; do
+            if ! awk '{print $2}' .frozen-sha256 | grep -Fxq "$file"; then
+              echo "::error file=backend/migrations/sqlite/$file::migration $file is not frozen; append its sha256 to backend/migrations/sqlite/.frozen-sha256"
+              exit 1
+            fi
+          done
+          if [ -n "${BASE_SHA:-}" ]; then
+            base_manifest="$(git show "${BASE_SHA}:backend/migrations/sqlite/.frozen-sha256" 2>/dev/null || true)"
+            if [ -z "$base_manifest" ]; then
+              # 兼容迁移目录调整前的目标分支清单。
+              base_manifest="$(git show "${BASE_SHA}:backend/crates/gateway-store/src/sqlite/migrations/.frozen-sha256" 2>/dev/null || true)"
+            fi
+            if [ -n "$base_manifest" ]; then
+              while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                if ! grep -Fxq "$line" .frozen-sha256; then
+                  file="$(printf '%s' "$line" | awk '{print $2}')"
+                  echo "::error file=backend/migrations/sqlite/.frozen-sha256::frozen migration $file was modified or removed; add a new numbered migration instead"
                   exit 1
                 fi
               done <<< "$base_manifest"

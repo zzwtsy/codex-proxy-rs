@@ -42,6 +42,7 @@ host:
   worker_shutdown_timeout_seconds: 30
 
 store:
+  backend: postgres
   database:
     # Docker 内由 CPR_DATABASE_URL 覆盖；密码不要写进 URL。
     # 必填，应用接受任意非空字符串。Compose 由 CPR_DATABASE_PASSWORD 覆盖；

@@ -8,7 +8,7 @@ use redis::{Script, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 
 use super::{MAX_REDIS_EXACT_INTEGER, namespace, resource_fingerprint};
-use crate::{StoreError, StoreResult, redis_unavailable, require_nonempty};
+use crate::{StoreError, StoreResult, redis_unavailable};
 
 const CONSUME_LOGIN_ATTEMPT_SCRIPT: &str = r#"
 local source_count = redis.call('INCR', KEYS[1])
@@ -21,74 +21,7 @@ end
 return 0
 "#;
 
-/// Redis 身份标签只由认证服务写入，不能从请求中的角色声明构造。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SessionSubjectRecord {
-    Admin {
-        admin_user_id: String,
-        // 旧会话没有指纹，按未认证处理并要求重新登录。
-        #[serde(default)]
-        credential_fingerprint: String,
-    },
-    Key {
-        client_key_id: String,
-    },
-}
-
-impl SessionSubjectRecord {
-    fn validate(&self) -> StoreResult<()> {
-        match self {
-            Self::Admin { admin_user_id, .. } => {
-                require_nonempty("authentication session", "admin_user_id", admin_user_id)
-            }
-            Self::Key { client_key_id } => {
-                require_nonempty("authentication session", "client_key_id", client_key_id)
-            }
-        }
-    }
-}
-
-/// Redis 中不含密码或原始 API Key 的统一会话事实。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthSessionRecord {
-    pub subject: SessionSubjectRecord,
-    pub expires_at: DateTime<Utc>,
-}
-
-impl AuthSessionRecord {
-    fn validate(&self) -> StoreResult<u64> {
-        self.subject.validate()?;
-        let expires_at_millis = u64::try_from(self.expires_at.timestamp_millis())
-            .map_err(|_| auth_invalid("session expiry must be after the Unix epoch"))?;
-        if expires_at_millis > MAX_REDIS_EXACT_INTEGER {
-            return Err(auth_invalid(
-                "session expiry is outside the supported range",
-            ));
-        }
-        let now_millis = u64::try_from(Utc::now().timestamp_millis())
-            .map_err(|_| auth_invalid("current time is outside the supported range"))?;
-        if expires_at_millis <= now_millis {
-            return Err(auth_invalid("session expiry must be in the future"));
-        }
-        Ok(expires_at_millis)
-    }
-}
-
-#[async_trait]
-pub trait AuthStateRepository: Send + Sync {
-    async fn load_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>>;
-    async fn store_session(&self, session_id: &str, session: &AuthSessionRecord)
-    -> StoreResult<()>;
-    async fn delete_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>>;
-    async fn consume_login_attempt(
-        &self,
-        source: &str,
-        source_limit: u32,
-        global_limit: u32,
-        window: Duration,
-    ) -> StoreResult<Option<Duration>>;
-}
+pub use crate::coordination::{AuthSessionRecord, AuthStateRepository, SessionSubjectRecord};
 
 #[derive(Clone)]
 pub struct RedisAuthStateRepository {
@@ -137,7 +70,14 @@ impl AuthStateRepository for RedisAuthStateRepository {
         session: &AuthSessionRecord,
     ) -> StoreResult<()> {
         let key = self.session_key(session_id)?;
-        let expires_at_millis = session.validate()?;
+        session.validate()?;
+        let expires_at_millis = u64::try_from(session.expires_at.timestamp_millis())
+            .map_err(|_| auth_invalid("session expiry is outside the supported range"))?;
+        if expires_at_millis > MAX_REDIS_EXACT_INTEGER {
+            return Err(auth_invalid(
+                "session expiry is outside the supported range",
+            ));
+        }
         let payload = encode_session(session)?;
         let mut connection = self.connection.clone();
         redis::cmd("SET")

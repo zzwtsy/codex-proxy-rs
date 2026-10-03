@@ -36,7 +36,7 @@
 
 ## 快速开始
 
-使用 Docker Compose 部署版本固定的发布镜像，同时启动 PostgreSQL 和 Redis
+默认使用 Docker Compose 部署 PostgreSQL + Redis。单实例部署也可选择 SQLite，网关不连接 PostgreSQL 或 Redis
 
 以下命令适用于 Linux amd64/arm64，需要 Docker Engine、Docker Compose Plugin、curl 和 OpenSSL
 
@@ -63,12 +63,22 @@ curl -fsSL https://raw.githubusercontent.com/zyycn/codex-proxy-rs/main/deploy/in
 | `INSTALL_DIR` | 安装目录，建议使用绝对路径 | 当前目录下的 `codex-proxy-rs/` |
 | `CPR_RELEASE_TAG` | 指定发布标签 | 最新正式版本 |
 | `ADMIN_PASSWORD` | 管理员初始密码，至少 12 位，不能包含 `$`，不能使用常见弱口令 | 随机生成 |
+| `CPR_STORAGE_BACKEND` | 新安装存储组合：`postgres` 或 `sqlite` | `postgres` |
 
 例如，自定义安装目录：
 
 ```bash
 INSTALL_DIR="$HOME/services/codex-proxy-rs" bash install.sh
 ```
+
+SQLite 单实例安装：
+
+```bash
+CPR_STORAGE_BACKEND=sqlite bash install.sh
+```
+
+SQLite 模式使用 `.runtime/data/codex-proxy.sqlite3`；不会启动 PostgreSQL 或 Redis。它面向单网关实例，
+且新安装会创建独立空库，不会导入已有 PostgreSQL 数据。重复运行安装器会保留现有配置和存储模式
 
 重复运行时请使用同一安装目录，检测到 `deploy/config.yaml` 后，脚本保留现有配置和部署文件，
 忽略传入的管理员密码，也不执行版本升级
