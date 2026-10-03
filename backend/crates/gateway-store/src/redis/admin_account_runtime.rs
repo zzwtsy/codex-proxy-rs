@@ -1,6 +1,6 @@
-//! Admin query service 使用的账号运行态组合 adapter。
+//! Redis cooldown 与凭据租约到 Admin 账号运行态端口的组合。
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,44 +10,86 @@ use gateway_admin::{
     ports::store::{AccountRuntimeStore, AdminStoreResult},
 };
 
-use super::{
-    CredentialCooldownRepository as _, CredentialLeaseRepository as _,
-    RedisCredentialCooldownRepository, RedisCredentialLeaseRepository,
+use crate::{
+    AccountRuntimeStateRepository, AccountRuntimeStoreAdapter, CredentialLeaseRepository,
+    StoreResult,
 };
 
-/// 只组合可丢失 Redis 事实；不持有 PostgreSQL，也不执行状态投影。
+use super::{
+    CredentialCooldownRepository as _, RedisCredentialCooldownRepository,
+    RedisCredentialLeaseRepository,
+};
+
+/// 仅用于保留 PostgreSQL+Redis 组合的便捷构造；运行态接口不依赖 Redis 类型。
 #[derive(Clone)]
 pub struct RedisAdminAccountRuntimeStore {
-    cooldowns: RedisCredentialCooldownRepository,
-    leases: RedisCredentialLeaseRepository,
+    inner: AccountRuntimeStoreAdapter,
 }
 
 impl RedisAdminAccountRuntimeStore {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         cooldowns: RedisCredentialCooldownRepository,
         leases: RedisCredentialLeaseRepository,
     ) -> Self {
-        Self { cooldowns, leases }
+        let state: Arc<dyn AccountRuntimeStateRepository> = Arc::new(cooldowns);
+        let leases: Arc<dyn CredentialLeaseRepository> = Arc::new(leases);
+        Self {
+            inner: AccountRuntimeStoreAdapter::new(state, leases),
+        }
     }
 }
 
 #[async_trait]
 impl AccountRuntimeStore for RedisAdminAccountRuntimeStore {
     async fn active_rate_limits(&self) -> AdminStoreResult<AccountRuntimeSnapshot> {
-        self.cooldowns
-            .active_cooldowns()
-            .await
-            .map_err(|error| crate::admin_store_error("account runtime", error))
+        self.inner.active_rate_limits().await
     }
 
     async fn account_runtime(
         &self,
         account_ids: &[String],
     ) -> AdminStoreResult<AccountRuntimeSnapshot> {
+        self.inner.account_runtime(account_ids).await
+    }
+
+    async fn active_freezes(
+        &self,
+    ) -> AdminStoreResult<BTreeMap<String, gateway_admin::model::accounts::AccountFreeze>> {
+        self.inner.active_freezes().await
+    }
+
+    async fn capacity_peaks(
+        &self,
+        account_ids: &[String],
+    ) -> AdminStoreResult<BTreeMap<String, u32>> {
+        self.inner.capacity_peaks(account_ids).await
+    }
+
+    async fn finish_freeze(
+        &self,
+        account_id: &str,
+        expected: &gateway_admin::model::accounts::AccountFreeze,
+        postpone_until: Option<DateTime<Utc>>,
+    ) -> AdminStoreResult<bool> {
+        self.inner
+            .finish_freeze(account_id, expected, postpone_until)
+            .await
+    }
+}
+
+#[async_trait]
+impl AccountRuntimeStateRepository for RedisCredentialCooldownRepository {
+    async fn active_rate_limits(&self) -> StoreResult<AccountRuntimeSnapshot> {
+        self.active_cooldowns().await
+    }
+
+    async fn account_cooldowns(
+        &self,
+        account_ids: &[String],
+    ) -> StoreResult<BTreeMap<String, gateway_core::account::AccountCooldown>> {
         let reads = account_ids.iter().map(|account_id| async move {
-            self.cooldowns
-                .read_credential_cooldown(account_id)
+            self.read_credential_cooldown(account_id)
                 .await
                 .map(|cooldown| {
                     cooldown.map(|cooldown| {
@@ -61,55 +103,30 @@ impl AccountRuntimeStore for RedisAdminAccountRuntimeStore {
                     })
                 })
         });
-        let mut cooldown = BTreeMap::new();
+        let mut cooldowns = BTreeMap::new();
         for result in join_all(reads).await {
-            if let Some((account_id, until)) =
-                result.map_err(|error| crate::admin_store_error("account runtime", error))?
-            {
-                cooldown.insert(account_id, until);
+            if let Some((account_id, cooldown)) = result? {
+                cooldowns.insert(account_id, cooldown);
             }
         }
-        let in_flight = self
-            .leases
-            .credential_runtime_signals(account_ids)
-            .await
-            .ok()
-            .map(|signals| {
-                signals
-                    .into_iter()
-                    .map(|signal| (signal.resource_id, u64::from(signal.in_flight)))
-                    .collect()
-            });
-        Ok(AccountRuntimeSnapshot {
-            cooldown,
-            in_flight,
-        })
+        Ok(cooldowns)
     }
 
     async fn active_freezes(
         &self,
-    ) -> AdminStoreResult<BTreeMap<String, gateway_admin::model::accounts::AccountFreeze>> {
-        self.cooldowns
-            .active_freezes()
-            .await
-            .map_err(|error| crate::admin_store_error("account runtime", error))
+    ) -> StoreResult<BTreeMap<String, gateway_admin::model::accounts::AccountFreeze>> {
+        RedisCredentialCooldownRepository::active_freezes(self).await
     }
 
-    async fn capacity_peaks(
-        &self,
-        account_ids: &[String],
-    ) -> AdminStoreResult<BTreeMap<String, u32>> {
+    async fn capacity_peaks(&self, account_ids: &[String]) -> StoreResult<BTreeMap<String, u32>> {
         let reads = account_ids.iter().map(|account_id| async move {
-            self.cooldowns
-                .read_capacity_peak(account_id)
+            self.read_capacity_peak(account_id)
                 .await
                 .map(|peak| peak.map(|value| (account_id.clone(), value)))
         });
         let mut peaks = BTreeMap::new();
         for result in join_all(reads).await {
-            if let Some((account_id, peak)) =
-                result.map_err(|error| crate::admin_store_error("account runtime", error))?
-            {
+            if let Some((account_id, peak)) = result? {
                 peaks.insert(account_id, peak);
             }
         }
@@ -121,10 +138,8 @@ impl AccountRuntimeStore for RedisAdminAccountRuntimeStore {
         account_id: &str,
         expected: &gateway_admin::model::accounts::AccountFreeze,
         postpone_until: Option<DateTime<Utc>>,
-    ) -> AdminStoreResult<bool> {
-        self.cooldowns
-            .finish_freeze(account_id, expected, postpone_until)
+    ) -> StoreResult<bool> {
+        RedisCredentialCooldownRepository::finish_freeze(self, account_id, expected, postpone_until)
             .await
-            .map_err(|error| crate::admin_store_error("account runtime", error))
     }
 }

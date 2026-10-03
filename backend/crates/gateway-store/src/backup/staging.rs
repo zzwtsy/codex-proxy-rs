@@ -14,6 +14,7 @@ const MIN_STAGING_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 pub struct StagingArea {
     base_dir: PathBuf,
     max_archive_bytes: u64,
+    backend: crate::StoreBackend,
 }
 
 impl StagingArea {
@@ -23,21 +24,54 @@ impl StagingArea {
     ///
     /// 目录创建或权限设置失败时返回 [`StoreError`]。
     pub fn open(base_dir: PathBuf, max_archive_bytes: u64) -> StoreResult<Self> {
-        std::fs::create_dir_all(&base_dir).map_err(|_| unavailable("create staging directory"))?;
+        Self::open_with_backend(base_dir, max_archive_bytes, crate::StoreBackend::PostgreSql)
+    }
+
+    /// 只读启动时记录暂存路径，但不创建目录或修改权限。
+    ///
+    /// # Errors
+    ///
+    /// 路径已存在但不是目录时返回 [`StoreError`]。
+    pub fn open_read_only(
+        base_dir: PathBuf,
+        max_archive_bytes: u64,
+        backend: crate::StoreBackend,
+    ) -> StoreResult<Self> {
+        if let Ok(metadata) = std::fs::metadata(&base_dir)
+            && !metadata.is_dir()
+        {
+            return Err(invalid("staging path is not a directory"));
+        }
+        Ok(Self {
+            base_dir,
+            max_archive_bytes,
+            backend,
+        })
+    }
+
+    /// 按实际存储后端标记文件系统错误。
+    pub fn open_with_backend(
+        base_dir: PathBuf,
+        max_archive_bytes: u64,
+        backend: crate::StoreBackend,
+    ) -> StoreResult<Self> {
+        std::fs::create_dir_all(&base_dir)
+            .map_err(|_| unavailable(backend, "create staging directory"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| unavailable("set staging directory permissions"))?;
+                .map_err(|_| unavailable(backend, "set staging directory permissions"))?;
         }
         let metadata = std::fs::metadata(&base_dir)
-            .map_err(|_| unavailable("read staging directory metadata"))?;
+            .map_err(|_| unavailable(backend, "read staging directory metadata"))?;
         if !metadata.is_dir() {
             return Err(invalid("staging path is not a directory"));
         }
         Ok(Self {
             base_dir,
             max_archive_bytes,
+            backend,
         })
     }
 
@@ -51,6 +85,25 @@ impl StagingArea {
     #[must_use]
     pub fn final_path(&self, backup_id: &str) -> PathBuf {
         self.base_dir.join(format!("{backup_id}.dump"))
+    }
+
+    /// 指定扩展名的部分文件路径。
+    #[must_use]
+    pub fn partial_path_with_extension(&self, backup_id: &str, extension: &str) -> PathBuf {
+        self.base_dir
+            .join(format!("{backup_id}.{extension}.partial"))
+    }
+
+    /// 指定扩展名的完成文件路径。
+    #[must_use]
+    pub fn final_path_with_extension(&self, backup_id: &str, extension: &str) -> PathBuf {
+        self.base_dir.join(format!("{backup_id}.{extension}"))
+    }
+
+    /// 清理指定扩展名的部分文件和完成文件。
+    pub fn cleanup_with_extension(&self, backup_id: &str, extension: &str) {
+        let _ = std::fs::remove_file(self.partial_path_with_extension(backup_id, extension));
+        let _ = std::fs::remove_file(self.final_path_with_extension(backup_id, extension));
     }
 
     /// 单任务暂存归档上限。
@@ -69,7 +122,7 @@ impl StagingArea {
     /// 剩余空间不足或读取失败时返回 [`crate::StoreError`]。
     pub fn ensure_capacity(&self) -> StoreResult<()> {
         let free = fs2::available_space(&self.base_dir)
-            .map_err(|_| unavailable("read staging free space"))?;
+            .map_err(|_| unavailable(self.backend, "read staging free space"))?;
         if free < MIN_STAGING_FREE_BYTES {
             return Err(StoreError::InvalidData {
                 entity: "backup staging",
@@ -92,8 +145,11 @@ impl StagingArea {
     }
 }
 
-fn unavailable(operation: &'static str) -> StoreError {
-    crate::postgres_unavailable(operation)
+fn unavailable(backend: crate::StoreBackend, operation: &'static str) -> StoreError {
+    StoreError::Unavailable {
+        backend,
+        message: operation.to_owned(),
+    }
 }
 
 fn invalid(message: &str) -> StoreError {

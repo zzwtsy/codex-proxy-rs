@@ -1,47 +1,17 @@
 //! 价格覆盖与请求费用明细的持久化。
 
 use gateway_admin::model::pricing::{PricingChange, PricingSyncChanges, UpdatePricing};
-use gateway_core::{
-    metering::{ModelPriceOverride, PricingOverrides},
-    routing::ProviderKind,
-};
+use gateway_core::metering::{ModelPriceOverride, PricingOverrides};
+
+pub(crate) use crate::billing::encode_billing_snapshot;
 use sqlx::types::Json;
 
 use super::{
     AdminAuditEvent, PgControlPlaneRepository, append_admin_audit_event_in_transaction,
     bump_config_revision_in_transaction,
 };
-use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
-
-pub(crate) fn encode_billing_snapshot(
-    b: &gateway_core::metering::CalculatedCostBreakdown,
-) -> serde_json::Value {
-    serde_json::json!({
-        "version": 1,
-        "longContextBillingApplied": b.long_context_billing_applied(),
-        "image": b.image().map(|image| serde_json::json!({
-            "inputTokens": image.input_tokens, "cachedTokens": image.cached_tokens,
-            "input": image.input_amount.amount().canonical(),
-            "cacheRead": image.cache_read_amount.amount().canonical(),
-            "inputPrice": image.input_price_per_million.amount().canonical(),
-            "cacheReadPrice": image.cache_read_price_per_million.amount().canonical(),
-        })),
-        "input": b.input_amount().amount().canonical(),
-        "output": b.output_amount().amount().canonical(),
-        "cacheRead": b.cache_read_amount().amount().canonical(),
-        "cacheWrite": b.cache_write_amount().amount().canonical(),
-        "standard": b.standard_amount().amount().canonical(),
-        "total": b.total_amount().amount().canonical(),
-        "inputPrice": b.input_price_per_million().amount().canonical(),
-        "outputPrice": b.output_price_per_million().amount().canonical(),
-        "cacheReadPrice": b.cache_read_price_per_million().amount().canonical(),
-        "cacheWritePrice": b.cache_write_price_per_million().amount().canonical(),
-        "currency": b.total_amount().currency().as_str(),
-        "serviceTier": b.service_tier(),
-        "multiplierPercent": b.multiplier_percent(),
-        "customMultiplierBps": b.custom_multiplier_bps(),
-    })
-}
+use crate::pricing_validation::validate_pricing;
+use crate::{Revision, StoreResult, postgres_unavailable};
 
 pub(crate) fn decode_billing_snapshot(
     value: &serde_json::Value,
@@ -101,40 +71,6 @@ pub(crate) fn decode_billing_snapshot(
             .try_into()
             .ok()?,
     })
-}
-
-pub(crate) fn validate_pricing(pricing: &PricingOverrides) -> StoreResult<()> {
-    if pricing
-        .values()
-        .map(std::collections::BTreeMap::len)
-        .sum::<usize>()
-        > 10_000
-    {
-        return Err(invalid_pricing());
-    }
-    for (provider, models) in pricing {
-        if ProviderKind::new(provider.clone()).is_err() {
-            return Err(invalid_pricing());
-        }
-        for (model, pricing) in models {
-            if model.is_empty()
-                || model.len() > 128
-                || model.chars().any(char::is_whitespace)
-                || model.chars().any(char::is_control)
-                || pricing.validate().is_err()
-            {
-                return Err(invalid_pricing());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn invalid_pricing() -> StoreError {
-    StoreError::InvalidData {
-        entity: "model pricing",
-        message: "invalid model pricing".to_owned(),
-    }
 }
 
 impl PgControlPlaneRepository {

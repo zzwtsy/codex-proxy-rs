@@ -1,8 +1,10 @@
 //! Provider、账号与 OAuth refresh 的 Redis lease/fencing。
 
 use std::collections::BTreeMap;
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -19,7 +21,15 @@ use gateway_core::routing::ProviderKind;
 use redis::{Script, aio::ConnectionManager};
 use uuid::Uuid;
 
-use crate::{Revision, StoreError, StoreResult, redis_unavailable, require_nonempty};
+use crate::{
+    Revision, StoreError, StoreResult,
+    coordination::{
+        CredentialBoundedLeaseAcquisition, CredentialBoundedLeaseRequest, CredentialLeaseGrant,
+        CredentialLeaseGuard, CredentialLeaseRepository, CredentialLeaseRequest,
+        CredentialLeaseScope, CredentialRuntimeSignal,
+    },
+    redis_unavailable, require_nonempty,
+};
 
 use super::{MAX_REDIS_EXACT_INTEGER, namespace, resource_fingerprint};
 
@@ -124,185 +134,6 @@ end
 return tostring(cursor - 1)
 "#;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialLeaseScope {
-    Provider,
-    ProviderAccount,
-    OAuthRefreshCapacity,
-    OAuthRefresh,
-    ProviderTask,
-}
-
-impl CredentialLeaseScope {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Provider => "provider",
-            Self::ProviderAccount => "account",
-            Self::OAuthRefreshCapacity => "refresh-capacity",
-            Self::OAuthRefresh => "refresh",
-            Self::ProviderTask => "task",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialLeaseRequest {
-    pub scope: CredentialLeaseScope,
-    pub resource_id: String,
-    pub owner_id: String,
-    pub ttl: Duration,
-}
-
-impl CredentialLeaseRequest {
-    pub fn validate(&self) -> StoreResult<()> {
-        require_nonempty("credential lease", "resource_id", &self.resource_id)?;
-        require_nonempty("credential lease", "owner_id", &self.owner_id)?;
-        supported_duration(self.ttl, false, "lease TTL")?;
-        Ok(())
-    }
-}
-
-/// 对任意明确资源施加并发数和启动间隔约束的计数 lease。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialBoundedLeaseRequest {
-    pub scope: CredentialLeaseScope,
-    pub resource_id: String,
-    pub owner_id: String,
-    pub max_concurrent: u32,
-    pub request_interval: Duration,
-    pub ttl: Duration,
-}
-
-impl CredentialBoundedLeaseRequest {
-    pub fn validate(&self) -> StoreResult<()> {
-        require_nonempty("credential bounded lease", "resource_id", &self.resource_id)?;
-        require_nonempty("credential bounded lease", "owner_id", &self.owner_id)?;
-        if self.max_concurrent == 0 && self.scope != CredentialLeaseScope::ProviderAccount {
-            return Err(invalid("max_concurrent must be positive"));
-        }
-        supported_duration(self.request_interval, true, "request interval")?;
-        supported_duration(self.ttl, false, "lease TTL")?;
-        Ok(())
-    }
-
-    fn lease_request(&self) -> CredentialLeaseRequest {
-        CredentialLeaseRequest {
-            scope: self.scope,
-            resource_id: self.resource_id.clone(),
-            owner_id: self.owner_id.clone(),
-            ttl: self.ttl,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialLeaseGrant {
-    pub lease_id: String,
-    pub fencing_token: Revision,
-    pub expires_at: DateTime<Utc>,
-}
-
-/// Redis 可丢失的账号调度信号。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialRuntimeSignal {
-    pub resource_id: String,
-    pub in_flight: u32,
-    pub last_started_at: Option<DateTime<Utc>>,
-}
-
-pub enum CredentialBoundedLeaseAcquisition {
-    Acquired(CredentialLeaseGuard),
-    Busy { retry_after: Option<Duration> },
-}
-
-impl fmt::Debug for CredentialBoundedLeaseAcquisition {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Acquired(_) => formatter.write_str("Acquired([LEASE_GUARD])"),
-            Self::Busy { retry_after } => formatter
-                .debug_struct("Busy")
-                .field("retry_after", retry_after)
-                .finish(),
-        }
-    }
-}
-
-/// Drop 时在当前 Tokio runtime 上尽力释放；进程崩溃由 Redis TTL 回收。
-pub struct CredentialLeaseGuard {
-    repository: RedisCredentialLeaseRepository,
-    request: CredentialLeaseRequest,
-    grant: Option<CredentialLeaseGrant>,
-}
-
-impl CredentialLeaseGuard {
-    #[must_use]
-    pub fn grant(&self) -> Option<&CredentialLeaseGrant> {
-        self.grant.as_ref()
-    }
-
-    pub async fn release(mut self) -> StoreResult<bool> {
-        let Some(grant) = self.grant.take() else {
-            return Ok(false);
-        };
-        self.repository
-            .release_credential_lease(&self.request, &grant)
-            .await
-    }
-}
-
-impl fmt::Debug for CredentialLeaseGuard {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CredentialLeaseGuard")
-            .field("scope", &self.request.scope)
-            .field("resource_id", &"[FINGERPRINTED]")
-            .field("owner_id", &"[FINGERPRINTED]")
-            .field("grant", &self.grant)
-            .finish()
-    }
-}
-
-impl Drop for CredentialLeaseGuard {
-    fn drop(&mut self) {
-        let Some(grant) = self.grant.take() else {
-            return;
-        };
-        let repository = self.repository.clone();
-        let request = self.request.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            drop(runtime.spawn(async move {
-                let _ = repository.release_credential_lease(&request, &grant).await;
-            }));
-        }
-    }
-}
-
-#[async_trait]
-pub trait CredentialLeaseRepository: Send + Sync {
-    async fn acquire_credential_lease(
-        &self,
-        request: &CredentialLeaseRequest,
-    ) -> StoreResult<Option<CredentialLeaseGrant>>;
-    async fn renew_credential_lease(
-        &self,
-        request: &CredentialLeaseRequest,
-        grant: &CredentialLeaseGrant,
-    ) -> StoreResult<Option<CredentialLeaseGrant>>;
-    async fn release_credential_lease(
-        &self,
-        request: &CredentialLeaseRequest,
-        grant: &CredentialLeaseGrant,
-    ) -> StoreResult<bool>;
-    async fn credential_runtime_signals(
-        &self,
-        resource_ids: &[String],
-    ) -> StoreResult<Vec<CredentialRuntimeSignal>>;
-    async fn try_acquire_bounded_lease(
-        &self,
-        request: &CredentialBoundedLeaseRequest,
-    ) -> StoreResult<CredentialBoundedLeaseAcquisition>;
-}
-
 #[derive(Clone)]
 pub struct RedisCredentialLeaseRepository {
     connection: ConnectionManager,
@@ -323,11 +154,7 @@ impl RedisCredentialLeaseRepository {
         request: CredentialLeaseRequest,
     ) -> StoreResult<Option<CredentialLeaseGuard>> {
         let grant = self.acquire_credential_lease(&request).await?;
-        Ok(grant.map(|grant| CredentialLeaseGuard {
-            repository: self.clone(),
-            request,
-            grant: Some(grant),
-        }))
+        Ok(grant.map(|grant| CredentialLeaseGuard::new(Arc::new(self.clone()), request, grant)))
     }
 
     /// 原子推进跨进程共享、按 Client Key 与 Provider 隔离的调度游标。
@@ -768,11 +595,7 @@ impl CredentialLeaseRepository for RedisCredentialLeaseRepository {
             .await?;
         match attempt.grant {
             Some(grant) => Ok(CredentialBoundedLeaseAcquisition::Acquired(
-                CredentialLeaseGuard {
-                    repository: self.clone(),
-                    request: lease_request,
-                    grant: Some(grant),
-                },
+                CredentialLeaseGuard::new(Arc::new(self.clone()), lease_request, grant),
             )),
             None => Ok(CredentialBoundedLeaseAcquisition::Busy {
                 retry_after: attempt.retry_after,

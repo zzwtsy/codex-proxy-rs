@@ -16,9 +16,10 @@ use crate::model::Revision;
 use crate::model::{
     MutationContext,
     backup::{
-        BackupError, BackupObjectMetadata, BackupRecord, BackupRecordListQuery, BackupRecordPage,
-        BackupRecordSeed, BackupSettings, BackupStatusTransition, BackupStorageConfig,
-        ConnectionTestResult, UpdateBackupScheduleCommand, UpdateBackupStorageCommand,
+        BackupArchiveFormat, BackupError, BackupObjectMetadata, BackupRecord,
+        BackupRecordListQuery, BackupRecordPage, BackupRecordSeed, BackupSettings,
+        BackupStatusTransition, BackupStorageConfig, ConnectionTestResult,
+        UpdateBackupScheduleCommand, UpdateBackupStorageCommand,
     },
 };
 use crate::ports::store::AdminStoreResult;
@@ -137,9 +138,14 @@ pub trait BackupRepository: Send + Sync {
     ) -> AdminStoreResult<Vec<BackupRecord>>;
 }
 
-/// `pg_dump` 导出与本地暂存端口。
+/// 数据库快照与本地暂存端口。
 #[async_trait]
 pub trait DatabaseDumpPort: Send + Sync {
+    /// 当前连接生成的归档格式。默认值保持已有 PostgreSQL adapters 的对象 key 兼容。
+    fn archive_format(&self) -> BackupArchiveFormat {
+        BackupArchiveFormat::PostgresCustom
+    }
+
     /// 创建归档；完成后原子落盘。取消时终止子进程并清理部分文件。
     async fn dump(&self, request: DumpRequest) -> Result<DumpArtifact, BackupError>;
 

@@ -13,10 +13,10 @@ use crate::model::{
     AdminError, AdminErrorKind, MutationContext,
     auth::{AdminAuditEvent, AuditActorKind},
     backup::{
-        BackupError, BackupRecord, BackupRecordListQuery, BackupRecordPage, BackupSettings,
-        BackupStatus, BackupStorageConfig, BackupTriggerKind, ConnectionTestResult,
+        BackupArchiveFormat, BackupError, BackupRecord, BackupRecordListQuery, BackupRecordPage,
+        BackupSettings, BackupStatus, BackupStorageConfig, BackupTriggerKind, ConnectionTestResult,
         DownloadUrlResult, UpdateBackupScheduleCommand, UpdateBackupStorageCommand,
-        build_backup_seed, code,
+        build_backup_seed_for_format, code,
     },
 };
 use crate::ports::{
@@ -81,6 +81,7 @@ pub(crate) struct DefaultBackupService {
     object_store: Arc<dyn BackupObjectStorePort>,
     auth: Arc<dyn AuthStore>,
     snapshot: Arc<dyn SnapshotControl>,
+    archive_format: BackupArchiveFormat,
 }
 
 impl DefaultBackupService {
@@ -91,6 +92,7 @@ impl DefaultBackupService {
         auth: Arc<dyn AuthStore>,
         snapshot: Arc<dyn SnapshotControl>,
         timezone: gateway_core::time::DeploymentTimeZone,
+        archive_format: BackupArchiveFormat,
     ) -> Self {
         Self {
             timezone,
@@ -98,6 +100,7 @@ impl DefaultBackupService {
             object_store,
             auth,
             snapshot,
+            archive_format,
         }
     }
 }
@@ -209,12 +212,13 @@ impl BackupService for DefaultBackupService {
             ));
         }
         let prefix = settings.prefix.as_deref().unwrap_or_default();
-        let seed = build_backup_seed(
+        let seed = build_backup_seed_for_format(
             BackupTriggerKind::Manual,
             None,
             prefix,
             Utc::now(),
             expires_at,
+            self.archive_format,
         )
         .map_err(map_backup_error)?;
         let record = self
@@ -256,7 +260,10 @@ impl BackupService for DefaultBackupService {
         let Some(config) = BackupStorageConfig::from_settings(&settings) else {
             return Err(AdminError::bad_request("备份存储配置不完整"));
         };
-        let file_name = crate::model::backup::build_download_file_name(backup_id);
+        let file_name = crate::model::backup::build_download_file_name_for_format(
+            backup_id,
+            self.archive_format,
+        );
         let url = self
             .object_store
             .presigned_download(&config, &record.object_key, &file_name, DOWNLOAD_TTL)

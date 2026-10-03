@@ -422,6 +422,7 @@ async fn initialize_inner(
         store.auth(),
         snapshot.clone(),
         timezone,
+        backup_ports.dump().archive_format(),
     ));
     let backup_task = backup::task::BackupTask::new(
         backup_ports.repository(),

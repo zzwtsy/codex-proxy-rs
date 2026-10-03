@@ -4,7 +4,7 @@ use gateway_admin::model::audit::MutationAuditOperation;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -39,7 +39,6 @@ use gateway_core::{
 };
 use serde::Deserialize;
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
-use tokio::sync::Notify;
 
 use crate::{
     StoreError, StoreResult, admin_revision, admin_store_error, mutation_audit,
@@ -49,47 +48,6 @@ use crate::{
 use super::{ControlPlaneRepository, PgControlPlaneRepository};
 
 const ENTITY: &str = "client API key";
-const CLIENT_API_KEY_LAST_USED_FLUSH_DELAY: Duration = Duration::from_secs(1);
-const CLIENT_API_KEY_LAST_USED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientApiKeySnapshot {
-    pub request_profiles: std::collections::BTreeMap<
-        gateway_core::routing::ProviderKind,
-        gateway_core::account::OpaqueProviderData,
-    >,
-    pub id: ClientApiKeyId,
-    pub plaintext_key: PlaintextClientApiKey,
-    pub group_ids: Vec<AccountGroupId>,
-    pub limits: RateLimits,
-}
-
-impl ClientApiKeySnapshot {
-    pub(crate) fn from_persisted(
-        id: String,
-        key: String,
-        group_ids: Vec<String>,
-        max_concurrency: i64,
-        requests_per_minute: i64,
-    ) -> StoreResult<Self> {
-        Ok(Self {
-            request_profiles: std::collections::BTreeMap::new(),
-            id: ClientApiKeyId::new(id).map_err(|_| invalid("persisted key ID is invalid"))?,
-            plaintext_key: PlaintextClientApiKey::new(key)
-                .map_err(|_| invalid("persisted plaintext key is invalid"))?,
-            group_ids: group_ids
-                .into_iter()
-                .map(|id| {
-                    AccountGroupId::new(id).map_err(|_| invalid("persisted group ID is invalid"))
-                })
-                .collect::<StoreResult<Vec<_>>>()?,
-            limits: RateLimits {
-                max_concurrency: to_u64(max_concurrency)?,
-                requests_per_minute: to_u64(requests_per_minute)?,
-            },
-        })
-    }
-}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientApiKeySecret {
@@ -189,7 +147,7 @@ impl ClientApiKeyCursor {
         Ok(cursor)
     }
 
-    fn from_record(sort: ClientApiKeySort, record: &ClientApiKeyRecord) -> Self {
+    pub(crate) fn from_record(sort: ClientApiKeySort, record: &ClientApiKeyRecord) -> Self {
         let value = match sort.field {
             ClientApiKeySortField::Name => ClientApiKeyCursorValue::Name(record.name.clone()),
             ClientApiKeySortField::Enabled => ClientApiKeyCursorValue::Enabled(record.enabled),
@@ -508,29 +466,24 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
     }
 }
 
-/// 认证成功后按一秒窗口合并写回 API Key 最后使用时间。
-///
-/// 该 adapter 仅记录稳定 Key ID；认证材料从不进入异步队列或日志。
+/// PostgreSQL API Key 最近使用时间的 Store 绑定。
 #[derive(Clone)]
 pub struct PgClientApiKeyUsageSink {
-    state: Arc<ClientApiKeyUsageBuffer>,
-}
-
-struct ClientApiKeyUsageBuffer {
-    pending: Mutex<BTreeMap<String, DateTime<Utc>>>,
-    flush_requested: Notify,
+    inner: crate::client_key_usage::BufferedClientApiKeyUsageSink,
 }
 
 pub struct PgClientApiKeyUsageWriter {
-    repository: PgClientApiKeyRepository,
-    state: Arc<ClientApiKeyUsageBuffer>,
-    flush_delay: Duration,
+    inner: crate::client_key_usage::ClientApiKeyUsageWriter,
 }
 
 impl PgClientApiKeyUsageSink {
     #[must_use]
     pub fn new(pool: PgPool) -> (Self, PgClientApiKeyUsageWriter) {
-        Self::with_flush_delay(pool, CLIENT_API_KEY_LAST_USED_FLUSH_DELAY)
+        let repository: Arc<dyn crate::client_key_usage::ClientApiKeyLastUsedRepository> =
+            Arc::new(PgClientApiKeyRepository::new(pool));
+        let (inner, writer) =
+            crate::client_key_usage::BufferedClientApiKeyUsageSink::new(repository);
+        (Self { inner }, PgClientApiKeyUsageWriter { inner: writer })
     }
 
     #[must_use]
@@ -538,120 +491,37 @@ impl PgClientApiKeyUsageSink {
         pool: PgPool,
         flush_delay: Duration,
     ) -> (Self, PgClientApiKeyUsageWriter) {
-        let state = Arc::new(ClientApiKeyUsageBuffer {
-            pending: Mutex::new(BTreeMap::new()),
-            flush_requested: Notify::new(),
-        });
-        (
-            Self {
-                state: Arc::clone(&state),
-            },
-            PgClientApiKeyUsageWriter {
-                repository: PgClientApiKeyRepository::new(pool),
-                state,
-                flush_delay: flush_delay.max(Duration::from_millis(1)),
-            },
-        )
-    }
-
-    fn queue(&self, key_id: &ClientApiKeyId) {
-        let used_at = Utc::now();
-        let mut pending = lock_unpoisoned(&self.state.pending);
-        pending
-            .entry(key_id.as_str().to_owned())
-            .and_modify(|pending_at| *pending_at = (*pending_at).max(used_at))
-            .or_insert(used_at);
-        drop(pending);
-        self.state.flush_requested.notify_one();
-    }
-}
-
-impl PgClientApiKeyUsageWriter {
-    async fn flush_pending(&self) -> StoreResult<u64> {
-        let updates = std::mem::take(&mut *lock_unpoisoned(&self.state.pending));
-        if updates.is_empty() {
-            return Ok(0);
-        }
-        match self.repository.touch_client_api_keys(&updates).await {
-            Ok(updated) => Ok(updated),
-            Err(error) => {
-                let mut pending = lock_unpoisoned(&self.state.pending);
-                for (key_id, used_at) in updates {
-                    pending
-                        .entry(key_id)
-                        .and_modify(|pending_at| *pending_at = (*pending_at).max(used_at))
-                        .or_insert(used_at);
-                }
-                drop(pending);
-                self.state.flush_requested.notify_one();
-                Err(error)
-            }
-        }
-    }
-
-    async fn flush_on_shutdown(&self) {
-        match tokio::time::timeout(
-            CLIENT_API_KEY_LAST_USED_SHUTDOWN_TIMEOUT,
-            self.flush_pending(),
-        )
-        .await
-        {
-            Ok(Ok(updated)) if updated > 0 => {
-                tracing::info!(updated, "Client API Key last-used 已在关闭前写回");
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => {
-                tracing::warn!("Client API Key last-used 关闭写回失败");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    pending = lock_unpoisoned(&self.state.pending).len(),
-                    "Client API Key last-used 关闭写回超时"
-                );
-            }
-        }
+        let repository: Arc<dyn crate::client_key_usage::ClientApiKeyLastUsedRepository> =
+            Arc::new(PgClientApiKeyRepository::new(pool));
+        let (inner, writer) =
+            crate::client_key_usage::BufferedClientApiKeyUsageSink::with_flush_delay(
+                repository,
+                flush_delay,
+            );
+        (Self { inner }, PgClientApiKeyUsageWriter { inner: writer })
     }
 }
 
 impl ClientApiKeyUsageSink for PgClientApiKeyUsageSink {
     fn record_used(&self, key_id: &ClientApiKeyId) {
-        self.queue(key_id);
+        self.inner.record_used(key_id);
     }
 }
 
 impl DaemonTask for PgClientApiKeyUsageWriter {
     fn run(&self, cancellation: CancellationToken) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
-        Box::pin(async move {
-            loop {
-                tokio::select! {
-                    () = cancellation.cancelled() => {
-                        self.flush_on_shutdown().await;
-                        return Ok(());
-                    }
-                    () = self.state.flush_requested.notified() => {}
-                }
-                tokio::select! {
-                    () = cancellation.cancelled() => {
-                        self.flush_on_shutdown().await;
-                        return Ok(());
-                    }
-                    () = tokio::time::sleep(self.flush_delay) => {}
-                }
-                if self.flush_pending().await.is_err() {
-                    tracing::warn!("Client API Key last-used 批量写回失败");
-                    return Err(WorkerTaskError::safe(
-                        "client API key last-used flush failed",
-                    ));
-                }
-            }
-        })
+        self.inner.run(cancellation)
     }
 }
 
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+#[async_trait]
+impl crate::client_key_usage::ClientApiKeyLastUsedRepository for PgClientApiKeyRepository {
+    async fn touch_client_api_keys(
+        &self,
+        touched_at: &BTreeMap<String, DateTime<Utc>>,
+    ) -> StoreResult<u64> {
+        ClientApiKeyRepository::touch_client_api_keys(self, touched_at).await
+    }
 }
 
 /// Admin 用例所需的 Client Key 事务能力。
@@ -1002,7 +872,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
     }
 }
 
-fn store_client_key_query(
+pub(crate) fn store_client_key_query(
     query: AdminClientKeyListQuery,
 ) -> AdminStoreResult<ClientApiKeyListQuery> {
     let sort = store_client_key_sort(query.sort);
@@ -1046,7 +916,9 @@ fn store_client_key_cursor(
         .map_err(|error| admin_store_error(ENTITY, error))
 }
 
-fn admin_client_key_cursor(cursor: ClientApiKeyCursor) -> AdminStoreResult<AdminClientKeyCursor> {
+pub(crate) fn admin_client_key_cursor(
+    cursor: ClientApiKeyCursor,
+) -> AdminStoreResult<AdminClientKeyCursor> {
     let sort = AdminClientKeySort {
         field: match cursor.sort.field {
             ClientApiKeySortField::Name => AdminClientKeySortField::Name,
@@ -1073,7 +945,9 @@ fn admin_client_key_cursor(cursor: ClientApiKeyCursor) -> AdminStoreResult<Admin
     })
 }
 
-fn admin_client_key_record(record: ClientApiKeyRecord) -> AdminStoreResult<AdminClientKeyRecord> {
+pub(crate) fn admin_client_key_record(
+    record: ClientApiKeyRecord,
+) -> AdminStoreResult<AdminClientKeyRecord> {
     Ok(AdminClientKeyRecord {
         request_profile_overrides: record.request_profile_overrides,
         id: ClientApiKeyId::new(record.id)

@@ -30,12 +30,19 @@ mod runtime_settings;
 mod snapshot;
 mod usage_facts;
 
+pub use crate::runtime_snapshot::{
+    ClientApiKeySnapshot, RuntimeSnapshotData, RuntimeSnapshotRepository, SnapshotAccountGroupData,
+    SnapshotGroupMembershipData, SnapshotProviderAccountData, SnapshotRuntimeSettings,
+};
 pub use account_groups::*;
 pub use admin_security_audit::*;
 pub use admission_recovery::*;
 pub use backup::*;
 pub use client_budgets::PgClientBudgetStore;
 pub use client_keys::*;
+pub(crate) use client_keys::{
+    admin_client_key_cursor, admin_client_key_record, store_client_key_query,
+};
 pub use execution::*;
 pub use execution_buffer::*;
 pub use observability::*;

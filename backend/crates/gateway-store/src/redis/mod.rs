@@ -1,7 +1,5 @@
 //! 可丢失、可从 PostgreSQL 或 Provider 重建的 Redis 协调状态。
 
-use sha2::{Digest, Sha256};
-
 mod admin_account_runtime;
 mod artifact_profile;
 mod auth;
@@ -31,14 +29,10 @@ pub use provider_session_affinity::*;
 pub use provider_session_exclusion::*;
 pub use runtime_change::*;
 
+pub(crate) use crate::coordination::resource_fingerprint;
 use crate::{StoreError, StoreResult, require_nonempty};
 
 pub(crate) const MAX_REDIS_EXACT_INTEGER: u64 = (1_u64 << 53) - 1;
-
-pub(crate) fn resource_fingerprint(entity: &'static str, value: &str) -> StoreResult<String> {
-    require_nonempty(entity, "resource ID", value)?;
-    Ok(hex::encode(Sha256::digest(value.as_bytes())))
-}
 
 pub(crate) fn namespace(value: &str) -> StoreResult<String> {
     require_nonempty("Redis namespace", "namespace", value)?;
@@ -54,3 +48,9 @@ pub(crate) fn namespace(value: &str) -> StoreResult<String> {
     }
     Ok(value.to_owned())
 }
+
+pub use crate::coordination::{
+    CredentialBoundedLeaseAcquisition, CredentialBoundedLeaseRequest, CredentialLeaseGrant,
+    CredentialLeaseGuard, CredentialLeaseRepository, CredentialLeaseRequest, CredentialLeaseScope,
+    CredentialRuntimeSignal,
+};

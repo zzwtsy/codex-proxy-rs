@@ -12,7 +12,7 @@ use crate::postgres::{
     account_status_projection, load_cooldown,
 };
 
-use crate::redis::{CredentialLeaseRepository as _, RedisCredentialLeaseRepository};
+use crate::coordination::CredentialLeaseRepository;
 
 #[derive(Clone)]
 pub struct PgObservabilityRepository {
@@ -96,14 +96,14 @@ impl PgObservabilityRepository {
 #[derive(Clone)]
 pub struct PgAdminObservabilityStore {
     repository: PgObservabilityRepository,
-    runtime_signals: Option<RedisCredentialLeaseRepository>,
+    runtime_signals: Option<Arc<dyn CredentialLeaseRepository>>,
 }
 
 impl PgAdminObservabilityStore {
     #[must_use]
     pub fn new(
         pool: PgPool,
-        runtime_signals: Option<RedisCredentialLeaseRepository>,
+        runtime_signals: Option<Arc<dyn CredentialLeaseRepository>>,
         cooldowns: Option<Arc<dyn ProviderCooldownPort>>,
         query_budget: ObservabilityQueryBudget,
     ) -> Self {

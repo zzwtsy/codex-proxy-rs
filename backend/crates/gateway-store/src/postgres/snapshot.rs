@@ -3,81 +3,21 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use gateway_core::account::ProviderAccountId;
 use gateway_core::routing::{
     AccountGroupId, ConfigRevision,
-    snapshot::{
-        SnapshotAccountGroupFacts, SnapshotAccountGroupMemberFacts, SnapshotClientPolicyFacts,
-        SnapshotFacts, SnapshotProviderAccountFacts, SnapshotStoreError, SnapshotStorePort,
-    },
+    snapshot::{SnapshotFacts, SnapshotStoreError, SnapshotStorePort},
 };
-use gateway_core::settings::SettingsValues;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
 
-use super::ClientApiKeySnapshot;
+use crate::runtime_snapshot::{ClientApiKeySnapshot, RuntimeSnapshotRepository};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotRuntimeSettings {
-    pub pricing: gateway_core::metering::PricingOverrides,
-    pub request_profiles:
-        BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
-    pub request_location_enabled: bool,
-    pub request_location: gateway_core::account::RequestLocation,
-    pub refresh_margin_seconds: u64,
-    pub refresh_concurrency: u32,
-    pub max_concurrent_per_account: u32,
-    pub request_interval_ms: u64,
-    pub max_waiting_per_key: u32,
-    pub max_waiting_per_account: u32,
-    pub concurrency_wait_timeout_seconds: u32,
-    pub openai_guardian_reserved_concurrency: u32,
-    pub responses_max_decompressed_body_bytes: u64,
-    pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
-    pub rotation_strategy: String,
-    pub model_mappings: BTreeMap<String, String>,
-    pub min_codex_desktop_version: Option<String>,
-    pub min_codex_cli_version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeSnapshotData {
-    pub config_revision: Revision,
-    pub observed_current_revision: Revision,
-    pub settings: SnapshotRuntimeSettings,
-    pub client_api_keys: Vec<ClientApiKeySnapshot>,
-    pub account_groups: Vec<SnapshotAccountGroupData>,
-    pub provider_accounts: Vec<SnapshotProviderAccountData>,
-    pub group_memberships: Vec<SnapshotGroupMembershipData>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotAccountGroupData {
-    pub disable_fast: bool,
-    pub id: AccountGroupId,
-    pub name: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotProviderAccountData {
-    pub id: String,
-    pub provider_kind: String,
-    pub model_access: gateway_core::account::AccountModelAccess,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotGroupMembershipData {
-    pub group_id: AccountGroupId,
-    pub account_id: String,
-}
-
-#[async_trait]
-pub trait RuntimeSnapshotRepository: Send + Sync {
-    async fn load_runtime_snapshot(&self) -> StoreResult<RuntimeSnapshotData>;
-    async fn current_config_revision(&self) -> StoreResult<Revision>;
-}
+use crate::runtime_snapshot::{
+    RuntimeSnapshotData, SnapshotAccountGroupData, SnapshotGroupMembershipData,
+    SnapshotProviderAccountData, SnapshotRuntimeSettings, core_revision, decode_request_profiles,
+    revision_from_i64, snapshot_data_into_facts, to_u32, to_u64,
+};
 
 #[derive(Clone)]
 pub struct PgRuntimeSnapshotRepository {
@@ -151,87 +91,7 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
                 .load_runtime_snapshot()
                 .await
                 .map_err(|_| SnapshotStoreError::unavailable())?;
-            let config_revision = core_revision(data.config_revision)?;
-            let observed_current_revision = core_revision(data.observed_current_revision)?;
-            let settings = SettingsValues::new(
-                data.settings.max_concurrent_per_account,
-                data.settings.request_interval_ms,
-                data.settings.rotation_strategy,
-                data.settings.model_mappings,
-                data.settings.min_codex_desktop_version,
-                data.settings.min_codex_cli_version,
-            )
-            .with_responses_max_decompressed_body_bytes(
-                data.settings.responses_max_decompressed_body_bytes,
-            )
-            .with_openai_guardian_reserved_concurrency(
-                data.settings.openai_guardian_reserved_concurrency,
-            )
-            .with_smart_scheduling(data.settings.smart_scheduling)
-            .with_request_profiles(data.settings.request_profiles)
-            .with_pricing(data.settings.pricing)
-            .with_request_location(
-                data.settings.request_location,
-                data.settings.request_location_enabled,
-            )
-            .with_concurrency_queues(
-                data.settings.max_waiting_per_key,
-                data.settings.max_waiting_per_account,
-                data.settings.concurrency_wait_timeout_seconds,
-            );
-            let client_policies = data
-                .client_api_keys
-                .into_iter()
-                .map(|key| {
-                    SnapshotClientPolicyFacts::new(
-                        key.id,
-                        key.plaintext_key,
-                        key.group_ids,
-                        key.limits,
-                    )
-                    .with_request_profiles(key.request_profiles)
-                })
-                .collect();
-            let account_groups = data
-                .account_groups
-                .into_iter()
-                .map(|group| {
-                    SnapshotAccountGroupFacts::new(group.id, group.name, group.enabled)
-                        .with_disable_fast(group.disable_fast)
-                })
-                .collect();
-            let provider_accounts = data
-                .provider_accounts
-                .into_iter()
-                .map(|account| {
-                    ProviderAccountId::new(account.id)
-                        .map(|id| {
-                            SnapshotProviderAccountFacts::new(id, account.provider_kind)
-                                .with_model_access(account.model_access)
-                        })
-                        .map_err(|_| SnapshotStoreError::unavailable())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let group_memberships = data
-                .group_memberships
-                .into_iter()
-                .map(|membership| {
-                    ProviderAccountId::new(membership.account_id)
-                        .map(|account_id| {
-                            SnapshotAccountGroupMemberFacts::new(membership.group_id, account_id)
-                        })
-                        .map_err(|_| SnapshotStoreError::unavailable())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(SnapshotFacts::new(
-                config_revision,
-                observed_current_revision,
-                settings,
-                client_policies,
-                account_groups,
-                provider_accounts,
-                group_memberships,
-            ))
+            snapshot_data_into_facts(data)
         })
     }
 
@@ -245,10 +105,6 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
                 .and_then(core_revision)
         })
     }
-}
-
-fn core_revision(revision: Revision) -> Result<ConfigRevision, SnapshotStoreError> {
-    ConfigRevision::new(revision.get()).map_err(|_| SnapshotStoreError::unavailable())
 }
 
 #[derive(sqlx::FromRow)]
@@ -293,8 +149,8 @@ async fn load_settings(
         revision_from_i64(row.config_revision)?,
         SnapshotRuntimeSettings {
             pricing: {
-                super::pricing::validate_pricing(&row.pricing_synced_json.0)?;
-                super::pricing::validate_pricing(&row.pricing_overrides_json.0)?;
+                crate::pricing_validation::validate_pricing(&row.pricing_synced_json.0)?;
+                crate::pricing_validation::validate_pricing(&row.pricing_overrides_json.0)?;
                 gateway_core::metering::merge_pricing(
                     row.pricing_synced_json.0,
                     &row.pricing_overrides_json.0,
@@ -428,38 +284,9 @@ async fn load_group_memberships(
         .collect()
 }
 
-fn revision_from_i64(value: i64) -> StoreResult<Revision> {
-    Revision::new(to_u64(value)?)
-}
-
-fn to_u64(value: i64) -> StoreResult<u64> {
-    u64::try_from(value).map_err(|_| invalid("numeric snapshot field is negative"))
-}
-
-fn to_u32(value: i64) -> StoreResult<u32> {
-    u32::try_from(value).map_err(|_| invalid("numeric snapshot field is outside u32"))
-}
-
 fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: "runtime snapshot",
         message: message.to_owned(),
     }
-}
-
-fn decode_request_profiles(
-    profiles: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
-) -> StoreResult<
-    BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
-> {
-    profiles
-        .into_iter()
-        .map(|(kind, document)| {
-            Ok((
-                gateway_core::routing::ProviderKind::new(kind)
-                    .map_err(|_| invalid("invalid request profile provider"))?,
-                gateway_core::account::OpaqueProviderData::new(document),
-            ))
-        })
-        .collect()
 }

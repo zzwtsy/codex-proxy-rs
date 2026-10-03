@@ -1,9 +1,7 @@
 //! PostgreSQL revision 提交后的可丢失 Redis Pub/Sub 通知。
 
-use std::pin::Pin;
-
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use gateway_core::{
     routing::ConfigRevision,
     runtime::{SnapshotRevisionStream, SnapshotSubscriptionError, SnapshotSubscriptionPort},
@@ -15,19 +13,9 @@ use crate::{Revision, StoreError, StoreResult, redis_unavailable};
 
 use super::namespace;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeChange {
-    SnapshotPublished { config_revision: Revision },
-}
-
-pub type RuntimeChangeSubscription =
-    Pin<Box<dyn Stream<Item = StoreResult<RuntimeChange>> + Send + 'static>>;
-
-#[async_trait]
-pub trait RuntimeChangeRepository: Send + Sync {
-    async fn publish_runtime_change(&self, change: &RuntimeChange) -> StoreResult<()>;
-    async fn subscribe_runtime_changes(&self) -> StoreResult<RuntimeChangeSubscription>;
-}
+pub use crate::runtime_change::{
+    RuntimeChange, RuntimeChangeRepository, RuntimeChangeSubscription,
+};
 
 #[derive(Clone)]
 pub struct RedisRuntimeChangeRepository {
