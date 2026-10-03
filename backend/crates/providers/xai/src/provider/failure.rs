@@ -341,7 +341,7 @@ pub(super) fn preflight_context(context: &AttemptContext) -> Result<(), Provider
             UpstreamSendState::NotSent,
         ));
     }
-    if remaining(context.deadline()).is_none() {
+    if context.deadline().is_elapsed() {
         return Err(provider_error(
             ProviderErrorKind::Timeout,
             UpstreamSendState::NotSent,
@@ -357,7 +357,7 @@ pub(super) fn ensure_sent_context(context: &AttemptContext) -> Result<(), Provid
             UpstreamSendState::Sent,
         ));
     }
-    if remaining(context.deadline()).is_none() {
+    if context.deadline().is_elapsed() {
         return Err(provider_error(
             ProviderErrorKind::Timeout,
             UpstreamSendState::Sent,
@@ -570,11 +570,4 @@ pub(super) fn provider_error(
     send_state: UpstreamSendState,
 ) -> ProviderError {
     ProviderError::new(kind, send_state)
-}
-
-pub(super) fn remaining(deadline: SystemTime) -> Option<Duration> {
-    deadline
-        .duration_since(SystemTime::now())
-        .ok()
-        .filter(|remaining| !remaining.is_zero())
 }

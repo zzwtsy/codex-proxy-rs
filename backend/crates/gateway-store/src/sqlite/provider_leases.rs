@@ -6,11 +6,12 @@ use std::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use gateway_core::{
     account::{AccountRuntimeSignals, ProviderAccountId},
+    lifecycle::REQUEST_LEASE_TTL,
     policy::ClientApiKeyId,
     provider_ports::{
         ProviderLeaseAcquisition, ProviderLeasePort, ProviderLeaseRequest,
@@ -26,7 +27,6 @@ use crate::{
     sqlite::SqliteCredentialLeaseRepository,
 };
 
-const PROVIDER_ACCOUNT_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_REFRESH_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const OAUTH_REFRESH_CAPACITY_RESOURCE: &str = "oauth-refresh-global";
 
@@ -108,13 +108,10 @@ impl SqliteProviderLeaseCoordinator {
         &self,
         request: &ProviderSchedulingLeaseRequest,
     ) -> Result<ProviderLeaseAcquisition, ProviderStoreError> {
-        let ttl = request
-            .deadline()
-            .duration_since(SystemTime::now())
-            .ok()
-            .filter(|remaining| !remaining.is_zero())
-            .map(|remaining| remaining.min(PROVIDER_ACCOUNT_LEASE_TTL))
-            .ok_or_else(|| unavailable("acquire expired scheduling lease"))?;
+        let ttl = request.deadline().bounded(REQUEST_LEASE_TTL);
+        if ttl.is_zero() {
+            return Err(unavailable("acquire expired scheduling lease"));
+        }
         let acquisition = self
             .repository
             .try_acquire_bounded_lease(&CredentialBoundedLeaseRequest {
@@ -127,7 +124,18 @@ impl SqliteProviderLeaseCoordinator {
             })
             .await
             .map_err(|_| unavailable("acquire scheduling lease"))?;
-        Ok(map_acquisition(acquisition))
+        Ok(match acquisition {
+            CredentialBoundedLeaseAcquisition::Acquired(guard) => {
+                ProviderLeaseAcquisition::Acquired(Box::new(
+                    guard
+                        .maintain(request.deadline(), request.cancellation())
+                        .map_err(|_| unavailable("maintain scheduling lease"))?,
+                ))
+            }
+            CredentialBoundedLeaseAcquisition::Busy { retry_after } => {
+                ProviderLeaseAcquisition::Busy { retry_after }
+            }
+        })
     }
 
     async fn acquire_refresh_capacity(

@@ -403,7 +403,7 @@ impl CodexCredentialSelector {
         let mut waiting = CapacityWait::new(
             &self.waiting,
             queue_policy,
-            request.attempt.deadline(),
+            request.attempt.deadline().at(),
             request.attempt.concurrency_wait_budget(),
         )
         .with_priority(if prioritized {
@@ -759,7 +759,8 @@ impl CodexCredentialSelector {
                             context.concurrency_limit(&account),
                             policy.request_interval(),
                             request.attempt.deadline(),
-                        ),
+                        )
+                        .with_cancellation(request.attempt.cancellation().clone()),
                     ))
                     .await?
                 {

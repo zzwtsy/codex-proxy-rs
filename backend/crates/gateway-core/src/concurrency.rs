@@ -25,11 +25,11 @@ pub struct ConcurrencyWaitBudget {
 }
 
 impl ConcurrencyWaitBudget {
-    fn deadline(&self, timeout: Duration, request_deadline: SystemTime) -> Instant {
+    fn deadline(&self, timeout: Duration, request_deadline: Option<SystemTime>) -> Instant {
         let now = Instant::now();
-        let remaining = request_deadline
-            .duration_since(SystemTime::now())
-            .unwrap_or_default();
+        let remaining = request_deadline.map_or(timeout, |at| {
+            at.duration_since(SystemTime::now()).unwrap_or_default()
+        });
         let deadline = *self.deadline.get_or_init(|| now + timeout);
         deadline.min(now + remaining)
     }
@@ -266,7 +266,7 @@ impl<K: Eq + Hash> Drop for WaitTicket<K> {
 pub struct CapacityWait<'a, K: Eq + Hash> {
     queue: &'a ConcurrencyWaitQueue<K>,
     policy: ConcurrencyQueuePolicy,
-    request_deadline: SystemTime,
+    request_deadline: Option<SystemTime>,
     budget: &'a ConcurrencyWaitBudget,
     priority: WaitPriority,
     started_at: Option<Instant>,
@@ -275,16 +275,16 @@ pub struct CapacityWait<'a, K: Eq + Hash> {
 
 impl<'a, K: Clone + Eq + Hash> CapacityWait<'a, K> {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         queue: &'a ConcurrencyWaitQueue<K>,
         policy: ConcurrencyQueuePolicy,
-        request_deadline: SystemTime,
+        request_deadline: impl Into<Option<SystemTime>>,
         budget: &'a ConcurrencyWaitBudget,
     ) -> Self {
         Self {
             queue,
             policy,
-            request_deadline,
+            request_deadline: request_deadline.into(),
             budget,
             priority: WaitPriority::Normal,
             started_at: None,

@@ -171,6 +171,6 @@ fn old_model_request(started_at: SystemTime) -> NewModelRequest {
         image_generation_requested: false,
         admission_decision_ms: None,
         started_at,
-        deadline_at: started_at + std::time::Duration::from_secs(30),
+        deadline_at: (started_at + std::time::Duration::from_secs(30)).into(),
     }
 }

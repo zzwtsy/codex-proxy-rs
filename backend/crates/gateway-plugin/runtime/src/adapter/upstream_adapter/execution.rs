@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::SystemTime};
+use std::sync::Arc;
 
 use futures::stream;
 use gateway_core::{
@@ -153,11 +153,7 @@ impl Execution {
         let timeout = invocation
             .context
             .deadline()
-            .duration_since(SystemTime::now())
-            .map_err(|_| {
-                ProviderError::new(ProviderErrorKind::Timeout, UpstreamSendState::NotSent)
-            })?
-            .min(self.adapter.session.maximum_call_timeout());
+            .bounded(self.adapter.session.maximum_call_timeout());
         if timeout.is_zero() || invocation.context.cancellation().is_cancelled() {
             return Err(ProviderError::new(
                 ProviderErrorKind::Cancelled,

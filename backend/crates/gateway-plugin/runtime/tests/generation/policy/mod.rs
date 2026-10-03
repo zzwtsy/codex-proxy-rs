@@ -692,7 +692,7 @@ fn middleware_context(transport: ClientTransport) -> MiddlewareContext {
             client_key_id: ClientApiKeyId::new("key-middleware").unwrap(),
             account_group_ids: Arc::<[AccountGroupId]>::from([]),
             cancellation: CancellationToken::new(),
-            deadline: SystemTime::now() + Duration::from_secs(5),
+            deadline: (SystemTime::now() + Duration::from_secs(5)).into(),
             extension_scope: ExtensionCallScope::default(),
             execution_effects: None,
         },
@@ -716,7 +716,7 @@ fn attempt_middleware_context(effects: Arc<ExecutionEffects>) -> MiddlewareConte
             client_key_id: ClientApiKeyId::new("key-middleware").unwrap(),
             account_group_ids: Arc::<[AccountGroupId]>::from([]),
             cancellation: CancellationToken::new(),
-            deadline: SystemTime::now() + Duration::from_secs(5),
+            deadline: (SystemTime::now() + Duration::from_secs(5)).into(),
             extension_scope: ExtensionCallScope::default(),
             execution_effects: Some(effects),
         },
@@ -1155,7 +1155,7 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
             max_concurrency: 2,
             requests_per_minute: 10,
         },
-        timeout_ms: 60_000,
+        timeout_ms: Some(60_000),
     };
     let baseline_json = serde_json::to_value(&baseline).unwrap();
     let host_snapshot = gateway_core::routing::RuntimeSnapshot::new(

@@ -5,12 +5,13 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use gateway_core::account::{AccountRuntimeSignals, ProviderAccountId};
+use gateway_core::lifecycle::REQUEST_LEASE_TTL;
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
     ProviderLeaseAcquisition, ProviderLeasePort, ProviderLeaseRequest,
@@ -34,7 +35,6 @@ use crate::{
 use super::{MAX_REDIS_EXACT_INTEGER, namespace, resource_fingerprint};
 
 const SIGNAL_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
-const PROVIDER_ACCOUNT_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_REFRESH_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 const OAUTH_REFRESH_CAPACITY_RESOURCE: &str = "oauth-refresh-global";
 
@@ -364,18 +364,10 @@ impl RedisProviderLeaseCoordinator {
         &self,
         request: &ProviderSchedulingLeaseRequest,
     ) -> Result<ProviderLeaseAcquisition, ProviderStoreError> {
-        let ttl = request
-            .deadline()
-            .duration_since(SystemTime::now())
-            .ok()
-            .filter(|remaining| !remaining.is_zero())
-            .map(|remaining| remaining.min(PROVIDER_ACCOUNT_LEASE_TTL))
-            .ok_or_else(|| {
-                ProviderStoreError::new(
-                    ProviderStoreErrorKind::Unavailable,
-                    "acquire expired scheduling lease",
-                )
-            })?;
+        let ttl = request.deadline().bounded(REQUEST_LEASE_TTL);
+        if ttl.is_zero() {
+            return Err(provider_unavailable("acquire expired scheduling lease"));
+        }
         let acquisition = self
             .repository
             .try_acquire_bounded_lease(&CredentialBoundedLeaseRequest {
@@ -390,7 +382,11 @@ impl RedisProviderLeaseCoordinator {
             .map_err(|_| provider_unavailable("acquire scheduling lease"))?;
         Ok(match acquisition {
             CredentialBoundedLeaseAcquisition::Acquired(guard) => {
-                ProviderLeaseAcquisition::Acquired(Box::new(guard))
+                ProviderLeaseAcquisition::Acquired(Box::new(
+                    guard
+                        .maintain(request.deadline(), request.cancellation())
+                        .map_err(|_| provider_unavailable("maintain scheduling lease"))?,
+                ))
             }
             CredentialBoundedLeaseAcquisition::Busy { retry_after } => {
                 ProviderLeaseAcquisition::Busy { retry_after }

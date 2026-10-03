@@ -3,7 +3,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use gateway_core::account::{
     AccountCapacitySnapshot, AccountEligibilityPolicy, AccountSelectionPolicy, CredentialRevision,
@@ -235,7 +235,8 @@ pub struct GrokSessionSelection {
     account_selection_policy: AccountSelectionPolicy,
     eligibility: AccountEligibilityPolicy,
     affinity: Option<GrokSessionAffinityKey>,
-    deadline: SystemTime,
+    deadline: gateway_core::lifecycle::Deadline,
+    cancellation: gateway_core::lifecycle::CancellationToken,
     account_scope: Arc<FrozenAccountScope>,
     client_api_key_id: ClientApiKeyId,
     concurrency_wait_budget: gateway_core::concurrency::ConcurrencyWaitBudget,
@@ -244,6 +245,18 @@ pub struct GrokSessionSelection {
 }
 
 impl GrokSessionSelection {
+    pub(crate) fn with_cancellation(
+        mut self,
+        cancellation: gateway_core::lifecycle::CancellationToken,
+    ) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    pub(crate) fn cancellation(&self) -> &gateway_core::lifecycle::CancellationToken {
+        &self.cancellation
+    }
+
     /// 创建不可变的选择请求。
     #[must_use]
     pub fn new(
@@ -251,7 +264,7 @@ impl GrokSessionSelection {
         excluded_accounts: BTreeSet<ProviderAccountId>,
         required_account: Option<ProviderAccountId>,
         account_selection_policy: AccountSelectionPolicy,
-        deadline: SystemTime,
+        deadline: impl Into<gateway_core::lifecycle::Deadline>,
         account_scope: Arc<FrozenAccountScope>,
         client_api_key_id: ClientApiKeyId,
     ) -> Self {
@@ -262,7 +275,8 @@ impl GrokSessionSelection {
             account_selection_policy,
             eligibility: AccountEligibilityPolicy::Enforce,
             affinity: None,
-            deadline,
+            deadline: deadline.into(),
+            cancellation: gateway_core::lifecycle::CancellationToken::new(),
             account_scope,
             client_api_key_id,
             concurrency_wait_budget: gateway_core::concurrency::ConcurrencyWaitBudget::default(),
@@ -353,7 +367,7 @@ impl GrokSessionSelection {
 
     /// 返回限定调度租约的绝对截止时间。
     #[must_use]
-    pub const fn deadline(&self) -> SystemTime {
+    pub const fn deadline(&self) -> gateway_core::lifecycle::Deadline {
         self.deadline
     }
 

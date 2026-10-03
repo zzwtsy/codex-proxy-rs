@@ -1,4 +1,7 @@
-use std::{num::NonZeroU32, time::SystemTime};
+use std::{
+    num::NonZeroU32,
+    time::{Duration, SystemTime},
+};
 
 use gateway_core::{
     account::ProviderAccountId,
@@ -69,6 +72,49 @@ async fn sqlite_merged_first_attempt_is_atomic_and_retries_keep_sent_state() {
     .await
     .expect("load retried request");
     assert_eq!(persisted, (2, "sent".to_owned(), Some("acct_b".to_owned())));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_running_request_lease_is_renewed_without_a_request_timeout() {
+    let root = tempfile::tempdir().expect("SQLite data directory");
+    let pool = database(&root.path().join("execution-lease.sqlite3")).await;
+    let store = SqliteExecutionStore::new(pool.clone());
+    let mut request = request("req_renewed_lease", SystemTime::now());
+    request.deadline_at = Default::default();
+    store
+        .create_model_request(request.clone())
+        .await
+        .expect("create unbounded request");
+
+    let stale_deadline = SystemTime::now() + Duration::from_secs(1);
+    let stale_deadline_us =
+        chrono::DateTime::<chrono::Utc>::from(stale_deadline).timestamp_micros();
+    sqlx::query("update model_requests set deadline_at_us = ?2 where id = ?1")
+        .bind(request.id.as_str())
+        .bind(stale_deadline_us)
+        .execute(&pool)
+        .await
+        .expect("shorten recovery lease for renewal check");
+
+    let _lease = store.maintain_request(&request.id, request.deadline_at);
+    let renewed_deadline_us = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let deadline_us: i64 =
+                sqlx::query_scalar("select deadline_at_us from model_requests where id = ?1")
+                    .bind(request.id.as_str())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("load request recovery lease");
+            if deadline_us > stale_deadline_us {
+                break deadline_us;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request recovery lease is renewed promptly");
+    assert!(renewed_deadline_us > stale_deadline_us + 9 * 60 * 1_000_000);
     pool.close().await;
 }
 
@@ -298,7 +344,7 @@ fn request(id: &str, started_at: SystemTime) -> NewModelRequest {
         image_generation_requested: false,
         admission_decision_ms: Some(2),
         started_at,
-        deadline_at: started_at + std::time::Duration::from_secs(30),
+        deadline_at: (started_at + std::time::Duration::from_secs(30)).into(),
     }
 }
 

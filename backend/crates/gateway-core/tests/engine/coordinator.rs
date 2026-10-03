@@ -738,7 +738,7 @@ fn model_request(operation: &Operation, deadline: SystemTime) -> NewModelRequest
         continuation: Default::default(),
         image_generation_requested: operation.image_generation_requested(),
         started_at: SystemTime::now(),
-        deadline_at: deadline,
+        deadline_at: deadline.into(),
     }
 }
 
@@ -801,6 +801,35 @@ fn terminal_non_idempotent_failure(
         gateway_core::engine::EngineError::Provider(_)
     ));
     (store, provider)
+}
+
+#[test]
+fn request_without_total_deadline_can_complete_after_ten_minutes() {
+    let operation = generate_operation();
+    let route_plan = plan(&operation);
+    let (coordinator, store, provider) = coordinator(vec![Script::Stream {
+        account_id: "acct_one",
+        items: complete_stream(Some(12)),
+    }]);
+    let mut request = model_request(&operation, SystemTime::now());
+    request.started_at = SystemTime::now() - Duration::from_secs(601);
+    request.deadline_at = gateway_core::lifecycle::Deadline::default();
+    let mut session = block_on(coordinator.start(
+        request,
+        operation,
+        route_plan,
+        None,
+        None,
+        CancellationToken::new(),
+    ))
+    .expect("start long request");
+    block_on(session.collect_uncommitted()).expect("collect long response");
+    block_on(session.commit_downstream(Some(200))).expect("commit long response");
+    assert!(session.is_finalized());
+    assert_eq!(provider.contexts.lock().unwrap()[0].deadline().at(), None);
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.finalizations[0].outcome, ExecutionOutcome::Succeeded);
+    assert_eq!(state.attempts.len(), 1);
 }
 
 #[test]

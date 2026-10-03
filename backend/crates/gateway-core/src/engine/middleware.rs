@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::{Arc, RwLock, Weak};
-use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -552,7 +551,7 @@ pub struct MiddlewareContext {
     client_key_id: ClientApiKeyId,
     account_group_ids: Arc<[AccountGroupId]>,
     cancellation: CancellationToken,
-    deadline: SystemTime,
+    deadline: crate::lifecycle::Deadline,
     extension_scope: ExtensionCallScope,
     execution_effects: Option<Arc<ExecutionEffects>>,
 }
@@ -667,7 +666,7 @@ impl MiddlewareContext {
     }
 
     #[must_use]
-    pub const fn deadline(&self) -> SystemTime {
+    pub const fn deadline(&self) -> crate::lifecycle::Deadline {
         self.deadline
     }
 
@@ -701,7 +700,7 @@ pub struct MiddlewareAuthority {
     pub client_key_id: ClientApiKeyId,
     pub account_group_ids: Arc<[AccountGroupId]>,
     pub cancellation: CancellationToken,
-    pub deadline: SystemTime,
+    pub deadline: crate::lifecycle::Deadline,
     pub extension_scope: ExtensionCallScope,
     pub execution_effects: Option<Arc<ExecutionEffects>>,
 }

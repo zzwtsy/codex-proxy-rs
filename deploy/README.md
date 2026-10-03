@@ -251,6 +251,8 @@ HTTP 传输不加密，公网部署仍建议使用 HTTPS。
 并设置 `X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform`。
 反向代理仍需允许这些响应头生效；首个事件到达前的等待也需要足够的读取超时
 
+网关默认不限制模型请求的总执行时长。OpenAI 上游流默认有 300 秒空闲超时，持续收到数据不会因总时长超过 600 秒而中断
+
 OpenAI 上游池化 WebSocket 默认每 25 秒发送一次 Ping，发出后允许等待 30 秒；
 收到 Pong 或其他入站帧即解除本次心跳截止，持续无响应则以 `pong_timeout` 关闭连接。
 此策略也覆盖正在生成的请求，与等待下一条上游消息的 `stream_idle_timeout_ms` 分别计时

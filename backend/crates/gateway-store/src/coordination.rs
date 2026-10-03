@@ -528,6 +528,38 @@ impl CredentialLeaseGuard {
         }
     }
 
+    /// 租约丢失时取消依赖该账号槽位的请求。
+    pub fn maintain(
+        self,
+        deadline: gateway_core::lifecycle::Deadline,
+        cancellation: gateway_core::lifecycle::CancellationToken,
+    ) -> StoreResult<impl gateway_core::provider_ports::ProviderLeaseGuard> {
+        let repository = Arc::clone(&self.repository);
+        let lease_request = self.request.clone();
+        let grant = self.grant.clone().ok_or_else(|| StoreError::InvalidData {
+            entity: "credential lease",
+            message: "lease has already been released".to_owned(),
+        })?;
+        let renewal =
+            crate::lease_renewal::LeaseRenewal::spawn(deadline, Some(cancellation), move |ttl| {
+                let repository = Arc::clone(&repository);
+                let mut lease_request = lease_request.clone();
+                lease_request.ttl = ttl;
+                let grant = grant.clone();
+                Box::pin(async move {
+                    repository
+                        .renew_credential_lease(&lease_request, &grant)
+                        .await
+                        .map(|grant| grant.is_some())
+                })
+            });
+        Ok(RenewingCredentialLease {
+            // 先停止续期，再由 guard 释放存储端租约。
+            _renewal: renewal,
+            _guard: self,
+        })
+    }
+
     #[must_use]
     pub fn grant(&self) -> Option<&CredentialLeaseGrant> {
         self.grant.as_ref()
@@ -541,6 +573,11 @@ impl CredentialLeaseGuard {
             .release_credential_lease(&self.request, &grant)
             .await
     }
+}
+
+struct RenewingCredentialLease {
+    _renewal: crate::lease_renewal::LeaseRenewal,
+    _guard: CredentialLeaseGuard,
 }
 
 impl fmt::Debug for CredentialLeaseGuard {

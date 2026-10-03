@@ -1605,13 +1605,6 @@ pub(super) fn provider_error(
     ProviderError::new(kind, send_state)
 }
 
-pub(super) fn remaining(deadline: SystemTime) -> Option<Duration> {
-    deadline
-        .duration_since(SystemTime::now())
-        .ok()
-        .filter(|remaining| !remaining.is_zero())
-}
-
 /// 只恢复明确未发送的 HTTP 建连失败；已知 TLS/配置错误不反复尝试同一路径。
 fn transient_http_connect(error: &reqwest::Error) -> bool {
     if !error.is_connect() || error.is_builder() {

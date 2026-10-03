@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime};
 
 use futures::future::BoxFuture;
 
+use crate::lifecycle::{CancellationToken, Deadline, LeaseGuard};
+
 use crate::policy::{ClientApiKeyId, RateLimits};
 
 use super::{ExecutionStore, ModelRequestId};
@@ -60,6 +62,17 @@ pub struct ClientAdmissionRestoreResult {
 pub struct ClientAdmissionError;
 
 pub trait ClientAdmissionPort: Send + Sync {
+    /// 仅续期已经准入的并发槽位，不重复消费 RPM。
+    fn maintain(
+        &self,
+        _key: &ClientApiKeyId,
+        _request: &ModelRequestId,
+        _deadline: Deadline,
+        _cancellation: CancellationToken,
+    ) -> Box<dyn LeaseGuard> {
+        Box::new(())
+    }
+
     /// 请求 future 被取消时移交幂等释放，具体实现拥有异步清理执行器。
     fn abandon(&self, client_api_key_id: &ClientApiKeyId, model_request_id: &ModelRequestId);
 

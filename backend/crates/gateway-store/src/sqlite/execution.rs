@@ -78,7 +78,7 @@ impl SqliteExecutionStore {
         .bind(bool_i64(request.image_generation_requested))
         .bind(optional_i64(request.admission_decision_ms)?)
         .bind(DateTime::<Utc>::from(request.started_at).timestamp_micros())
-        .bind(DateTime::<Utc>::from(request.deadline_at).timestamp_micros())
+        .bind(DateTime::<Utc>::from(request.deadline_at.lease_deadline()).timestamp_micros())
         .bind(&request.continuation.affinity_hash)
         .bind(&request.continuation.previous_response_id_hash)
         .bind(bool_i64(request.continuation.requested))
@@ -141,6 +141,66 @@ impl SqliteExecutionStore {
 
 #[async_trait]
 impl ExecutionStore for SqliteExecutionStore {
+    fn maintain_request(
+        &self,
+        request_id: &ModelRequestId,
+        deadline: gateway_core::lifecycle::Deadline,
+    ) -> Box<dyn gateway_core::lifecycle::LeaseGuard> {
+        let pool = self.pool.clone();
+        let request_id = request_id.as_str().to_owned();
+        Box::new(crate::lease_renewal::LeaseRenewal::spawn(
+            deadline,
+            // 请求记录为 best-effort 观测，续期失败不能取消客户端执行。
+            None,
+            move |ttl| {
+                let pool = pool.clone();
+                let request_id = request_id.clone();
+                Box::pin(async move {
+                    let ttl_micros = i64::try_from(ttl.as_micros()).map_err(|_| {
+                        crate::StoreError::InvalidData {
+                            entity: "model request",
+                            message: "lease TTL is invalid".to_owned(),
+                        }
+                    })?;
+                    let now = Utc::now().timestamp_micros();
+                    let deadline_at = now.checked_add(ttl_micros).ok_or_else(|| {
+                        crate::StoreError::InvalidData {
+                            entity: "model request",
+                            message: "lease expiry is outside SQLite timestamp range".to_owned(),
+                        }
+                    })?;
+                    let updated = sqlx::query(
+                        "update model_requests set deadline_at_us = ?2
+                         where id = ?1 and outcome = 'running' and deadline_at_us > ?3",
+                    )
+                    .bind(&request_id)
+                    .bind(deadline_at)
+                    .bind(now)
+                    .execute(&pool)
+                    .await
+                    .map_err(|_| {
+                        crate::sqlite::sqlite_unavailable("renew model request recovery lease")
+                    })?;
+                    if updated.rows_affected() == 1 {
+                        return Ok(true);
+                    }
+                    let still_running = sqlx::query_scalar::<_, bool>(
+                        "select exists(
+                           select 1 from model_requests where id = ?1 and outcome = 'running'
+                         )",
+                    )
+                    .bind(&request_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|_| {
+                        crate::sqlite::sqlite_unavailable("check model request recovery lease")
+                    })?;
+                    Ok(!still_running)
+                })
+            },
+        ))
+    }
+
     async fn create_model_request(&self, request: NewModelRequest) -> Result<(), CoreStoreError> {
         self.insert_request(&request, None).await
     }
@@ -714,7 +774,10 @@ fn validate_new_request(request: &NewModelRequest) -> Result<(), CoreStoreError>
         || request.protocol.is_empty()
         || request.endpoint.is_empty()
         || request.client_transport.is_empty()
-        || request.started_at > request.deadline_at
+        || request
+            .deadline_at
+            .at()
+            .is_some_and(|deadline| request.started_at > deadline)
         || request
             .client_api_key_id
             .as_ref()

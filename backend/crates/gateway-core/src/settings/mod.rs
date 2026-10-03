@@ -23,8 +23,8 @@ pub struct ExecutionSettings {
     pub runtime: SettingsValues,
     pub disable_fast: bool,
     pub client_limits: RateLimits,
-    /// 从本次请求开始计时，已经过去的时间不会因插件改写而重置。
-    pub timeout_ms: u64,
+    /// null 表示不限制总时长；显式时限从请求开始计时，改写不重置计时原点。
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ struct ExecutionOverrides {
     input: Arc<ExecutionSettings>,
     disable_fast: Option<SettingOverride<bool>>,
     client_limits: Option<SettingOverride<RateLimits>>,
-    timeout_ms: Option<SettingOverride<u64>>,
+    timeout_ms: Option<SettingOverride<Option<u64>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -191,7 +191,7 @@ impl RequestSettings {
     /// 认证、模型入口和插件视图共用解析规则，派生策略不改变 Key 默认值。
     #[must_use]
     pub fn apply_policy(&self, policy: ClientPolicy) -> ClientPolicy {
-        let values = self.resolve_execution(policy.key_id().as_str(), policy.defaults(), 0);
+        let values = self.resolve_execution(policy.key_id().as_str(), policy.defaults(), None);
         policy.with_settings(
             values.runtime.request_profiles(),
             values.disable_fast,
@@ -200,7 +200,7 @@ impl RequestSettings {
     }
 
     #[must_use]
-    pub fn with_execution(mut self, policy: &ClientPolicy, timeout_ms: u64) -> Self {
+    pub fn with_execution(mut self, policy: &ClientPolicy, timeout_ms: Option<u64>) -> Self {
         let input = self.resolve_execution(policy.key_id().as_str(), policy.defaults(), timeout_ms);
         let previous = self
             .execution
@@ -231,7 +231,7 @@ impl RequestSettings {
         &self,
         key: &str,
         defaults: &ClientSettings,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
     ) -> ExecutionSettings {
         let overrides = self
             .execution
@@ -263,7 +263,7 @@ impl RequestSettings {
         &self,
         key: &ClientApiKeyId,
         started_at: SystemTime,
-    ) -> Result<SystemTime, InvalidSettings> {
+    ) -> Result<crate::lifecycle::Deadline, InvalidSettings> {
         let scope = self
             .execution
             .as_ref()
@@ -273,8 +273,7 @@ impl RequestSettings {
             .timeout_ms
             .as_ref()
             .map_or(scope.input.timeout_ms, |change| change.value);
-        started_at
-            .checked_add(Duration::from_millis(timeout_ms))
+        crate::lifecycle::Deadline::from_timeout(started_at, timeout_ms.map(Duration::from_millis))
             .ok_or(InvalidSettings)
     }
 
@@ -330,7 +329,7 @@ impl RequestSettings {
             .as_ref()
             .filter(|scope| scope.client_key_id == key.as_str())
             .and_then(|scope| scope.timeout_ms.as_ref())
-            .map(|change| Duration::from_millis(change.value))
+            .and_then(|change| change.value.map(Duration::from_millis))
     }
 
     #[must_use]

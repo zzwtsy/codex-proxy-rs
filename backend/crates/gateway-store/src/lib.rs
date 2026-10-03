@@ -41,6 +41,7 @@ mod bundle;
 mod client_key_usage;
 mod config;
 mod coordination;
+mod lease_renewal;
 mod local_runtime;
 pub use local_runtime::{
     LocalClientAdmissionPort, LocalNativeContinuationRepository, LocalWorkerLeaderLeasePort,

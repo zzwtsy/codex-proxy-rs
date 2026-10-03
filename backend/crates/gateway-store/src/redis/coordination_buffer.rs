@@ -77,6 +77,16 @@ impl BufferedClientAdmissionPort {
 }
 
 impl ClientAdmissionPort for BufferedClientAdmissionPort {
+    fn maintain(
+        &self,
+        key: &ClientApiKeyId,
+        request: &ModelRequestId,
+        deadline: gateway_core::lifecycle::Deadline,
+        cancellation: CancellationToken,
+    ) -> Box<dyn gateway_core::lifecycle::LeaseGuard> {
+        self.inner.maintain(key, request, deadline, cancellation)
+    }
+
     fn abandon(&self, key: &ClientApiKeyId, request: &ModelRequestId) {
         self.enqueue(AdmissionRelease {
             client_api_key_id: key.clone(),

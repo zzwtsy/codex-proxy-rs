@@ -1,10 +1,15 @@
-//! Host 与 API 之间的连接注册、drain 与取消契约。
+//! 请求与连接的截止、租约、取消和 drain 契约。
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use futures::{channel::oneshot, future::BoxFuture};
+use futures::{
+    channel::oneshot,
+    future::{BoxFuture, pending},
+};
+use futures_timer::Delay;
 
 struct CancellationState {
     cancelled: AtomicBool,
@@ -145,3 +150,70 @@ pub trait ConnectionLifecycle: Send + Sync {
 
     fn is_draining(&self) -> bool;
 }
+
+/// 请求默认没有总时长限制；显式截止与用于异常回收的可续期租约分开。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Deadline(Option<SystemTime>);
+
+/// 租约失去续期后有界回收，不作为模型请求的总执行预算。
+pub const REQUEST_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
+
+impl Deadline {
+    pub fn from_timeout(started_at: SystemTime, timeout: Option<Duration>) -> Option<Self> {
+        match timeout {
+            Some(timeout) => started_at.checked_add(timeout).map(|at| Self(Some(at))),
+            None => Some(Self(None)),
+        }
+    }
+
+    #[must_use]
+    pub const fn at(self) -> Option<SystemTime> {
+        self.0
+    }
+
+    #[must_use]
+    pub fn remaining(self) -> Option<Duration> {
+        self.0
+            .map(|at| at.duration_since(SystemTime::now()).unwrap_or_default())
+    }
+
+    #[must_use]
+    pub fn bounded(self, maximum: Duration) -> Duration {
+        self.remaining()
+            .map_or(maximum, |remaining| remaining.min(maximum))
+    }
+
+    #[must_use]
+    pub fn is_elapsed(self) -> bool {
+        self.remaining()
+            .is_some_and(|remaining| remaining.is_zero())
+    }
+
+    #[must_use]
+    pub fn min(self, other: SystemTime) -> Self {
+        Self(Some(self.0.map_or(other, |at| at.min(other))))
+    }
+
+    #[must_use]
+    pub fn lease_deadline(self) -> SystemTime {
+        let expires = SystemTime::now() + REQUEST_LEASE_TTL;
+        self.0.map_or(expires, |at| at.min(expires))
+    }
+
+    pub fn wait(self) -> BoxFuture<'static, ()> {
+        match self.remaining() {
+            Some(remaining) => Box::pin(Delay::new(remaining)),
+            None => Box::pin(pending()),
+        }
+    }
+}
+
+impl From<SystemTime> for Deadline {
+    fn from(at: SystemTime) -> Self {
+        Self(Some(at))
+    }
+}
+
+/// 持有者释放即停止续期，具体执行器由 Store 提供。
+pub trait LeaseGuard: Send + Sync {}
+impl<T: Send + Sync> LeaseGuard for T {}

@@ -96,7 +96,7 @@ impl GrokAccountSessionSelector {
         let mut waiting = CapacityWait::new(
             &self.waiting,
             queue_policy,
-            request.deadline(),
+            request.deadline().at(),
             request.concurrency_wait_budget(),
         );
         'refresh: loop {
@@ -289,7 +289,8 @@ impl GrokAccountSessionSelector {
                             ),
                             request.account_selection_policy().request_interval(),
                             request.deadline(),
-                        ),
+                        )
+                        .with_cancellation(request.cancellation().clone()),
                     ))
                     .await
                     .map_err(|_| GrokSessionSelectorError::Unavailable)?;

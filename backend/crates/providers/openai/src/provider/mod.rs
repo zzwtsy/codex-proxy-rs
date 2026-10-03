@@ -454,7 +454,7 @@ impl Provider for CodexProvider {
                 UpstreamSendState::NotSent,
             ));
         }
-        if remaining(context.deadline()).is_none() {
+        if context.deadline().is_elapsed() {
             return Err(provider_error(
                 ProviderErrorKind::Timeout,
                 UpstreamSendState::NotSent,

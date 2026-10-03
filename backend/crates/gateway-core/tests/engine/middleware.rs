@@ -148,7 +148,7 @@ fn context() -> MiddlewareContext {
             client_key_id: ClientApiKeyId::new("key_middleware").unwrap(),
             account_group_ids: Arc::<[AccountGroupId]>::from([]),
             cancellation: CancellationToken::new(),
-            deadline: SystemTime::now() + Duration::from_secs(5),
+            deadline: (SystemTime::now() + Duration::from_secs(5)).into(),
             extension_scope: ExtensionCallScope::default(),
             execution_effects: None,
         },

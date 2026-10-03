@@ -65,7 +65,7 @@ pub(super) async fn next_grok_chunk(
     upstream_model: &UpstreamModelId,
     context: &AttemptContext,
 ) -> Result<Option<bytes::Bytes>, ProviderError> {
-    let Some(stream_deadline) = remaining(context.deadline()) else {
+    if context.deadline().is_elapsed() {
         return Err(provider_error(
             ProviderErrorKind::Timeout,
             UpstreamSendState::Sent,
@@ -78,7 +78,7 @@ pub(super) async fn next_grok_chunk(
             ProviderErrorKind::Cancelled,
             UpstreamSendState::Sent,
         )),
-        _ = tokio::time::sleep(stream_deadline) => Err(provider_error(
+        _ = context.deadline().wait() => Err(provider_error(
             ProviderErrorKind::Timeout,
             UpstreamSendState::Sent,
         )),
@@ -141,7 +141,7 @@ pub(super) fn cold_compaction_http_sse_stream(
                 body,
                 session.binding().clone(),
             ).with_trace(context.trace());
-            let Some(handshake_deadline) = remaining(context.deadline()) else {
+            if context.deadline().is_elapsed() {
                 Err(mark_transient_compaction_failure(provider_error(
                     ProviderErrorKind::Timeout,
                     UpstreamSendState::NotSent,
@@ -152,7 +152,7 @@ pub(super) fn cold_compaction_http_sse_stream(
             let boundary = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => InferenceBoundary::Cancelled,
-                _ = tokio::time::sleep(handshake_deadline) => InferenceBoundary::Deadline,
+                _ = context.deadline().wait() => InferenceBoundary::Deadline,
                 response = transport.execute(inference_request) => InferenceBoundary::Response(response),
             };
             match boundary {
@@ -442,7 +442,7 @@ pub(super) fn cold_http_sse_stream(
                 body,
                 session.binding().clone(),
             ).with_trace(context.trace());
-            let Some(handshake_deadline) = remaining(context.deadline()) else {
+            if context.deadline().is_elapsed() {
                 Err(provider_error(
                     ProviderErrorKind::Timeout,
                     UpstreamSendState::NotSent,
@@ -452,7 +452,7 @@ pub(super) fn cold_http_sse_stream(
             let boundary = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => InferenceBoundary::Cancelled,
-                _ = tokio::time::sleep(handshake_deadline) => InferenceBoundary::Deadline,
+                _ = context.deadline().wait() => InferenceBoundary::Deadline,
                 response = transport.execute(inference_request) => InferenceBoundary::Response(response),
             };
             match boundary {
@@ -507,7 +507,7 @@ pub(super) fn cold_http_sse_stream(
         let mut decoder = GrokCanonicalDecoder::for_request(upstream_model.as_str(), &request)
             .with_pricing(context.pricing().get("xai").and_then(|p| p.get(upstream_model.as_str())).cloned());
         loop {
-            let Some(stream_deadline) = remaining(context.deadline()) else {
+            if context.deadline().is_elapsed() {
                 Err(provider_error(
                     ProviderErrorKind::Timeout,
                     UpstreamSendState::Sent,
@@ -520,7 +520,7 @@ pub(super) fn cold_http_sse_stream(
                     ProviderErrorKind::Cancelled,
                     UpstreamSendState::Sent,
                 )),
-                _ = tokio::time::sleep(stream_deadline) => Err(provider_error(
+                _ = context.deadline().wait() => Err(provider_error(
                     ProviderErrorKind::Timeout,
                     UpstreamSendState::Sent,
                 )),

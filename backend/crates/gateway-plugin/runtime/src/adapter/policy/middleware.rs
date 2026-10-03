@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -187,11 +187,7 @@ async fn invoke_middleware(
             Err(MiddlewareError::Fault)
         };
     };
-    let remaining = context
-        .deadline()
-        .duration_since(SystemTime::now())
-        .map_err(|_| MiddlewareError::Fault)?
-        .min(maximum_timeout);
+    let remaining = context.deadline().bounded(maximum_timeout);
     if remaining.is_zero() || context.cancellation().is_cancelled() {
         return Err(MiddlewareError::Fault);
     }

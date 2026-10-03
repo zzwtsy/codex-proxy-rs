@@ -417,16 +417,16 @@ pub(super) async fn create_response_attempt(
     request: &CodexResponsesRequest,
     request_context: CodexRequestContext<'_>,
     account_id: &str,
-    deadline: SystemTime,
+    deadline: gateway_core::lifecycle::Deadline,
     cancellation: &CancellationToken,
 ) -> Result<CodexBackendStreamingResponse, CodexHandshakeAttemptError> {
-    let Some(handshake_deadline) = remaining(deadline) else {
+    if deadline.is_elapsed() {
         return Err(CodexHandshakeAttemptError::Timeout);
     };
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(CodexHandshakeAttemptError::Cancelled),
-        _ = tokio::time::sleep(handshake_deadline) => Err(CodexHandshakeAttemptError::Timeout),
+        _ = deadline.wait() => Err(CodexHandshakeAttemptError::Timeout),
         response = client.create_response_stream_with_pool_account(
             request,
             request_context,
@@ -459,7 +459,7 @@ pub(super) async fn create_json_attempt(
     cookie_header: Option<&SecretString>,
     account_selection: CodexAccountSelectionTelemetry<'_>,
 ) -> Result<CodexBackendJsonResponse, CodexHandshakeAttemptError> {
-    let Some(handshake_deadline) = remaining(request.context.deadline()) else {
+    if request.context.deadline().is_elapsed() {
         return Err(CodexHandshakeAttemptError::Timeout);
     };
     let request_id = request.context.request_id().as_str();
@@ -477,7 +477,7 @@ pub(super) async fn create_json_attempt(
     tokio::select! {
         biased;
         _ = request.context.cancellation().cancelled() => Err(CodexHandshakeAttemptError::Cancelled),
-        _ = tokio::time::sleep(handshake_deadline) => Err(CodexHandshakeAttemptError::Timeout),
+        _ = request.context.deadline().wait() => Err(CodexHandshakeAttemptError::Timeout),
         response = request.client.post_raw_json(
             request.endpoint_path,
             request.body.clone(),
@@ -839,7 +839,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .with_raw_sse_passthrough();
         let mut pre_commit_events = PreCommitClientEvents::new(trace);
         loop {
-            let Some(stream_deadline) = remaining(context.deadline()) else {
+            if context.deadline().is_elapsed() {
                 if allows_account_state_mutation {
                     synchronize_passive_quota(
                         &quota,
@@ -858,7 +858,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     ProviderErrorKind::Cancelled,
                     UpstreamSendState::Sent,
                 ))),
-                _ = tokio::time::sleep(stream_deadline) => Err(MappedProviderFailure::plain(provider_error(
+                _ = context.deadline().wait() => Err(MappedProviderFailure::plain(provider_error(
                     ProviderErrorKind::Timeout,
                     UpstreamSendState::Sent,
                 ))),

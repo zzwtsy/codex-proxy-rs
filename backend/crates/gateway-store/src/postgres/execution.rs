@@ -971,6 +971,47 @@ impl ModelRequestRepository for PgExecutionStore {
 
 #[async_trait]
 impl ExecutionStore for PgExecutionStore {
+    fn maintain_request(
+        &self,
+        request_id: &ModelRequestId,
+        deadline: gateway_core::lifecycle::Deadline,
+    ) -> Box<dyn gateway_core::lifecycle::LeaseGuard> {
+        let pool = self.pool.clone();
+        let request_id = request_id.as_str().to_owned();
+        Box::new(crate::lease_renewal::LeaseRenewal::spawn(
+            deadline,
+            // 请求记录为 best-effort 观测，续期失败不能取消客户端执行。
+            None,
+            move |ttl| {
+                let pool = pool.clone();
+                let request_id = request_id.clone();
+                Box::pin(async move {
+                    let ttl_ms = i64::try_from(ttl.as_millis()).map_err(|_| {
+                        crate::StoreError::InvalidData {
+                            entity: "model request",
+                            message: "lease TTL is invalid".to_owned(),
+                        }
+                    })?;
+                    // 首次观测可能尚在队列中；缺行不创建记录，已终结行不改写。
+                    sqlx::query_scalar::<_, bool>(
+                        "with renewed as (
+                           update model_requests set deadline_at = now() + $2 * interval '1 millisecond'
+                           where id = $1 and outcome = 'running' and deadline_at > now()
+                           returning id
+                         )
+                         select exists(select 1 from renewed)
+                           or not exists(select 1 from model_requests where id = $1 and outcome = 'running')",
+                    )
+                    .bind(&request_id)
+                    .bind(ttl_ms)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|_| postgres_unavailable("renew model request recovery lease"))
+                })
+            },
+        ))
+    }
+
     async fn create_model_request(
         &self,
         request: CoreNewModelRequest,
@@ -1435,7 +1476,7 @@ fn new_model_request_row(request: CoreNewModelRequest) -> NewModelRequest {
         image_generation_requested: request.image_generation_requested,
         admission_decision_ms: request.admission_decision_ms,
         started_at: DateTime::<Utc>::from(request.started_at),
-        deadline_at: DateTime::<Utc>::from(request.deadline_at),
+        deadline_at: DateTime::<Utc>::from(request.deadline_at.lease_deadline()),
     }
 }
 
