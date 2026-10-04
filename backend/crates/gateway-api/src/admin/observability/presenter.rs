@@ -1305,6 +1305,10 @@ pub(crate) fn diagnostics_view(
                 } else {
                     item.name
                 },
+                account_id: item.account_id,
+                account_name: item.account_name,
+                client_api_key_id: item.client_api_key_id,
+                client_api_key_name: item.client_api_key_name,
                 request_count: item.request_count,
                 account_plan_type: item.account_plan_type,
                 account_plan_type_display: item.account_plan_type_display,
@@ -1322,6 +1326,7 @@ pub(crate) fn diagnostics_view(
                 estimated_cost: item.estimated_cost.as_ref().map(ToString::to_string),
                 attempt_count: item.attempt_count,
                 total_tokens: item.total_tokens,
+                token_share: item.token_share,
             })
             .collect(),
     }

@@ -8,7 +8,7 @@ import { use } from 'echarts/core'
 import { computed } from 'vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { useChartPalette } from '@/composables/useChartPalette'
-import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/format'
+import { formatLocalizedCompactNumber as formatCompactNumber, formatPercent } from '@/utils/format'
 
 import {
   tooltipIndex,
@@ -21,7 +21,6 @@ import {
   usageTooltipItem,
   usageValueAxis,
 } from '../utils/chart'
-import { formatPercent } from '../utils/format'
 
 type Health = Awaited<ReturnType<typeof getUsageRecordInsightsOverview>>['health']
 type HealthPoint = Health['points'][number]

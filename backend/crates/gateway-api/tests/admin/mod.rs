@@ -630,6 +630,7 @@ pub(super) struct MemoryObservations {
     pub summaries: Vec<(TimeRange, UsageFilter)>,
     pub trends: Vec<(TimeRange, UsageFilter)>,
     pub records: Vec<UsageQuery>,
+    pub diagnostics: Vec<(TimeRange, UsageFilter, DiagnosticDimension)>,
     pub errors: Vec<OpsErrorQuery>,
 }
 
@@ -1336,10 +1337,15 @@ impl ObservabilityStore for UnusedStore {
 
     async fn usage_diagnostics(
         &self,
-        _: TimeRange,
-        _: UsageFilter,
-        _: DiagnosticDimension,
+        range: TimeRange,
+        filter: UsageFilter,
+        dimension: DiagnosticDimension,
     ) -> AdminStoreResult<DiagnosticsObservation> {
+        self.observations
+            .lock()
+            .expect("observations")
+            .diagnostics
+            .push((range, filter, dimension));
         Ok(self.diagnostics.lock().expect("diagnostics").clone())
     }
 

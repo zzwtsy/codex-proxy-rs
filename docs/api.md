@@ -163,6 +163,10 @@ Codex PAT 验证服务不可用和身份响应无效分别返回 `50301`、`5020
 使用带偏移的 RFC3339，不能与 `period` 或 `asOf` 混用；对应接口仍执行范围上限校验。
 自然日刚开始时允许空的今日快照，显式起止范围仍要求开始早于结束
 
+用量、洞察和错误接口也可成对传入 `startDate` 与 `endDate`，格式为 `YYYY-MM-DD`。日期按部署
+`host.timezone` 解释，结束日期包含当天，后端以起始日零点到结束日次日零点构成时间范围。
+自定义日期不能与 `startTime`、`endTime`、`period` 或 `asOf` 混用；范围仍受 366 天上限约束
+
 图表的 `label`、日期提示和空桶由后端提供；日粒度按本地日界，小时及 15 分钟桶以 UTC 时间点定位。
 账号请求柱覆盖截至锚点的最近 24 个 UTC 小时桶，包含当前未完整小时，独立于今日汇总的自然日范围。
 健康时间线覆盖锚点所在自然日，每 15 分钟一个桶，夏令时日期可以为 92 或 100 个桶。
@@ -1603,11 +1607,16 @@ Dashboard 返回原始 `asOf` 及 `asOfDisplay`，作为当前数据的查询锚
 
 用量查询可组合页码/游标、时间范围、Provider、Client Key、账号、模型、route、transport、状态码、
 request/response/upstream ID、outcome 与搜索文本。诊断 `dimension` 可取 `model`、`account`、
-`apiKey`、`provider`、`transport`、`failureClass`、`status`。诊断按请求量降序返回最多 100 项，
-同请求量按维度标识稳定排列
+`apiKey`、`accountKey`、`provider`、`transport`、`failureClass`、`status`。诊断按请求量降序返回最多 100 项，
+账号和账号密钥维度返回全部匹配项；同请求量按维度标识稳定排列
 
 `requestShare` 的分母为该维度筛选后、截取前的全部请求数；`failureClass` 只在带错误类型的请求内计算占比
 `retryCount` 为额外执行尝试次数之和，`retryRate` 为发生过重试的请求数占该组请求数的比例，同一请求多次重试只计一次
+
+账号和账号密钥维度只统计关联的 OpenAI OAuth 账号。`accountKey` 每项对应一个账号与 Client Key 组合，
+包含 `accountId`、`accountName`、`clientApiKeyId`、`clientApiKeyName`。`totalTokens` 统计筛选范围内成功交付的请求 Token；
+`tokenShare` 仅在 `accountKey` 维度返回，分母是同一账号在当前范围内所有 Client Key 的 Token 总量。
+同一 Client Key 使用多个账号时分别计入各账号；名称不可用时名称字段回退为对应 ID
 
 账号维度诊断项、使用记录列表和错误排查列表的 `accountPlanType` / `accountPlanTypeDisplay` 返回账号当前订阅及展示名称，
 按各记录的内部账号 ID 关联；订阅未知或账号已删除时为 `null`，不作为请求发生时的订阅快照

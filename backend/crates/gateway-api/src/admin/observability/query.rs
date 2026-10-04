@@ -49,6 +49,8 @@ pub struct UsageQuery {
     pub as_of: Option<i64>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
 }
 
 impl UsageQuery {
@@ -89,6 +91,8 @@ pub struct DiagnosticsQuery {
     pub as_of: Option<i64>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub status_code: Option<i64>,
@@ -126,6 +130,8 @@ pub struct OpsQuery {
     pub as_of: Option<i64>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
 }
 
 impl OpsQuery {
@@ -170,6 +176,7 @@ pub enum DiagnosticDimension {
     Model,
     Account,
     ApiKey,
+    AccountApiKey,
     Provider,
     Transport,
     Failure,
@@ -183,6 +190,7 @@ impl DiagnosticDimension {
             None | Some("model") => Ok(Self::Model),
             Some("account") => Ok(Self::Account),
             Some("apiKey" | "api_key") => Ok(Self::ApiKey),
+            Some("accountKey" | "account_key") => Ok(Self::AccountApiKey),
             Some("provider") => Ok(Self::Provider),
             Some("transport") => Ok(Self::Transport),
             Some("failureClass" | "failure_class") => Ok(Self::Failure),
@@ -198,6 +206,7 @@ impl DiagnosticDimension {
             Self::Model => "model",
             Self::Account => "account",
             Self::ApiKey => "apiKey",
+            Self::AccountApiKey => "accountKey",
             Self::Provider => "provider",
             Self::Transport => "transport",
             Self::Failure => "failureClass",
@@ -267,6 +276,7 @@ pub(crate) fn domain_diagnostic_dimension(
         DiagnosticDimension::Model => domain::DiagnosticDimension::Model,
         DiagnosticDimension::Account => domain::DiagnosticDimension::Account,
         DiagnosticDimension::ApiKey => domain::DiagnosticDimension::ApiKey,
+        DiagnosticDimension::AccountApiKey => domain::DiagnosticDimension::AccountApiKey,
         DiagnosticDimension::Provider => domain::DiagnosticDimension::Provider,
         DiagnosticDimension::Transport => domain::DiagnosticDimension::Transport,
         DiagnosticDimension::Failure => domain::DiagnosticDimension::Failure,
@@ -284,14 +294,16 @@ pub(crate) fn request_outcome(
         .transpose()
 }
 
-pub(crate) fn usage_range(
+pub(crate) fn usage_query_range(
     start: Option<&str>,
     end: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
     period: Option<&str>,
     as_of: Option<i64>,
     timezone: gateway_core::time::DeploymentTimeZone,
 ) -> Result<domain::TimeRange, WireValidationError> {
-    crate::time::query_range(start, end, period, as_of, timezone, "7d")
+    crate::time::query_range_with_dates(start, end, start_date, end_date, period, as_of, timezone)
 }
 
 pub(crate) fn dashboard_today_range(
@@ -338,9 +350,11 @@ pub(crate) fn usage_command(
     let page_size_value =
         DomainPageSize::new(page_size).map_err(|_| WireValidationError::new("pageSize"))?;
     Ok(domain::UsageQuery {
-        range: usage_range(
+        range: usage_query_range(
             query.start_time.as_deref(),
             query.end_time.as_deref(),
+            query.start_date.as_deref(),
+            query.end_date.as_deref(),
             query.period.as_deref(),
             query.as_of,
             timezone,
@@ -365,9 +379,11 @@ pub(crate) fn ops_command(
             .or(query.status_code),
     )?;
     Ok(domain::OpsErrorQuery {
-        range: usage_range(
+        range: usage_query_range(
             query.start_time.as_deref(),
             query.end_time.as_deref(),
+            query.start_date.as_deref(),
+            query.end_date.as_deref(),
             query.period.as_deref(),
             query.as_of,
             timezone,

@@ -143,9 +143,11 @@ pub(crate) async fn usage_records_summary<S>(
 where
     S: SessionState + Send + Sync,
 {
-    let range = usage_range(
+    let range = usage_query_range(
         query.start_time.as_deref(),
         query.end_time.as_deref(),
+        query.start_date.as_deref(),
+        query.end_date.as_deref(),
         query.period.as_deref(),
         query.as_of,
         state.admin_services().timezone(),
@@ -173,9 +175,11 @@ where
     S: SessionState + Send + Sync,
 {
     let time = crate::time::TimePresenter::new(state.admin_services().timezone());
-    let range = usage_range(
+    let range = usage_query_range(
         query.start_time.as_deref(),
         query.end_time.as_deref(),
+        query.start_date.as_deref(),
+        query.end_date.as_deref(),
         query.period.as_deref(),
         query.as_of,
         state.admin_services().timezone(),
@@ -203,9 +207,11 @@ where
     S: SessionState + Send + Sync,
 {
     let dimension = query.dimension().map_err(map_wire_error)?;
-    let range = usage_range(
+    let range = usage_query_range(
         query.start_time.as_deref(),
         query.end_time.as_deref(),
+        query.start_date.as_deref(),
+        query.end_date.as_deref(),
         query.period.as_deref(),
         query.as_of,
         state.admin_services().timezone(),

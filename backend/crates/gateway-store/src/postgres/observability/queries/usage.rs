@@ -449,10 +449,15 @@ pub(crate) async fn usage_diagnostics(
                   row_number() over (order by request_count desc, dimension_name)
                     as sort_position
              from aggregated
-            where currency_grouping = 1
-            order by request_count desc, dimension_name limit ",
+            where currency_grouping = 1",
     );
-    statement.push_bind(DIAGNOSTIC_LIMIT);
+    if !matches!(
+        dimension,
+        DiagnosticDimension::Account | DiagnosticDimension::AccountApiKey
+    ) {
+        statement.push(" order by request_count desc, dimension_name limit ");
+        statement.push_bind(DIAGNOSTIC_LIMIT);
+    }
     statement.push(
         ")
          select aggregated.*, selected.total_request_count,
@@ -474,34 +479,51 @@ pub(crate) async fn usage_diagnostics(
         .map(|row| unsigned(row, "total_request_count"))
         .transpose()?
         .unwrap_or_default();
-    let mut observations = Vec::with_capacity(DIAGNOSTIC_LIMIT as usize);
+    let capacity = if matches!(
+        dimension,
+        DiagnosticDimension::Account | DiagnosticDimension::AccountApiKey
+    ) {
+        rows.len()
+    } else {
+        DIAGNOSTIC_LIMIT as usize
+    };
+    let mut observations = Vec::with_capacity(capacity);
     let mut costs = HashMap::<String, Vec<CurrencyCostTotal>>::new();
     for row in &rows {
         match get::<i32>(row, "currency_grouping")? {
-            1 => observations.push(DiagnosticObservation {
-                key: get(row, "dimension_name")?,
-                name: get(row, "dimension_name")?,
-                account_provider_kind: get(row, "account_provider_kind")?,
-                account_plan_type: get(row, "account_plan_type")?,
-                request_count: unsigned(row, "request_count")?,
-                success_count: unsigned(row, "success_count")?,
-                failure_count: unsigned(row, "failure_count")?,
-                attempt_count: unsigned(row, "attempt_count")?,
-                total_tokens: unsigned(row, "total_tokens")?,
-                average_latency_ms: optional_unsigned(row, "average_latency_ms")?,
-                latency_p95_ms: optional_unsigned(row, "latency_p95_ms")?,
-                first_token_p95_ms: optional_unsigned(row, "first_token_p95_ms")?,
-                non_completion_count: unsigned(row, "non_completion_count")?,
-                retry_count: unsigned(row, "retry_count")?,
-                retried_request_count: unsigned(row, "retried_request_count")?,
-                cost_coverage: coverage_from_row(row)?,
-                costs: Vec::new(),
-            }),
+            1 => {
+                let dimension_name: String = get(row, "dimension_name")?;
+                let (account_id, client_api_key_id) = account_key_refs(dimension, &dimension_name)?;
+                observations.push(DiagnosticObservation {
+                    key: diagnostic_observation_key(dimension, &dimension_name)?,
+                    name: dimension_name,
+                    account_id,
+                    account_name: None,
+                    client_api_key_id,
+                    client_api_key_name: None,
+                    account_provider_kind: get(row, "account_provider_kind")?,
+                    account_plan_type: get(row, "account_plan_type")?,
+                    request_count: unsigned(row, "request_count")?,
+                    success_count: unsigned(row, "success_count")?,
+                    failure_count: unsigned(row, "failure_count")?,
+                    attempt_count: unsigned(row, "attempt_count")?,
+                    total_tokens: unsigned(row, "total_tokens")?,
+                    average_latency_ms: optional_unsigned(row, "average_latency_ms")?,
+                    latency_p95_ms: optional_unsigned(row, "latency_p95_ms")?,
+                    first_token_p95_ms: optional_unsigned(row, "first_token_p95_ms")?,
+                    non_completion_count: unsigned(row, "non_completion_count")?,
+                    retry_count: unsigned(row, "retry_count")?,
+                    retried_request_count: unsigned(row, "retried_request_count")?,
+                    cost_coverage: coverage_from_row(row)?,
+                    costs: Vec::new(),
+                });
+            }
             0 if get::<Option<String>>(row, "cost_currency")?.is_some()
                 && get::<Option<String>>(row, "amount")?.is_some() =>
             {
+                let dimension_name: String = get(row, "dimension_name")?;
                 costs
-                    .entry(get(row, "dimension_name")?)
+                    .entry(diagnostic_observation_key(dimension, &dimension_name)?)
                     .or_default()
                     .push(cost_from_row(row)?);
             }
@@ -532,11 +554,58 @@ pub(crate) async fn usage_diagnostics(
         }
         _ => HashMap::new(),
     };
+    let (account_names, client_api_key_names) = if dimension == DiagnosticDimension::AccountApiKey {
+        let account_ids = observations
+            .iter()
+            .filter_map(|item| item.account_id.clone())
+            .collect::<Vec<_>>();
+        let client_api_key_ids = observations
+            .iter()
+            .filter_map(|item| item.client_api_key_id.clone())
+            .collect::<Vec<_>>();
+        (
+            diagnostic_account_display_names(pool, &account_ids).await?,
+            diagnostic_api_key_display_names(pool, &client_api_key_ids).await?,
+        )
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
     for observation in &mut observations {
-        if let Some(name) = display_names.remove(&observation.key) {
+        if dimension == DiagnosticDimension::AccountApiKey {
+            if let Some(account_id) = &observation.account_id {
+                let name = account_names
+                    .get(account_id)
+                    .cloned()
+                    .unwrap_or_else(|| account_id.clone());
+                observation.account_name = Some(name);
+            }
+            if let Some(client_api_key_id) = &observation.client_api_key_id {
+                let name = client_api_key_names
+                    .get(client_api_key_id)
+                    .cloned()
+                    .unwrap_or_else(|| client_api_key_id.clone());
+                observation.client_api_key_name = Some(name);
+            }
+            observation.name = format!(
+                "{} → {}",
+                observation.account_name.as_deref().unwrap_or("未知账号"),
+                observation
+                    .client_api_key_name
+                    .as_deref()
+                    .unwrap_or("未知密钥")
+            );
+        } else if let Some(name) = display_names.remove(&observation.key) {
             observation.name = name;
         }
         observation.costs = costs.remove(&observation.key).unwrap_or_default();
+    }
+    if dimension == DiagnosticDimension::AccountApiKey {
+        observations.sort_by(|left, right| {
+            left.account_name
+                .cmp(&right.account_name)
+                .then_with(|| right.total_tokens.cmp(&left.total_tokens))
+                .then_with(|| left.client_api_key_name.cmp(&right.client_api_key_name))
+        });
     }
     Ok(DiagnosticsObservation {
         total_request_count,
@@ -613,6 +682,9 @@ pub(crate) fn diagnostic_dimension_sql(dimension: DiagnosticDimension) -> &'stat
         DiagnosticDimension::Model => MODEL_DIAGNOSTIC_DIMENSION_SQL,
         DiagnosticDimension::Account => "coalesce(mr.provider_account_ref, 'unrouted')",
         DiagnosticDimension::ApiKey => "mr.client_api_key_ref",
+        DiagnosticDimension::AccountApiKey => {
+            "json_build_array(mr.provider_account_ref, mr.client_api_key_ref)::text"
+        }
         DiagnosticDimension::Transport => {
             "coalesce(mr.upstream_transport, mr.client_transport, 'unknown')"
         }
@@ -621,6 +693,31 @@ pub(crate) fn diagnostic_dimension_sql(dimension: DiagnosticDimension) -> &'stat
             "coalesce(mr.upstream_status_code, mr.client_status_code)::text"
         }
     }
+}
+
+fn account_key_refs(
+    dimension: DiagnosticDimension,
+    dimension_name: &str,
+) -> StoreResult<(Option<String>, Option<String>)> {
+    if dimension != DiagnosticDimension::AccountApiKey {
+        return Ok((None, None));
+    }
+    let [account_id, client_api_key_id]: [String; 2] = serde_json::from_str(dimension_name)
+        .map_err(|_| postgres_unavailable("decode account-key diagnostic identity"))?;
+    Ok((Some(account_id), Some(client_api_key_id)))
+}
+
+fn diagnostic_observation_key(
+    dimension: DiagnosticDimension,
+    dimension_name: &str,
+) -> StoreResult<String> {
+    if dimension != DiagnosticDimension::AccountApiKey {
+        return Ok(dimension_name.to_owned());
+    }
+    let [account_id, client_api_key_id]: [String; 2] = serde_json::from_str(dimension_name)
+        .map_err(|_| postgres_unavailable("decode account-key diagnostic identity"))?;
+    serde_json::to_string(&[account_id, client_api_key_id])
+        .map_err(|_| postgres_unavailable("encode account-key diagnostic identity"))
 }
 
 pub(crate) fn push_diagnostic_dimension_filter(
@@ -640,8 +737,30 @@ pub(crate) fn push_diagnostic_dimension_filter(
             statement
                 .push(" and coalesce(mr.upstream_status_code, mr.client_status_code) is not null");
         }
+        DiagnosticDimension::Account => {
+            statement.push(
+                " and mr.provider_account_ref is not null
+                    and mr.provider_kind = 'openai'
+                    and coalesce(
+                      mr.provider_account_authentication_kind_snapshot,
+                      (select account.authentication_kind from provider_accounts account
+                        where account.id = mr.provider_account_ref)
+                    ) = 'oauth'",
+            );
+        }
+        DiagnosticDimension::AccountApiKey => {
+            statement.push(
+                " and mr.provider_account_ref is not null
+                    and mr.client_api_key_ref is not null
+                    and mr.provider_kind = 'openai'
+                    and coalesce(
+                      mr.provider_account_authentication_kind_snapshot,
+                      (select account.authentication_kind from provider_accounts account
+                        where account.id = mr.provider_account_ref)
+                    ) = 'oauth'",
+            );
+        }
         DiagnosticDimension::Provider
-        | DiagnosticDimension::Account
         | DiagnosticDimension::ApiKey
         | DiagnosticDimension::Transport => {}
     }

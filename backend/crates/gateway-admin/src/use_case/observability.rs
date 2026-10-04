@@ -348,6 +348,22 @@ impl ObservabilityService for DefaultObservabilityService {
             .usage_diagnostics(range, filter, dimension)
             .await
             .map_err(|error| map_store_error(error, "usage diagnostics"))?;
+        let account_token_totals = if dimension == DiagnosticDimension::AccountApiKey {
+            Some(observation.items.iter().try_fold(
+                HashMap::<String, u64>::new(),
+                |mut totals, item| -> Result<_, AdminError> {
+                    if let Some(account_id) = &item.account_id {
+                        let total = totals.entry(account_id.clone()).or_default();
+                        *total = total
+                            .checked_add(item.total_tokens)
+                            .ok_or_else(|| AdminError::internal("账号 Token 总量超出数值范围"))?;
+                    }
+                    Ok(totals)
+                },
+            )?)
+        } else {
+            None
+        };
         let items = observation
             .items
             .into_iter()
@@ -356,9 +372,19 @@ impl ObservabilityService for DefaultObservabilityService {
                 let non_completion_rate =
                     rate_or_zero(item.non_completion_count, item.request_count);
                 let retry_rate = rate_or_zero(item.retried_request_count, item.request_count);
+                let token_share = account_token_totals.as_ref().and_then(|totals| {
+                    item.account_id
+                        .as_ref()
+                        .and_then(|account_id| totals.get(account_id))
+                        .map(|total| rate_or_zero(item.total_tokens, *total))
+                });
                 DiagnosticsItem {
                     key: item.key,
                     name: item.name,
+                    account_id: item.account_id,
+                    account_name: item.account_name,
+                    client_api_key_id: item.client_api_key_id,
+                    client_api_key_name: item.client_api_key_name,
                     account_plan_type_display: item.account_provider_kind.as_deref().and_then(
                         |provider| {
                             self.providers
@@ -384,6 +410,7 @@ impl ObservabilityService for DefaultObservabilityService {
                     estimated_cost: usd_cost(&item.costs),
                     attempt_count: item.attempt_count,
                     total_tokens: item.total_tokens,
+                    token_share,
                 }
             })
             .collect::<Vec<_>>();

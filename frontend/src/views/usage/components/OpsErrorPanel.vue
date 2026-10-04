@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { UsageTimeRangeParams } from '../composables/useUsageTimeRange'
 import type { OpsError } from '@/api'
+import type { TimeRangeParams } from '@/composables/useTimeRange'
 
 import { BaseIconButton, BaseInput, BaseTable, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
 import { Eye, RefreshCw, Search } from '@lucide/vue'
@@ -15,8 +15,8 @@ import OpsErrorDetailModal from './OpsErrorDetailModal.vue'
 import UsageClientIpCell from './UsageClientIpCell.vue'
 
 const props = defineProps<{
-  timeRangeParams: UsageTimeRangeParams
-  latestTimeRangeParams: () => UsageTimeRangeParams
+  timeRangeParams: TimeRangeParams
+  latestTimeRangeParams: () => TimeRangeParams
   provider: string
   active: boolean
 }>()

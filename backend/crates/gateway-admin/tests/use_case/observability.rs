@@ -529,6 +529,84 @@ async fn observability_services_should_calculate_usage_insights_and_diagnostic_s
     );
     assert_eq!(diagnostics.items[0].request_share, 0.75);
     assert_eq!(diagnostics.items[1].request_share, 0.25);
+    assert_eq!(diagnostics.items[0].token_share, None);
+    assert_eq!(diagnostics.items[1].token_share, None);
+}
+
+#[tokio::test]
+async fn account_diagnostics_should_not_report_key_token_share() {
+    let range = observation_range(Utc::now());
+    let store = Arc::new(FixtureObservabilityStore::new(range));
+    let mut first = diagnostic("codex-one", 1);
+    first.total_tokens = 150;
+    let mut second = diagnostic("codex-two", 1);
+    second.total_tokens = 450;
+    store.replace_diagnostics(DiagnosticsObservation {
+        total_request_count: 2,
+        items: vec![first, second],
+    });
+    let services = observability_services_with_calculated_billing(store).await;
+
+    let result = services
+        .observability()
+        .diagnostics(range, UsageFilter::default(), DiagnosticDimension::Account)
+        .await
+        .expect("account diagnostics");
+
+    assert_eq!(result.items[0].token_share, None);
+    assert_eq!(result.items[1].token_share, None);
+}
+
+#[tokio::test]
+async fn account_key_diagnostics_should_calculate_token_share_within_each_account() {
+    let range = observation_range(Utc::now());
+    let store = Arc::new(FixtureObservabilityStore::new(range));
+    let mut first = diagnostic("first-key", 1);
+    first.account_id = Some("account-one".to_owned());
+    first.client_api_key_id = Some("shared-key".to_owned());
+    first.total_tokens = 150;
+    let mut second = diagnostic("second-key", 1);
+    second.account_id = Some("account-one".to_owned());
+    second.client_api_key_id = Some("second-key".to_owned());
+    second.total_tokens = 450;
+    let mut third = diagnostic("other-account-key", 1);
+    third.account_id = Some("account-two".to_owned());
+    third.client_api_key_id = Some("shared-key".to_owned());
+    third.total_tokens = 300;
+    store.replace_diagnostics(DiagnosticsObservation {
+        total_request_count: 3,
+        items: vec![first, second, third],
+    });
+    let services = observability_services_with_calculated_billing(store).await;
+
+    let result = services
+        .observability()
+        .diagnostics(
+            range,
+            UsageFilter::default(),
+            DiagnosticDimension::AccountApiKey,
+        )
+        .await
+        .expect("account-key diagnostics");
+
+    let first = result
+        .items
+        .iter()
+        .find(|item| item.key == "first-key")
+        .expect("first account key");
+    let second = result
+        .items
+        .iter()
+        .find(|item| item.key == "second-key")
+        .expect("second account key");
+    let third = result
+        .items
+        .iter()
+        .find(|item| item.key == "other-account-key")
+        .expect("key in second account");
+    assert_eq!(first.token_share, Some(0.25));
+    assert_eq!(second.token_share, Some(0.75));
+    assert_eq!(third.token_share, Some(1.0));
 }
 
 #[tokio::test]
@@ -1106,6 +1184,10 @@ fn diagnostic(name: &str, request_count: u64) -> DiagnosticObservation {
         non_completion_count: 0,
         retry_count: 0,
         retried_request_count: 0,
+        account_id: None,
+        account_name: None,
+        client_api_key_id: None,
+        client_api_key_name: None,
         account_provider_kind: None,
         account_plan_type: None,
         key: name.to_owned(),

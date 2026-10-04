@@ -248,16 +248,14 @@ async fn usage_list_and_diagnostics_should_resolve_current_account_metadata_by_i
             )
             .await
             .expect("account plans");
-        assert_eq!(
-            diagnostics
-                .items
-                .iter()
-                .find(|item| item.key == "acct_observe")
-                .expect("personal diagnostics")
-                .account_plan_type
-                .as_deref(),
-            plan
-        );
+        let personal_diagnostics = diagnostics
+            .items
+            .iter()
+            .find(|item| item.key == "acct_observe")
+            .expect("personal diagnostics");
+        assert_eq!(personal_diagnostics.account_plan_type.as_deref(), plan);
+        assert_eq!(personal_diagnostics.account_id, None);
+        assert_eq!(personal_diagnostics.client_api_key_id, None);
         assert_eq!(
             diagnostics
                 .items
@@ -325,6 +323,107 @@ async fn usage_list_and_diagnostics_should_resolve_current_account_metadata_by_i
         .await
         .expect("deleted account diagnostics");
     assert_eq!(diagnostics.items[0].account_plan_type, None);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn account_key_diagnostics_should_keep_keys_separate_per_oauth_account() {
+    let Some(database) = TestDatabase::create("account_key_diagnostics").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed_observability_facts(&database.pool, now)
+        .await
+        .expect("seed observability facts");
+    sqlx::query(
+        "insert into provider_accounts (
+           id, provider_kind, name, email, upstream_user_id,
+           upstream_account_id, authentication_kind, provider_credentials_json,
+           credential_revision, has_refresh_token, enabled, credential_state,
+           credential_observed_at, created_at, updated_at
+         ) values (
+           'acct_second', 'openai', 'secondary', 'second@example.invalid',
+           'user-second', null, 'oauth', '{}'::jsonb, 1, false, true, 'ready',
+           $1, $1, $1
+         )",
+    )
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .expect("insert second OAuth account");
+    sqlx::query(
+        "update model_requests
+            set client_api_key_ref = 'key_second', total_tokens = 60,
+                downstream_committed_at = $1
+          where id = 'req_observe_uncommitted'",
+    )
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .expect("complete second key usage");
+    sqlx::query(
+        "update model_requests
+            set provider_account_id = 'acct_second', provider_account_ref = 'acct_second',
+                provider_account_name_snapshot = 'secondary',
+                provider_account_email_snapshot = 'second@example.invalid',
+                provider_account_authentication_kind_snapshot = 'oauth',
+                outcome = 'succeeded', client_status_code = 200, upstream_status_code = 200,
+                error_kind = null, total_tokens = 40, downstream_committed_at = $1
+          where id = 'req_observe_failed'",
+    )
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .expect("move shared key usage to second OAuth account");
+    let range = ObservabilityRange::new(now - TimeDelta::hours(1), now + TimeDelta::hours(1))
+        .expect("observability range");
+
+    let diagnostics = observability_repository(&database.pool)
+        .usage_diagnostics(
+            range,
+            UsageRecordFilter::default(),
+            DiagnosticDimension::AccountApiKey,
+        )
+        .await
+        .expect("account-key diagnostics");
+
+    assert_eq!(diagnostics.total_request_count, 3);
+    assert_eq!(diagnostics.items.len(), 3);
+    let account_one_shared_key = diagnostics
+        .items
+        .iter()
+        .find(|item| {
+            item.account_id.as_deref() == Some("acct_observe")
+                && item.client_api_key_id.as_deref() == Some("key_observe")
+        })
+        .expect("shared key in first account");
+    assert_eq!(account_one_shared_key.total_tokens, 120);
+    assert_eq!(
+        account_one_shared_key.account_name.as_deref(),
+        Some("account@example.invalid")
+    );
+    let account_one_second_key = diagnostics
+        .items
+        .iter()
+        .find(|item| {
+            item.account_id.as_deref() == Some("acct_observe")
+                && item.client_api_key_id.as_deref() == Some("key_second")
+        })
+        .expect("second key in first account");
+    assert_eq!(account_one_second_key.total_tokens, 60);
+    let account_two_shared_key = diagnostics
+        .items
+        .iter()
+        .find(|item| {
+            item.account_id.as_deref() == Some("acct_second")
+                && item.client_api_key_id.as_deref() == Some("key_observe")
+        })
+        .expect("same key in second account");
+    assert_eq!(account_two_shared_key.total_tokens, 40);
+    assert_eq!(
+        account_two_shared_key.account_name.as_deref(),
+        Some("second@example.invalid")
+    );
     database.close().await;
 }
 

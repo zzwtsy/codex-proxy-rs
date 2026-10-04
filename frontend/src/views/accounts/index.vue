@@ -18,6 +18,7 @@ import AccountOverviewCards from './components/AccountOverviewCards.vue'
 import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
 import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
+import AccountShareCard from './components/AccountShareCard.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
@@ -194,7 +195,7 @@ const {
 </script>
 
 <template>
-  <div class="flex min-h-0 w-full flex-col xl:h-full xl:overflow-hidden">
+  <div class="flex min-h-0 w-full flex-col">
     <BasePageHeader
       class="h-17"
       title="账号管理"
@@ -202,6 +203,8 @@ const {
     />
 
     <AccountOverviewCards :summary="accountSummary" />
+
+    <AccountShareCard />
 
     <BaseCard
       class="mt-4 flex flex-col xl:h-[calc(100dvh-250px)] xl:min-h-125"

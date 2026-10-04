@@ -88,6 +88,9 @@ pub(crate) const fn store_diagnostic_dimension(
         admin_observability::DiagnosticDimension::Model => DiagnosticDimension::Model,
         admin_observability::DiagnosticDimension::Account => DiagnosticDimension::Account,
         admin_observability::DiagnosticDimension::ApiKey => DiagnosticDimension::ApiKey,
+        admin_observability::DiagnosticDimension::AccountApiKey => {
+            DiagnosticDimension::AccountApiKey
+        }
         admin_observability::DiagnosticDimension::Transport => DiagnosticDimension::Transport,
         admin_observability::DiagnosticDimension::Failure => DiagnosticDimension::Failure,
         admin_observability::DiagnosticDimension::Status => DiagnosticDimension::Status,
@@ -716,6 +719,10 @@ fn admin_diagnostic_observation(
     Ok(admin_observability::DiagnosticObservation {
         key: observation.key,
         name: observation.name,
+        account_id: observation.account_id,
+        account_name: observation.account_name,
+        client_api_key_id: observation.client_api_key_id,
+        client_api_key_name: observation.client_api_key_name,
         account_provider_kind: observation.account_provider_kind,
         account_plan_type: observation.account_plan_type,
         request_count: observation.request_count,

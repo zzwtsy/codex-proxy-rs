@@ -1,6 +1,6 @@
 //! 管理与自助页面共用的时间展示投影。
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use gateway_core::time::DeploymentTimeZone;
 
 pub(crate) fn query_range(
@@ -37,6 +37,44 @@ pub(crate) fn query_range(
     let period = CalendarPeriod::parse(period.unwrap_or(default_period))
         .map_err(|_| WireValidationError::new("period"))?;
     TimeRange::calendar_at(period, end, timezone).map_err(|_| WireValidationError::new("timeRange"))
+}
+
+pub(crate) fn query_range_with_dates(
+    start: Option<&str>,
+    end: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    period: Option<&str>,
+    as_of: Option<i64>,
+    timezone: DeploymentTimeZone,
+) -> Result<gateway_admin::model::observability::TimeRange, crate::admin::WireValidationError> {
+    use crate::admin::WireValidationError;
+    use gateway_admin::model::observability::TimeRange;
+
+    if start_date.is_none() && end_date.is_none() {
+        return query_range(start, end, period, as_of, timezone, "7d");
+    }
+    if start.is_some()
+        || end.is_some()
+        || start_date.is_none()
+        || end_date.is_none()
+        || period.is_some()
+        || as_of.is_some()
+    {
+        return Err(WireValidationError::new("timeRange"));
+    }
+
+    let start_date = parse_date(start_date.ok_or_else(|| WireValidationError::new("timeRange"))?)
+        .ok_or_else(|| WireValidationError::new("timeRange"))?;
+    let end_date = parse_date(end_date.ok_or_else(|| WireValidationError::new("timeRange"))?)
+        .ok_or_else(|| WireValidationError::new("timeRange"))?;
+    TimeRange::calendar_dates(start_date, end_date, timezone)
+        .map_err(|_| WireValidationError::new("timeRange"))
+}
+
+fn parse_date(value: &str) -> Option<NaiveDate> {
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    (date.format("%Y-%m-%d").to_string() == value).then_some(date)
 }
 
 #[derive(Clone, Copy)]

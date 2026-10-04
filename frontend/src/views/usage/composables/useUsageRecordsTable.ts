@@ -1,6 +1,6 @@
 import type { Ref } from 'vue'
 import type { UsageDisplayRecord } from '../utils/records'
-import type { UsageTimeRangeParams } from './useUsageTimeRange'
+import type { TimeRangeParams } from '@/composables/useTimeRange'
 import { watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, onScopeDispose, shallowRef, watch } from 'vue'
@@ -13,8 +13,8 @@ import {
 import { withMinimumDuration } from '@/utils/operation'
 
 interface UseUsageRecordsTableOptions {
-  timeRangeParams: Readonly<Ref<UsageTimeRangeParams>>
-  latestTimeRangeParams: () => UsageTimeRangeParams
+  timeRangeParams: Readonly<Ref<TimeRangeParams>>
+  latestTimeRangeParams: () => TimeRangeParams
   active: Readonly<Ref<boolean>>
 }
 

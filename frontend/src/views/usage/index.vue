@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { BaseCard, BaseIconButton, BasePageHeader, BaseSegmented, BaseSelect, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
+import type { TimeRangePreset } from '@/composables/useTimeRange'
 
+import { BaseCard, BaseIconButton, BasePageHeader, BaseSegmented, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
 import { Eye } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
+import DateRangePicker from '@/components/DateRangePicker.vue'
 import ProviderFilter from '@/components/ProviderFilter.vue'
+import { maxCustomRangeDays, timeRangePresets, useTimeRange } from '@/composables/useTimeRange'
 import OpsErrorPanel from './components/OpsErrorPanel.vue'
 import UsageFilters from './components/UsageFilters.vue'
 import UsageInsightsGrid from './components/UsageInsightsGrid.vue'
@@ -12,8 +15,8 @@ import UsageRecordsTable from './components/UsageRecordsTable.vue'
 import UsageSummaryCards from './components/UsageSummaryCards.vue'
 import { useUsageRecordDetail } from './composables/useUsageRecordDetail'
 import { useUsageRecordsTable } from './composables/useUsageRecordsTable'
-import { useUsageTimeRange } from './composables/useUsageTimeRange'
-import { usageRecordColumns, usageTimeRangeOptions } from './constants'
+
+import { usageRecordColumns } from './constants'
 
 const recordView = shallowRef('success')
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(usageRecordColumns, 'usage-records')
@@ -21,8 +24,22 @@ const recordViewOptions = [
   { label: '成功记录', value: 'success' },
   { label: '错误排查', value: 'errors' },
 ]
-const { timeRange, timeRangeParams, refreshTimeRangeEnd, latestTimeRangeParams }
-  = useUsageTimeRange()
+const {
+  timeRange,
+  timeRangeParams,
+  customStartDate,
+  customEndDate,
+  selectPreset,
+  selectCustomRange,
+  clearCustomRange,
+  latestTimeRangeParams,
+} = useTimeRange()
+
+// 分段控件只承载预设；自定义生效时进入无选中态，由日期 chip 呈现当前范围
+const presetSelection = computed<string>({
+  get: () => (timeRange.value === 'custom' ? '' : timeRange.value),
+  set: value => selectPreset(value as TimeRangePreset),
+})
 
 const {
   currentPage,
@@ -48,8 +65,7 @@ const {
 
 const { showDetailModal, selectedUsageRecord, handleViewDetail } = useUsageRecordDetail()
 
-watch(timeRange, () => {
-  refreshTimeRangeEnd()
+watch(timeRangeParams, () => {
   currentPage.value = 1
   void loadUsageRecords()
 })
@@ -59,12 +75,28 @@ watch(timeRange, () => {
   <div class="w-full">
     <BasePageHeader title="使用统计" description="查看请求用量、性能趋势与调用错误记录">
       <template #actions>
-        <BaseSelect v-model="timeRange" :options="usageTimeRangeOptions" class="w-34" />
-        <ProviderFilter
-          v-model="providerQuery"
-          :disabled="refreshingList"
-          class="shrink-0"
-        />
+        <div class="flex min-w-0 max-w-[calc(100vw-32px)] flex-wrap items-center justify-end gap-2 max-[960px]:justify-start">
+          <BaseSegmented
+            v-model="presetSelection"
+            label="快捷时间范围"
+            :options="timeRangePresets"
+            class="w-72 shrink-0"
+          />
+          <DateRangePicker
+            :start="customStartDate"
+            :end="customEndDate"
+            :max-range-days="maxCustomRangeDays"
+            class="shrink-0"
+            aria-label="自定义时间范围"
+            @custom="selectCustomRange"
+            @clear="clearCustomRange"
+          />
+          <ProviderFilter
+            v-model="providerQuery"
+            :disabled="refreshingList"
+            class="shrink-0"
+          />
+        </div>
       </template>
     </BasePageHeader>
 

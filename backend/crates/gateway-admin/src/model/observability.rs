@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Days, NaiveDate, TimeDelta, Utc};
 
 use super::{AdminModelError, PageSize};
 
@@ -60,6 +60,32 @@ impl TimeRange {
     pub fn new(start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Self, AdminModelError> {
         let duration = end.signed_duration_since(start);
         if duration <= TimeDelta::zero() || duration > TimeDelta::days(366) {
+            return Err(AdminModelError::InvalidTimeRange);
+        }
+        Ok(Self { start, end })
+    }
+
+    /// 创建覆盖最多 366 个自然日的范围，允许时区切换使 UTC 时长略超 366 天。
+    pub fn calendar_dates(
+        first_date: NaiveDate,
+        last_date: NaiveDate,
+        timezone: gateway_core::time::DeploymentTimeZone,
+    ) -> Result<Self, AdminModelError> {
+        let date_count = last_date.signed_duration_since(first_date).num_days() + 1;
+        if !(1..=366).contains(&date_count) {
+            return Err(AdminModelError::InvalidTimeRange);
+        }
+
+        let start = timezone
+            .date_start(first_date)
+            .ok_or(AdminModelError::InvalidTimeRange)?;
+        let end_date = last_date
+            .checked_add_days(Days::new(1))
+            .ok_or(AdminModelError::InvalidTimeRange)?;
+        let end = timezone
+            .date_start(end_date)
+            .ok_or(AdminModelError::InvalidTimeRange)?;
+        if end <= start {
             return Err(AdminModelError::InvalidTimeRange);
         }
         Ok(Self { start, end })
@@ -188,6 +214,7 @@ pub enum DiagnosticDimension {
     Model,
     Account,
     ApiKey,
+    AccountApiKey,
     Transport,
     Failure,
     Status,
@@ -800,6 +827,10 @@ pub struct DiagnosticsObservation {
 pub struct DiagnosticObservation {
     pub key: String,
     pub name: String,
+    pub account_id: Option<String>,
+    pub account_name: Option<String>,
+    pub client_api_key_id: Option<String>,
+    pub client_api_key_name: Option<String>,
     pub account_provider_kind: Option<String>,
     pub account_plan_type: Option<String>,
     pub request_count: u64,
@@ -1185,6 +1216,10 @@ pub struct UsageInsights {
 pub struct DiagnosticsItem {
     pub key: String,
     pub name: String,
+    pub account_id: Option<String>,
+    pub account_name: Option<String>,
+    pub client_api_key_id: Option<String>,
+    pub client_api_key_name: Option<String>,
     pub account_plan_type: Option<String>,
     pub account_plan_type_display: Option<String>,
     pub request_count: u64,
@@ -1202,6 +1237,7 @@ pub struct DiagnosticsItem {
     pub estimated_cost: Option<DecimalAmount>,
     pub attempt_count: u64,
     pub total_tokens: u64,
+    pub token_share: Option<f64>,
 }
 
 /// 诊断结果。

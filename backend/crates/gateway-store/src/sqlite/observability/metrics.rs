@@ -781,8 +781,28 @@ pub(crate) async fn usage_diagnostics(
         DiagnosticDimension::Status => {
             query.push(" and coalesce(mr.upstream_status_code, mr.client_status_code) is not null");
         }
+        DiagnosticDimension::Account => {
+            query.push(
+                " and mr.provider_account_ref is not null
+                    and mr.provider_kind = 'openai'
+                    and coalesce(
+                      mr.provider_account_authentication_kind_snapshot,
+                      account.authentication_kind
+                    ) = 'oauth'",
+            );
+        }
+        DiagnosticDimension::AccountApiKey => {
+            query.push(
+                " and mr.provider_account_ref is not null
+                    and mr.client_api_key_ref is not null
+                    and mr.provider_kind = 'openai'
+                    and coalesce(
+                      mr.provider_account_authentication_kind_snapshot,
+                      account.authentication_kind
+                    ) = 'oauth'",
+            );
+        }
         DiagnosticDimension::Provider
-        | DiagnosticDimension::Account
         | DiagnosticDimension::ApiKey
         | DiagnosticDimension::Transport => {}
     }
@@ -793,12 +813,39 @@ pub(crate) async fn usage_diagnostics(
     let mut groups = BTreeMap::<String, DiagnosticAccumulator>::new();
     while let Some(row) = rows.try_next().await.map_err(|_| unavailable())? {
         total_request_count = add_u64(total_request_count, 1)?;
-        let key: String = row.try_get("dimension_name").map_err(|_| unavailable())?;
+        let dimension_name: String = row.try_get("dimension_name").map_err(|_| unavailable())?;
+        let account_id: Option<String> = row
+            .try_get("provider_account_ref")
+            .map_err(|_| unavailable())?;
+        let client_api_key_id: Option<String> = row
+            .try_get("client_api_key_ref")
+            .map_err(|_| unavailable())?;
+        let key = if dimension == DiagnosticDimension::AccountApiKey {
+            let account_id = account_id
+                .as_deref()
+                .ok_or_else(|| invalid("account-key diagnostic is missing an account ID"))?;
+            let client_api_key_id = client_api_key_id
+                .as_deref()
+                .ok_or_else(|| invalid("account-key diagnostic is missing a client key ID"))?;
+            serde_json::to_string(&[account_id, client_api_key_id]).map_err(|_| unavailable())?
+        } else {
+            dimension_name
+        };
         let metric = metric_record_from_row(&row)?;
         let group = groups
             .entry(key.clone())
             .or_insert_with(|| DiagnosticAccumulator {
                 display_name: key.clone(),
+                account_id: if dimension == DiagnosticDimension::AccountApiKey {
+                    account_id.clone()
+                } else {
+                    None
+                },
+                client_api_key_id: if dimension == DiagnosticDimension::AccountApiKey {
+                    client_api_key_id.clone()
+                } else {
+                    None
+                },
                 account_provider_kind: row.try_get("account_provider_kind").unwrap_or(None),
                 account_plan_type: row.try_get("account_plan_type").unwrap_or(None),
                 ..DiagnosticAccumulator::default()
@@ -814,6 +861,19 @@ pub(crate) async fn usage_diagnostics(
                 group.display_name = display_name;
                 group.has_display_name = true;
             }
+        } else if dimension == DiagnosticDimension::AccountApiKey {
+            if group.account_name.is_none() {
+                let email: Option<String> = row
+                    .try_get("provider_account_email_snapshot")
+                    .unwrap_or(None);
+                let account_name: Option<String> = row
+                    .try_get("provider_account_name_snapshot")
+                    .unwrap_or(None);
+                group.account_name = email.or(account_name);
+            }
+            if group.client_api_key_name.is_none() {
+                group.client_api_key_name = row.try_get("api_key_name").unwrap_or(None);
+            }
         } else if dimension == DiagnosticDimension::ApiKey && !group.has_display_name {
             let display_name: Option<String> = row.try_get("api_key_name").unwrap_or(None);
             if let Some(display_name) = display_name {
@@ -825,15 +885,46 @@ pub(crate) async fn usage_diagnostics(
     }
     let mut items = groups
         .into_iter()
-        .map(|(key, group)| group.into_item(key))
+        .map(|(key, mut group)| {
+            if dimension == DiagnosticDimension::AccountApiKey {
+                let account_name = group
+                    .account_name
+                    .clone()
+                    .or_else(|| group.account_id.clone())
+                    .unwrap_or_else(|| "未知账号".to_owned());
+                let client_api_key_name = group
+                    .client_api_key_name
+                    .clone()
+                    .or_else(|| group.client_api_key_id.clone())
+                    .unwrap_or_else(|| "未知密钥".to_owned());
+                group.display_name = format!("{account_name} → {client_api_key_name}");
+                group.account_name = Some(account_name);
+                group.client_api_key_name = Some(client_api_key_name);
+            }
+            group.into_item(key)
+        })
         .collect::<StoreResult<Vec<_>>>()?;
-    items.sort_by(|left, right| {
-        right
-            .request_count
-            .cmp(&left.request_count)
-            .then_with(|| left.key.cmp(&right.key))
-    });
-    items.truncate(100);
+    if dimension == DiagnosticDimension::AccountApiKey {
+        items.sort_by(|left, right| {
+            left.account_name
+                .cmp(&right.account_name)
+                .then_with(|| right.total_tokens.cmp(&left.total_tokens))
+                .then_with(|| left.client_api_key_name.cmp(&right.client_api_key_name))
+        });
+    } else {
+        items.sort_by(|left, right| {
+            right
+                .request_count
+                .cmp(&left.request_count)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+    }
+    if !matches!(
+        dimension,
+        DiagnosticDimension::Account | DiagnosticDimension::AccountApiKey
+    ) {
+        items.truncate(100);
+    }
     Ok(DiagnosticsObservation {
         total_request_count,
         items,
@@ -846,6 +937,7 @@ fn diagnostic_dimension_sql(dimension: DiagnosticDimension) -> &'static str {
         DiagnosticDimension::Model => "coalesce(mr.upstream_model_id, mr.requested_model_id)",
         DiagnosticDimension::Account => "coalesce(mr.provider_account_ref, 'unrouted')",
         DiagnosticDimension::ApiKey => "mr.client_api_key_ref",
+        DiagnosticDimension::AccountApiKey => "mr.client_api_key_ref",
         DiagnosticDimension::Transport => {
             "coalesce(mr.upstream_transport, mr.client_transport, 'unknown')"
         }
@@ -860,6 +952,10 @@ fn diagnostic_dimension_sql(dimension: DiagnosticDimension) -> &'static str {
 struct DiagnosticAccumulator {
     display_name: String,
     has_display_name: bool,
+    account_id: Option<String>,
+    account_name: Option<String>,
+    client_api_key_id: Option<String>,
+    client_api_key_name: Option<String>,
     account_provider_kind: Option<String>,
     account_plan_type: Option<String>,
     request_count: u64,
@@ -940,6 +1036,10 @@ impl DiagnosticAccumulator {
         Ok(DiagnosticObservation {
             key,
             name: self.display_name,
+            account_id: self.account_id,
+            account_name: self.account_name,
+            client_api_key_id: self.client_api_key_id,
+            client_api_key_name: self.client_api_key_name,
             account_provider_kind: self.account_provider_kind,
             account_plan_type: self.account_plan_type,
             request_count: self.request_count,

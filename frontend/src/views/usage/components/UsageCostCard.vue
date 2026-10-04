@@ -10,7 +10,7 @@ import {
   zeroInactiveValues,
 } from '@/components/charts/timeSeriesGap'
 import { useChartPalette } from '@/composables/useChartPalette'
-import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/format'
+import { formatLocalizedCompactNumber as formatCompactNumber, formatPercent } from '@/utils/format'
 
 import {
   tooltipIndex,
@@ -25,7 +25,6 @@ import {
 } from '../utils/chart'
 import {
   decimalDisplayNumber,
-  formatPercent,
   formatUsd,
   formatUsdAxis,
 } from '../utils/format'

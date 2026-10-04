@@ -52,9 +52,3 @@ export const opsErrorColumns = defineTableColumns<OpsErrorRow>([
   { key: 'userAgent', label: 'User-Agent', kind: 'custom', size: '4xl', emptyText: '未记录' },
   { key: 'actions', label: '操作', kind: 'actions', size: 'sm', hideable: false },
 ])
-
-export const usageTimeRangeOptions = [
-  { label: '今天', value: 'today' },
-  { label: '最近 7 天', value: '7d' },
-  { label: '最近 30 天', value: '30d' },
-]

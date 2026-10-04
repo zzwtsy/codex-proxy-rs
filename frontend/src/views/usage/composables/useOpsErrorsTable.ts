@@ -1,5 +1,5 @@
 import type { Ref } from 'vue'
-import type { UsageTimeRangeParams } from './useUsageTimeRange'
+import type { TimeRangeParams } from '@/composables/useTimeRange'
 import { watchDebounced } from '@vueuse/core'
 
 import { computed, onScopeDispose, shallowRef, watch } from 'vue'
@@ -8,8 +8,8 @@ import { useStablePagedQuery } from '@/composables/useStablePagedQuery'
 import { withMinimumDuration } from '@/utils/operation'
 
 interface UseOpsErrorsTableOptions {
-  timeRangeParams: Readonly<Ref<UsageTimeRangeParams>>
-  latestTimeRangeParams: () => UsageTimeRangeParams
+  timeRangeParams: Readonly<Ref<TimeRangeParams>>
+  latestTimeRangeParams: () => TimeRangeParams
   provider: Readonly<Ref<string>>
   active: Readonly<Ref<boolean>>
 }

@@ -1,15 +1,6 @@
 import { formatLocalizedCompactNumber } from '@/utils/format'
 import { formatProviderLabel } from '@/utils/providers'
 
-const percentFormatter = new Intl.NumberFormat('zh-CN', {
-  style: 'percent',
-  maximumFractionDigits: 1,
-})
-
-export function formatPercent(value?: number | null) {
-  return value == null || !Number.isFinite(value) ? '—' : percentFormatter.format(value)
-}
-
 export function formatProvider(value?: string | null) {
   return formatProviderLabel(value)
 }

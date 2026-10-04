@@ -440,6 +440,10 @@ export interface UsageInsightsOverviewResponse {
 export interface UsageDiagnosticItem {
   key: string
   name: string
+  accountId?: string | null
+  accountName?: string | null
+  clientApiKeyId?: string | null
+  clientApiKeyName?: string | null
   accountPlanType: string | null
   accountPlanTypeDisplay: string | null
   requestCount: number
@@ -457,6 +461,7 @@ export interface UsageDiagnosticItem {
   estimatedCost: string | null
   attemptCount: number
   totalTokens: number
+  tokenShare?: number
 }
 
 export interface UsageDiagnosticsResponse {
@@ -465,14 +470,15 @@ export interface UsageDiagnosticsResponse {
 }
 
 // 请求参数类型：仅定义 API 边界的形状，调用方不依赖显式声明。
-interface UsageRangeQuery {
-  period: 'today' | '7d' | '30d'
-  asOf: number
+type UsageRangeQuery = {
   provider?: string
   model?: string
   statusCode?: number
   search?: string
-}
+} & (
+  | { period: 'today' | '7d' | '30d', asOf: number, startDate?: never, endDate?: never }
+  | { startDate: string, endDate: string, period?: never, asOf?: never }
+)
 
 interface PageQuery {
   currentPage: number

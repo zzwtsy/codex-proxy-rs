@@ -187,6 +187,7 @@ pub enum DiagnosticDimension {
     Model,
     Account,
     ApiKey,
+    AccountApiKey,
     Transport,
     Failure,
     Status,
@@ -691,6 +692,10 @@ pub struct DiagnosticsObservation {
 pub struct DiagnosticObservation {
     pub key: String,
     pub name: String,
+    pub account_id: Option<String>,
+    pub account_name: Option<String>,
+    pub client_api_key_id: Option<String>,
+    pub client_api_key_name: Option<String>,
     pub account_provider_kind: Option<String>,
     pub account_plan_type: Option<String>,
     pub request_count: u64,

@@ -745,6 +745,14 @@ pub struct UsageInsightsOverviewView {
 pub struct DiagnosticItemView {
     pub key: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_api_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_api_key_name: Option<String>,
     pub account_plan_type: Option<String>,
     pub account_plan_type_display: Option<String>,
     pub request_count: u64,
@@ -762,6 +770,8 @@ pub struct DiagnosticItemView {
     pub estimated_cost: Option<String>,
     pub attempt_count: u64,
     pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_share: Option<f64>,
 }
 
 /// 诊断聚合响应。

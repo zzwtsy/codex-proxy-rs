@@ -575,6 +575,10 @@ async fn diagnostics_should_keep_stable_key_and_display_name_contract() {
         total_request_count: 4,
         items: vec![DiagnosticObservation {
             key: "acct_diag".to_owned(),
+            account_id: Some("acct_diag".to_owned()),
+            account_name: Some("diag@example.invalid".to_owned()),
+            client_api_key_id: Some("key_diag".to_owned()),
+            client_api_key_name: Some("Shared key".to_owned()),
             account_provider_kind: Some("openai".to_owned()),
             account_plan_type: Some("pro".to_owned()),
             name: "diag@example.invalid".to_owned(),
@@ -597,7 +601,7 @@ async fn diagnostics_should_keep_stable_key_and_display_name_contract() {
         .with_state(fixture.state())
         .oneshot(
             Request::builder()
-                .uri("/api/admin/usage/insights/diagnostics?dimension=account")
+                .uri("/api/admin/usage/insights/diagnostics?dimension=accountKey")
                 .header(header::COOKIE, "cpr_session=valid-session")
                 .header("x-request-id", "req_diagnostics_snapshot")
                 .body(Body::empty())
@@ -612,10 +616,18 @@ async fn diagnostics_should_keep_stable_key_and_display_name_contract() {
     let value: serde_json::Value = serde_json::from_slice(&body).expect("diagnostics JSON");
     assert!(value["data"]["items"][0].get("impactScore").is_none());
     assert_eq!(value["data"]["items"][0]["requestShare"], 0.5);
+    assert_eq!(value["data"]["items"][0]["tokenShare"], 1.0);
     assert_eq!(value["data"]["items"][0]["retryCount"], 3);
     assert_eq!(value["data"]["items"][0]["retryRate"], 0.5);
     assert_eq!(value["data"]["items"][0]["accountPlanType"], "pro");
     assert_eq!(value["data"]["items"][0]["accountPlanTypeDisplay"], "Pro");
+    assert_eq!(value["data"]["items"][0]["accountId"], "acct_diag");
+    assert_eq!(
+        value["data"]["items"][0]["accountName"],
+        "diag@example.invalid"
+    );
+    assert_eq!(value["data"]["items"][0]["clientApiKeyId"], "key_diag");
+    assert_eq!(value["data"]["items"][0]["clientApiKeyName"], "Shared key");
     assert_eq!(
         (
             &value["data"]["items"][0]["key"],
@@ -627,7 +639,7 @@ async fn diagnostics_should_keep_stable_key_and_display_name_contract() {
             &serde_json::json!("acct_diag"),
             &serde_json::json!("diag@example.invalid"),
             &serde_json::json!(3800),
-            &serde_json::json!("account"),
+            &serde_json::json!("accountKey"),
         )
     );
 }
@@ -1137,4 +1149,112 @@ async fn calendar_query_rejects_an_anchor_outside_the_local_calendar() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(fixture.dashboard_summary_range.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn custom_date_range_should_reach_usage_and_error_queries_in_deployment_timezone() {
+    use crate::admin::{AdminTestFixture, AdminTestState};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use chrono::{DateTime, Utc};
+    use gateway_admin::model::observability::{AttemptMetrics, TimeRange, UsageOverview};
+    use gateway_api::admin::observability;
+    use gateway_core::time::DeploymentTimeZone;
+    use tower::ServiceExt as _;
+
+    let timezone: DeploymentTimeZone = "America/Los_Angeles".parse().unwrap();
+    let fixture = AdminTestFixture::with_timezone(timezone).await;
+    fixture.auth.insert_session("valid-session");
+    let now = Utc::now();
+    fixture.observations.lock().unwrap().summary = Some(UsageOverview {
+        range: TimeRange::new(now - chrono::Duration::hours(1), now).unwrap(),
+        requests: Default::default(),
+        attempts: AttemptMetrics::default(),
+        providers: Vec::new(),
+    });
+    fixture.observations.lock().unwrap().trend = Some(Vec::new());
+
+    let router = observability::router::<AdminTestState>().with_state(fixture.state());
+    let query = "startDate=2024-11-03&endDate=2025-11-03";
+    for path in [
+        format!("/api/admin/usage/records?currentPage=1&pageSize=10&{query}"),
+        format!("/api/admin/usage/records/summary?{query}"),
+        format!("/api/admin/usage/insights/overview?{query}"),
+        format!("/api/admin/usage/insights/diagnostics?dimension=account&{query}"),
+        format!("/api/admin/operations/errors?currentPage=1&pageSize=10&{query}"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path.as_str())
+                    .header(header::COOKIE, "cpr_session=valid-session")
+                    .header("x-request-id", "req_usage_custom_dates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let expected_status = if path.starts_with("/api/admin/usage/insights/overview") {
+            // 测试 Store 的费用事实流默认失败，但请求范围已先交给 Store。
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(response.status(), expected_status, "{path}");
+    }
+
+    let expected = TimeRange {
+        start: "2024-11-03T07:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        end: "2025-11-04T08:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+    };
+    let observations = fixture.observations.lock().unwrap();
+    assert_eq!(observations.records[0].range, expected);
+    assert_eq!(observations.summaries[0].0, expected);
+    assert_eq!(observations.summaries[1].0, expected);
+    assert_eq!(observations.trends[0].0, expected);
+    assert_eq!(observations.diagnostics[0].0, expected);
+    assert_eq!(observations.errors[0].range, expected);
+}
+
+#[tokio::test]
+async fn custom_date_range_should_reject_invalid_or_oversized_dates() {
+    use crate::admin::{AdminTestFixture, AdminTestState};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use gateway_api::admin::observability;
+    use tower::ServiceExt as _;
+
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let router = observability::router::<AdminTestState>().with_state(fixture.state());
+    for query in [
+        "startDate=2025-01-01",
+        "startDate=2025-1-01&endDate=2025-01-02",
+        "startDate=2025-02-30&endDate=2025-03-01",
+        "startDate=2025-01-02&endDate=2025-01-01",
+        "startDate=2024-11-03&endDate=2025-11-04",
+        "startDate=2025-01-01&endDate=2025-01-02&period=7d",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/admin/usage/insights/diagnostics?dimension=account&{query}"
+                    ))
+                    .header(header::COOKIE, "cpr_session=valid-session")
+                    .header("x-request-id", "req_usage_invalid_dates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    assert!(fixture.observations.lock().unwrap().diagnostics.is_empty());
 }

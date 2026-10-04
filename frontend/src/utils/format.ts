@@ -1,3 +1,8 @@
+const percentFormatter = new Intl.NumberFormat('zh-CN', {
+  style: 'percent',
+  maximumFractionDigits: 1,
+})
+
 export function parseTimestamp(value: string | number | Date | null | undefined): number | null {
   if (value === null || value === undefined)
     return null
@@ -19,6 +24,10 @@ const metricUnits = [
   ['M', 1_000_000],
   ['K', 1_000],
 ] as const
+
+export function formatPercent(value?: number | null) {
+  return value == null || !Number.isFinite(value) ? '—' : percentFormatter.format(value)
+}
 
 export function formatInteger(value: number) {
   return integerFormatter.format(value)
