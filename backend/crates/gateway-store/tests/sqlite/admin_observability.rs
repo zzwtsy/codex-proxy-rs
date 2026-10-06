@@ -221,7 +221,7 @@ async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_erro
 }
 
 #[tokio::test]
-async fn sqlite_account_diagnostics_include_only_codex_oauth() {
+async fn sqlite_account_diagnostics_include_non_oauth_and_unrouted_requests() {
     let root = tempfile::tempdir().expect("SQLite data directory");
     let pool = sqlite::connect_and_migrate(
         &root.path().join("codex-account-diagnostics.sqlite3"),
@@ -363,10 +363,25 @@ async fn sqlite_account_diagnostics_include_only_codex_oauth() {
     let diagnostics = store
         .usage_diagnostics(range, UsageFilter::default(), DiagnosticDimension::Account)
         .await
-        .expect("Codex OAuth account diagnostics");
+        .expect("account diagnostics");
 
-    assert_eq!(diagnostics.total_request_count, 4);
-    assert_eq!(diagnostics.items.len(), 2);
+    assert_eq!(diagnostics.total_request_count, 7);
+    assert_eq!(diagnostics.items.len(), 5);
+    let account_request_counts = diagnostics
+        .items
+        .iter()
+        .map(|item| (item.key.as_str(), item.request_count))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        account_request_counts,
+        std::collections::BTreeMap::from([
+            ("codex-one", 3),
+            ("codex-two", 1),
+            ("openai-api-key", 1),
+            ("other-provider", 1),
+            ("unrouted", 1),
+        ])
+    );
     let codex_one = diagnostics
         .items
         .iter()
@@ -390,7 +405,7 @@ async fn sqlite_account_diagnostics_include_only_codex_oauth() {
             DiagnosticDimension::AccountApiKey,
         )
         .await
-        .expect("Codex OAuth account-key diagnostics");
+        .expect("OpenAI OAuth account-key diagnostics");
     assert_eq!(account_keys.total_request_count, 4);
     assert_eq!(account_keys.items.len(), 3);
     let alpha_one = account_keys

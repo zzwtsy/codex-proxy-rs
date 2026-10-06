@@ -737,17 +737,6 @@ pub(crate) fn push_diagnostic_dimension_filter(
             statement
                 .push(" and coalesce(mr.upstream_status_code, mr.client_status_code) is not null");
         }
-        DiagnosticDimension::Account => {
-            statement.push(
-                " and mr.provider_account_ref is not null
-                    and mr.provider_kind = 'openai'
-                    and coalesce(
-                      mr.provider_account_authentication_kind_snapshot,
-                      (select account.authentication_kind from provider_accounts account
-                        where account.id = mr.provider_account_ref)
-                    ) = 'oauth'",
-            );
-        }
         DiagnosticDimension::AccountApiKey => {
             statement.push(
                 " and mr.provider_account_ref is not null
@@ -760,7 +749,8 @@ pub(crate) fn push_diagnostic_dimension_filter(
                     ) = 'oauth'",
             );
         }
-        DiagnosticDimension::Provider
+        DiagnosticDimension::Account
+        | DiagnosticDimension::Provider
         | DiagnosticDimension::ApiKey
         | DiagnosticDimension::Transport => {}
     }

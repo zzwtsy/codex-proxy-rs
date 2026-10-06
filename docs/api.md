@@ -1613,7 +1613,8 @@ request/response/upstream ID、outcome 与搜索文本。诊断 `dimension` 可�
 `requestShare` 的分母为该维度筛选后、截取前的全部请求数；`failureClass` 只在带错误类型的请求内计算占比
 `retryCount` 为额外执行尝试次数之和，`retryRate` 为发生过重试的请求数占该组请求数的比例，同一请求多次重试只计一次
 
-账号和账号密钥维度只统计关联的 OpenAI OAuth 账号。`accountKey` 每项对应一个账号与 Client Key 组合，
+`account` 维度按账号引用分组，未关联账号的请求归入 `unrouted`；`accountKey` 维度只统计关联的 OpenAI OAuth 账号。
+`accountKey` 每项对应一个账号与 Client Key 组合，
 包含 `accountId`、`accountName`、`clientApiKeyId`、`clientApiKeyName`。`totalTokens` 统计筛选范围内成功交付的请求 Token；
 `tokenShare` 仅在 `accountKey` 维度返回，分母是同一账号在当前范围内所有 Client Key 的 Token 总量。
 同一 Client Key 使用多个账号时分别计入各账号；名称不可用时名称字段回退为对应 ID
