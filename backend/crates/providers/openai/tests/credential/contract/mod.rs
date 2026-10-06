@@ -1,3 +1,5 @@
+//! OpenAI 凭据合同测试入口，以及凭据编码、持久化与选号约束测试
+
 mod capacity;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +25,6 @@ use gateway_core::lifecycle::CancellationToken;
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
     ProviderCooldownPort, ProviderLeasePort, ProviderSessionAffinityKey,
-    ProviderSessionAffinityPort,
 };
 use gateway_core::routing::{
     ClientRoutingScope, FrozenAccountScope, ProviderKind, RuntimeAccount, RuntimeAccountDirectory,
@@ -791,9 +792,7 @@ async fn record_success_should_not_overwrite_a_newer_session_winner() {
         .await
         .expect("seed newer affinity");
 
-    selector
-        .record_success(&first, Some(&key), first.id())
-        .await;
+    selector.record_success(&first).await;
 
     assert_eq!(
         affinity
@@ -828,9 +827,7 @@ async fn selector_should_reuse_and_renew_the_account_bound_to_the_same_session()
         })
         .await
         .expect("select first account");
-    selector
-        .record_success(first.account(), Some(&key), first.account_id())
-        .await;
+    selector.record_success(first.account()).await;
     let first_account = first.account_id().clone();
 
     let second_attempt = attempt(BTreeSet::new());
@@ -863,7 +860,7 @@ async fn selector_should_reuse_and_renew_the_account_bound_to_the_same_session()
     assert_eq!(
         affinity.renewal_ttls(),
         vec![Duration::from_secs(24 * 60 * 60); 2],
-        "successful response and next selection both renew the binding"
+        "initial admission and next selection both renew the binding"
     );
 }
 
@@ -900,9 +897,7 @@ async fn selector_should_replace_a_busy_affinity_binding_after_the_fallback_succ
         })
         .await
         .expect("select fallback account");
-    selector
-        .record_success(selected.account(), Some(&key), &bound)
-        .await;
+    selector.record_success(selected.account()).await;
 
     assert_eq!(
         (
@@ -1326,7 +1321,7 @@ fn rate_limited_failure_does_not_consult_stale_quota_snapshot() {
             .credential_state(),
         CredentialState::Ready
     );
-    // 429 临时限流写入 Redis 冷却，不读写 quota JSON。
+    // 429 临时限流写入 Redis 冷却，不读写 quota JSON
     assert_eq!(store.quota_reads(), 0);
     let cooldown = block_on(cooldowns.read(account.id())).expect("read cooldown");
     assert!(
@@ -1376,7 +1371,7 @@ fn successful_upstream_response_recovers_non_quota_terminal_states() {
         let current = store.account("acct_primary").expect("stale account");
         let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
 
-        block_on(selector.record_success(&current, None, current.id()));
+        block_on(selector.record_success(&current));
 
         assert_eq!(
             store
@@ -1655,7 +1650,7 @@ fn cloudflare_challenge_does_not_change_persisted_account_facts() {
             .credential_state(),
         CredentialState::Ready
     );
-    block_on(selector.record_success(lease.account(), None, lease.account_id()));
+    block_on(selector.record_success(lease.account()));
 }
 
 #[test]

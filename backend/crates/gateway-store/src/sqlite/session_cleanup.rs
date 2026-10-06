@@ -30,6 +30,10 @@ impl ScheduledTask for SqliteSessionCleanupTask {
                    select rowid from provider_session_exclusions where expires_at_us <= ?1
                    order by expires_at_us, rowid limit ?2
                  )",
+                "delete from provider_session_aliases where rowid in (
+                   select rowid from provider_session_aliases where expires_at_us <= ?1
+                   order by expires_at_us, rowid limit ?2
+                 )",
             ] {
                 if context.cancellation().is_cancelled() {
                     return Ok(());

@@ -1,3 +1,5 @@
+//! 验证 HTTP 与 WebSocket 的账号头部隔离及中间件覆盖
+
 use super::*;
 
 const SELECTED_ACCOUNT: &str = "acct_scope_same";
@@ -265,7 +267,7 @@ async fn middleware_can_override_account_headers_on_http_and_websocket() {
                             })
                             .collect(),
                     }),
-                    false,
+                    FastMode::Default,
                 ),
             )
             .await

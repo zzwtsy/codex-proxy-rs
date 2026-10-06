@@ -1,8 +1,9 @@
-//! 终态配置表的一致性 `RuntimeSnapshot` 输入读取。
+//! 终态配置表的一致性 `RuntimeSnapshot` 输入读取
 
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use gateway_core::account::FastMode;
 use gateway_core::routing::{
     AccountGroupId, ConfigRevision,
     snapshot::{SnapshotFacts, SnapshotStoreError, SnapshotStorePort},
@@ -218,16 +219,17 @@ async fn load_client_keys(
 async fn load_account_groups(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<Vec<SnapshotAccountGroupData>> {
-    let rows = sqlx::query_as::<_, (String, String, bool, bool)>(
-        "select id, name, enabled, disable_fast from account_groups order by id",
+    let rows = sqlx::query_as::<_, (String, String, bool, String)>(
+        "select id, name, enabled, fast_mode from account_groups order by id",
     )
     .fetch_all(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("load snapshot account groups"))?;
     rows.into_iter()
-        .map(|(id, name, enabled, disable_fast)| {
+        .map(|(id, name, enabled, fast_mode)| {
             Ok(SnapshotAccountGroupData {
-                disable_fast,
+                fast_mode: FastMode::parse(&fast_mode)
+                    .ok_or_else(|| invalid("invalid fast_mode"))?,
                 id: AccountGroupId::new(id).map_err(|_| invalid("invalid account group id"))?,
                 name,
                 enabled,

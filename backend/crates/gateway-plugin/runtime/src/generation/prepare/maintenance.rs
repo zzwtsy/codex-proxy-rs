@@ -1,4 +1,4 @@
-//! 对账只从已发布集合开始；通知合并，实例串行，失败和停用不阻塞其他实例。
+//! 对账只从已发布集合开始；通知合并，实例串行，失败和停用不阻塞其他实例
 
 use super::{PluginRuntime, PreparedSet, RpcSession};
 use futures::{StreamExt as _, future::BoxFuture};
@@ -24,7 +24,7 @@ struct MaintenanceTask {
 }
 
 impl PluginRuntime {
-    /// 由 Host 监督维护任务；CLI 和只读准备不会启动后台业务。
+    /// 由 Host 监督维护任务；CLI 和只读准备不会启动后台业务
     pub fn maintenance_worker(
         self: &Arc<Self>,
         snapshots: RuntimeSnapshotHandle,
@@ -90,7 +90,7 @@ impl DaemonTask for MaintenanceTask {
                     }
                 }
                 revision = snapshot.as_ref().map(|s| s.revision());
-                // 发布变更优先于下一轮维护；不在快照发布锁中等待插件或数据库。
+                // 发布变更优先于下一轮维护；不在快照发布锁中等待插件或数据库
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break,
@@ -126,9 +126,13 @@ async fn reconcile(session: Arc<RpcSession>, dirty: Arc<Notify>, cancellation: C
             () = cancellation.cancelled() => return,
             result = session.call("plugin.reconcile", context, serde_json::json!({}), Vec::new()) => result,
         };
-        if !result
-            .is_ok_and(|reply| reply.result == serde_json::json!({}) && reply.payload.is_empty())
-        {
+        if !result.is_ok_and(|reply| {
+            let valid = reply.result == serde_json::json!({}) && reply.payload.is_empty();
+            if !valid {
+                session.invalid_response(Stage::Maintenance);
+            }
+            valid
+        }) {
             tracing::warn!(%instance_id, "plugin maintenance failed; retrying after bounded delay");
             tokio::select! {
                 biased;

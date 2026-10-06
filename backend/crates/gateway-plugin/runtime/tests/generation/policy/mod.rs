@@ -1,3 +1,6 @@
+//! 验证插件重试、模型路由与账号调度策略的顺序及宿主约束
+
+mod compatibility;
 mod facts;
 mod http;
 mod mounts;
@@ -26,6 +29,7 @@ use gateway_admin::{
     ports::plugins::PluginPackageInspector,
 };
 use gateway_core::{
+    account::FastMode,
     account::{
         AccountCandidate, AccountEligibilityPolicy, AccountRuntimeSignals, AccountSelectionContext,
         AccountSelectionPolicy, AccountWeight, CredentialRevision, CredentialState,
@@ -1045,6 +1049,7 @@ async fn outer_plugin_receives_inner_rejection_details_and_preserves_rejection_s
         panic!("expected rejection")
     };
     assert!(error.is_rejected());
+    assert!(generation.is_ready(), "主动拒绝请求不应停止插件");
     let MiddlewareError::Remote { source, .. } = error else {
         panic!("expected remote details")
     };
@@ -1150,7 +1155,7 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
     let baseline = ExecutionSettings {
         runtime: SettingsValues::new(3, 50, "smart", BTreeMap::new(), None, None)
             .with_request_profiles(profiles("key-default")),
-        disable_fast: true,
+        fast_mode: FastMode::Disabled,
         client_limits: RateLimits {
             max_concurrency: 2,
             requests_per_minute: 10,
@@ -1186,7 +1191,7 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
                         gateway_core::routing::ClientRoutingScope::all_accounts(),
                     )
                     .with_request_profiles(profiles("key-default"))
-                    .with_disable_fast(baseline.disable_fast),
+                    .with_fast_mode(baseline.fast_mode),
                 ),
                 true,
                 baseline.client_limits,
@@ -1194,13 +1199,13 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
             baseline.timeout_ms,
         );
     let mut first = baseline_json.clone();
-    first["disable_fast"] = serde_json::json!(false);
+    first["fast_mode"] = serde_json::json!("default");
     first["runtime"]["request_interval_ms"] = serde_json::json!(0);
     first["runtime"]["model_mappings"] = serde_json::json!({"alias":"model-one"});
     let mut last = first.clone();
     last["runtime"]["model_mappings"] = serde_json::json!({"alias":"model-two"});
     last["timeout_ms"] = serde_json::json!(90_000);
-    // 显式写回宿主值也要记录覆盖，否则 Key 默认值会再次生效。
+    // 显式写回宿主值也要记录覆盖，否则 Key 默认值会再次生效
     last["runtime"]["request_profiles"] = serde_json::json!({"openai":{"identity":"host"}});
     let worker = std::fs::read(env!("CARGO_BIN_EXE_gateway-plugin-test-middleware")).unwrap();
     let package = crate::support::package_with_contributions(
@@ -1219,7 +1224,7 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
     ], package).await;
     let generation = prepare(&runtime).await;
     let plan = runtime.middleware_registry().resolve(&generation).unwrap();
-    // 连续调用使用同一宿主基线，前一次插件改写不能泄漏到后一次。
+    // 连续调用使用同一宿主基线，前一次插件改写不能泄漏到后一次
     for _ in 0..2 {
         let expected: ExecutionSettings = serde_json::from_value(last.clone()).unwrap();
         let next = (Downstream {
@@ -1252,10 +1257,10 @@ async fn real_request_plugins_rewrite_settings_in_onion_order() {
                             "settings-second"
                         );
                         assert_eq!(
-                            sources["execution"]["disable_fast"]["instance_id"],
+                            sources["execution"]["fast_mode"]["instance_id"],
                             "settings-first"
                         );
-                        assert_eq!(sources["execution"]["disable_fast"]["value"], false);
+                        assert_eq!(sources["execution"]["fast_mode"]["value"], "default");
                         assert_eq!(
                             sources["execution"]["timeout_ms"]["instance_id"],
                             "settings-second"
@@ -1341,7 +1346,7 @@ async fn sdk_middleware_entry_registers_and_maps_a_real_process_response() {
     })
     .await
     .unwrap();
-    // 模拟慢消费者：SDK 可以继续发起读回调，但宿主不得预读第二个源。
+    // 模拟慢消费者：SDK 可以继续发起读回调，但宿主不得预读第二个源
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(reads.load(Ordering::Relaxed), 1);
     let frame = body.next_frame().await.unwrap().unwrap();
@@ -1362,7 +1367,7 @@ async fn sdk_middleware_entry_registers_and_maps_a_real_process_response() {
     })
     .await
     .unwrap();
-    // 尚未消费源帧就关闭，等待源归还的回调必须一起取消并释放下游正文。
+    // 尚未消费源帧就关闭，等待源归还的回调必须一起取消并释放下游正文
     reads.store(0, Ordering::Relaxed);
     let response = plan
         .handle(
@@ -1490,7 +1495,7 @@ impl CapabilitiesNext {
 
 #[tokio::test]
 async fn sdk_capability_declarations_require_request_stage() {
-    for (version, attempt) in [(3, false), (3, true)] {
+    for (version, attempt) in [(4, false), (4, true)] {
         let stage = if attempt {
             Stage::Attempt
         } else {

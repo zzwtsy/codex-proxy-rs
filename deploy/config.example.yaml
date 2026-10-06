@@ -62,7 +62,9 @@ store:
   #   acquire_timeout_seconds: 5
 
 admin:
-  session_ttl_minutes: 1440
+  # 不活动期限与从登录起计算的最长有效期，单位为分钟
+  session_ttl_minutes: 10080
+  session_absolute_ttl_minutes: 43200
   default_username: 'admin@cpr.local'
   # 仅首次创建管理员时使用；至少 12 个字符且不能包含 `$`。
   default_password: ''
@@ -81,3 +83,12 @@ api:
 openai:
   # 数据驻留约束；省略或 null 不指定地域约束，与管理端客户端身份无关。
   residency: us
+
+# Compose 启动桥接区；服务密码通过安装目录的 .env 提供。
+services:
+  app-runtime:
+    environment:
+      # 默认空值；小内存机器可改为下列值，更积极回收空闲内存，但可能增加 CPU 开销。
+      # 'glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072'
+      # 由 Compose 在进程启动前传入，修改后需重建应用容器，详见 deploy/README.md#小内存优化。
+      GLIBC_TUNABLES: ''

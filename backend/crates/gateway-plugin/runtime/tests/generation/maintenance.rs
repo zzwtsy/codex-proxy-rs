@@ -1,3 +1,5 @@
+//! 验证插件维护任务的资源创建、重试及事务归属和幂等性
+
 use crate::support::environment::{Environment, mutation};
 use gateway_admin::{
     model::{
@@ -7,6 +9,7 @@ use gateway_admin::{
     ports::plugin_resources::PluginResourceAccess,
 };
 use gateway_core::{
+    account::FastMode,
     lifecycle::CancellationToken,
     task::{WorkerContribution, WorkerRunnable},
 };
@@ -18,7 +21,7 @@ fn group(name: &str) -> CreateAccountGroup {
     CreateAccountGroup {
         name: name.into(),
         description: None,
-        disable_fast: false,
+        fast_mode: FastMode::Default,
         color: AccountGroupColor::parse("#2563EBFF").unwrap(),
     }
 }
@@ -166,6 +169,47 @@ async fn wait_done(path: &std::path::Path, after: usize) -> Value {
 }
 
 #[tokio::test]
+async fn malformed_maintenance_response_does_not_stop_the_host_worker() {
+    let Some(environment) = Environment::create().await else {
+        return;
+    };
+    environment
+        .install_plugin(
+            json!({"maintenance_fixture":true,"invalid_response_method":"plugin.reconcile"}),
+        )
+        .await;
+    let (runtime, core, resources, stop, task) = start(&environment).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while core
+            .snapshots()
+            .acquire()
+            .unwrap()
+            .extensions()
+            .unwrap()
+            .is_ready()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished(), "单个插件失败不能终止宿主维护任务");
+    for probe in core.health_probes() {
+        assert!(matches!(
+            probe.check().await,
+            gateway_core::health::HealthState::Healthy
+        ));
+    }
+    stop.cancel();
+    task.await.unwrap();
+    drop(resources);
+    environment.release_plugin_accounts(&runtime);
+    drop(core);
+    drop(runtime);
+    environment.close().await;
+}
+
+#[tokio::test]
 async fn published_reconciliation_provisions_retries_imports_and_restores_without_overwriting_groups()
  {
     let Some(environment) = Environment::create().await else {
@@ -237,7 +281,7 @@ async fn published_reconciliation_provisions_retries_imports_and_restores_withou
     drop(resources);
     drop(core);
     drop(runtime);
-    // 离线新增账号后重新启动真实插件子进程；稳定资源键必须复用原分组与 Key。
+    // 离线新增账号后重新启动真实插件子进程；稳定资源键必须复用原分组与 Key
     let offline = environment.account(None).await;
     std::fs::write(&marker, "").unwrap();
     let (runtime, core, resources, stop, task) = start(&environment).await;

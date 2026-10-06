@@ -1,8 +1,8 @@
-//! Store 值类型、错误与跨层映射。
+//! Store 值类型、错误与跨层映射
 
 use super::*;
 
-/// 发生错误的基础设施边界。
+/// 发生错误的基础设施边界
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreBackend {
     PostgreSql,
@@ -10,7 +10,7 @@ pub enum StoreBackend {
     Sqlite,
 }
 
-/// 上层状态机需要区分的稳定冲突类型。
+/// 上层状态机需要区分的稳定冲突类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictKind {
     StaleRevision,
@@ -23,7 +23,7 @@ pub enum ConflictKind {
     FencingTokenStale,
 }
 
-/// Store adapter 的稳定错误边界。
+/// Store adapter 的稳定错误边界
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
     #[error("{backend:?} store is unavailable: {message}")]
@@ -124,7 +124,7 @@ impl Revision {
     }
 }
 
-/// `numeric(20,10)` 可无损表达的非负金额。
+/// `numeric(20,10)` 可无损表达的非负金额
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DecimalAmount(String);
 
@@ -177,7 +177,8 @@ impl FromStr for DecimalAmount {
     }
 }
 
-/// Provider-owned JSON object。Store 只验证 object 与大小，不解释内部 key。
+/// Provider-owned JSON object
+/// Store 只验证 object 与大小，不解释内部 key
 #[derive(Clone, PartialEq)]
 pub struct JsonObject(Map<String, Value>);
 

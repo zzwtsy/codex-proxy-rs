@@ -1,3 +1,5 @@
+//! 插件中间件回调的调用状态、后续处理委托与资源回收
+
 mod body;
 mod headers;
 
@@ -84,6 +86,7 @@ fn request_feature(
 
 pub(crate) struct MiddlewareInvocation {
     instance_id: String,
+    settings_contract: crate::compatibility::FastSettings,
     capabilities_allowed: bool,
     transport: ClientTransport,
     state: Mutex<InvocationState>,
@@ -138,22 +141,28 @@ impl MiddlewareInvocation {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        serde_json::to_value(
-            state
-                .original_request
-                .settings()
-                .and_then(gateway_core::settings::RequestSettings::execution_values),
-        )
-        .map_err(|_| invalid())
+        state
+            .original_request
+            .settings()
+            .map(|settings| self.settings_contract.execution(settings))
+            .unwrap_or(Ok(serde_json::Value::Null))
+    }
+
+    pub(crate) fn settings_sources(&self) -> Result<serde_json::Value, PluginFault> {
+        self.request_settings()
+            .map(|settings| self.settings_contract.sources(&settings))
+            .unwrap_or(Ok(serde_json::Value::Null))
     }
     pub(crate) fn new(
         context: &MiddlewareContext,
         request: MiddlewareRequest,
         next: MiddlewareNext,
         instance_id: String,
+        settings_contract: crate::compatibility::FastSettings,
     ) -> Arc<Self> {
         Arc::new(Self {
             instance_id,
+            settings_contract,
             capabilities_allowed: context.mount()
                 == gateway_core::engine::middleware::MiddlewareMount::Request
                 && context.operation() == Some(gateway_core::operation::OperationKind::Generate),
@@ -334,7 +343,7 @@ impl MiddlewareInvocation {
                     "execution settings are not available at this middleware boundary",
                 )
             })?;
-            let values = serde_json::from_value(settings).map_err(|_| invalid())?;
+            let values = self.settings_contract.decode(settings, current)?;
             let updated = current
                 .replace_execution(&values, &self.instance_id)
                 .map_err(|_| invalid())?;
@@ -493,9 +502,6 @@ impl MiddlewareInvocation {
         &self,
         response: MiddlewareResponseHead,
     ) -> Result<MiddlewareCompletion, MiddlewareError> {
-        if let Some(error) = self.take_downstream_error() {
-            return Err(error);
-        }
         let downstream = {
             let mut state = self
                 .state
@@ -568,7 +574,7 @@ impl MiddlewareInvocation {
             }
             MiddlewareResponseBody::Empty => {
                 // 调用过 next 后不能靠关闭下游流伪装成已完成；需要丢弃正文时也必须
-                // 通过 preserving mapper 拉取到底，才能保留计量、终态和取消合同。
+                // 通过 preserving mapper 拉取到底，才能保留计量、终态和取消合同
                 if downstream.is_some() {
                     return Err(MiddlewareError::InvalidState);
                 }
@@ -660,7 +666,7 @@ fn validate_status(status: u16) -> Result<(), PluginFault> {
 
 const fn framing_for_response(transport: ClientTransport, status: u16) -> MiddlewareFraming {
     match transport {
-        // WebSocket 的失败也作为 JSON 消息交付，不使用 HTTP 错误正文的字节流边界。
+        // WebSocket 的失败也作为 JSON 消息交付，不使用 HTTP 错误正文的字节流边界
         ClientTransport::WebSocket => MiddlewareFraming::JsonDocument,
         _ if status < 200 || status >= 300 => MiddlewareFraming::RawBytes,
         ClientTransport::HttpSse => MiddlewareFraming::SseEvent,

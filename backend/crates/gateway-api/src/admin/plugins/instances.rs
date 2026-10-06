@@ -1,3 +1,5 @@
+//! 插件实例配置、运行状态、版本切换与回滚的 HTTP 接口
+
 use axum::{
     Router,
     extract::{Query, State},
@@ -53,6 +55,8 @@ struct InstanceView {
     enabled: bool,
     configuration_required: bool,
     compatibility_warning: Option<String>,
+    load_error: Option<String>,
+    api_deprecations: Vec<gateway_admin::model::plugins::instances::PluginApiDeprecation>,
     configuration: serde_json::Value,
     secret_fields: Vec<String>,
     bindings: Vec<PluginCapabilityBinding>,
@@ -148,6 +152,8 @@ impl From<PluginInstanceView> for InstanceView {
             enabled,
             configuration_required: value.configuration_required,
             compatibility_warning: value.compatibility_warning,
+            load_error: value.load_error,
+            api_deprecations: value.api_deprecations,
             configuration,
             secret_fields: secrets.into_keys().collect(),
             bindings,

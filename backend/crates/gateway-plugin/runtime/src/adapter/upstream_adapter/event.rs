@@ -1,3 +1,5 @@
+//! 校验并解码插件上游事件，转换为宿主执行事件与错误
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -35,6 +37,17 @@ pub(super) struct DecodedEvent {
     pub(super) continuation: Option<UpstreamContinuation>,
 }
 
+pub(super) enum EventDecodeError {
+    Invalid(ProviderError),
+    Upstream(ProviderError),
+}
+
+impl From<ProviderError> for EventDecodeError {
+    fn from(error: ProviderError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
 impl EventDecoder {
     pub(super) fn decode(
         &mut self,
@@ -43,10 +56,10 @@ impl EventDecoder {
         transport: &str,
         account: &dyn UpstreamAccountConnection,
         sent: UpstreamSendState,
-    ) -> Result<DecodedEvent, ProviderError> {
+    ) -> Result<DecodedEvent, EventDecodeError> {
         let message = UpstreamAdapterEvent::decode(payload).map_err(|_| invalid(sent))?;
         if self.completed || message.event.facts.len() > 64 {
-            return Err(invalid(sent));
+            return Err(invalid(sent).into());
         }
         let wire = message
             .event
@@ -55,19 +68,19 @@ impl EventDecoder {
             .transpose()?;
         if let Some(failure) = message.failure {
             if !message.event.facts.is_empty() || message.continuation.is_some() {
-                return Err(invalid(sent));
+                return Err(invalid(sent).into());
             }
             let mut error = failure_error(failure, sent)?;
             if let Some(wire) = wire {
                 error = error.with_atomic_client_events(vec![ProviderEvent::wire(wire)]);
             }
-            return Err(error);
+            return Err(EventDecodeError::Upstream(error));
         }
         if let Some(tier) = message.service_tier {
             if tier.is_empty() || tier.len() > 64 || tier.chars().any(char::is_control) {
-                return Err(invalid(sent));
+                return Err(invalid(sent).into());
             }
-            // 上游可能在完成时才把 auto 解析为实际档位；与原生观测一样保留最新值。
+            // 上游可能在完成时才把 auto 解析为实际档位；与原生观测一样保留最新值
             self.service_tier = Some(tier);
         }
         let mut facts = Vec::new();
@@ -82,7 +95,7 @@ impl EventDecoder {
                 CanonicalEvent::ContentAdded { index, kind } => {
                     self.contents += 1;
                     if self.contents > 4096 {
-                        return Err(invalid(sent));
+                        return Err(invalid(sent).into());
                     }
                     GatewayEvent::ContentAdded(ContentItem::new(
                         index,
@@ -124,7 +137,7 @@ impl EventDecoder {
                         .as_ref()
                         .is_some_and(|name| name.len() > 512 || name.chars().any(char::is_control))
                     {
-                        return Err(invalid(sent));
+                        return Err(invalid(sent).into());
                     }
                     GatewayEvent::ToolCallDelta(ToolCallDelta {
                         content_index: index,
@@ -148,7 +161,7 @@ impl EventDecoder {
                     .flatten()
                     .any(|count| count > i64::MAX as u64)
                     {
-                        return Err(invalid(sent));
+                        return Err(invalid(sent).into());
                     }
                     let usage = Usage {
                         input_tokens: usage.input_tokens,
@@ -166,7 +179,7 @@ impl EventDecoder {
                 CanonicalEvent::Completed { id, model, reason } => {
                     validate_model(model.as_deref(), sent)?;
                     if self.response_id.as_deref() != Some(id.as_str()) {
-                        return Err(invalid(sent));
+                        return Err(invalid(sent).into());
                     }
                     if let Some(cost) =
                         account.calculate_cost(self.service_tier.as_deref(), &self.usage)
@@ -195,7 +208,7 @@ impl EventDecoder {
             facts.push(fact);
         }
         if message.continuation.is_some() && !self.completed {
-            return Err(invalid(sent));
+            return Err(invalid(sent).into());
         }
         let mut event = if let Some(wire) = wire {
             ProviderEvent::canonical_with_wire(facts, wire)

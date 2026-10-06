@@ -40,6 +40,7 @@ async fn local_auth_state_stores_expires_and_deletes_process_sessions() {
             credential_fingerprint: "fingerprint".to_owned(),
         },
         expires_at: Utc::now() + TimeDelta::minutes(1),
+        absolute_expires_at: None,
     };
 
     repository

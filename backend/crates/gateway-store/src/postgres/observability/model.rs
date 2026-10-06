@@ -1,4 +1,4 @@
-//! 查询模型、校验与观测端口契约。
+//! 查询模型、校验与观测端口契约
 
 use super::*;
 use futures::stream::BoxStream;
@@ -7,7 +7,7 @@ pub(crate) const MAX_PAGE_SIZE: u16 = 100;
 pub(crate) const MAX_FILTER_BYTES: usize = 256;
 pub(crate) const MAX_SEARCH_BYTES: usize = 512;
 pub(crate) const MAX_ACCOUNT_IDS: usize = 200;
-/// 概览卡只展示最近使用的四个账号；完整账号用量由账号管理页单独查询。
+/// 概览卡只展示最近使用的四个账号；完整账号用量由账号管理页单独查询
 pub(crate) const DASHBOARD_ACCOUNT_LIMIT: u16 = 4;
 pub(crate) const DIAGNOSTIC_LIMIT: i64 = 100;
 pub(crate) const ACCOUNT_USAGE_TIMELINE_HOURS: i64 = 24;
@@ -226,9 +226,9 @@ pub struct RequestMetrics {
     pub latency_count: u64,
     pub max_latency_ms: Option<u64>,
     pub min_latency_ms: Option<u64>,
-    /// 分母：`input_tokens is not null`，即上游确实报告过 input token 事实的请求。
+    /// 分母：`input_tokens is not null`，即上游确实报告过 input token 事实的请求
     pub cache_eligible_request_count: u64,
-    /// 分子：分母集合中 `cached_tokens > 0` 的请求。
+    /// 分子：分母集合中 `cached_tokens > 0` 的请求
     pub cache_hit_request_count: u64,
     pub latency_percentiles: LatencyPercentiles,
     pub first_token_latency_percentiles: LatencyPercentiles,
@@ -245,7 +245,7 @@ pub struct RequestMetrics {
 }
 
 impl RequestMetrics {
-    /// 请求级 cache hit rate；没有 input token 事实时返回 `None`。
+    /// 请求级 cache hit rate；没有 input token 事实时返回 `None`
     #[must_use]
     pub fn cache_hit_request_rate(&self) -> Option<f64> {
         (self.cache_eligible_request_count > 0)
@@ -253,7 +253,7 @@ impl RequestMetrics {
     }
 }
 
-/// PostgreSQL `percentile_cont` 的非负、有限毫秒值；bits 保留插值小数且可安全比较。
+/// PostgreSQL `percentile_cont` 的非负、有限毫秒值；bits 保留插值小数且可安全比较
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PercentileMilliseconds(u64);
 
@@ -333,7 +333,7 @@ pub struct RequestMetricPoint {
     pub costs: Vec<CurrencyCostTotal>,
 }
 
-/// 已完整交付且由 Provider 计算费用的请求事实。
+/// 已完整交付且由 Provider 计算费用的请求事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalculatedUsageBillingFact {
     pub billing_snapshot_json: Option<serde_json::Value>,
@@ -449,7 +449,7 @@ impl ProviderAccountUsageQuery {
     }
 
     pub fn with_hourly_request_buckets(mut self) -> StoreResult<Self> {
-        // 小时图独立展示最近 24 个 UTC 小时桶，自然日统计不能限制为 24 小时。
+        // 小时图独立展示最近 24 个 UTC 小时桶，自然日统计不能限制为 24 小时
         let current_hour =
             DateTime::from_timestamp(self.range.end.timestamp().div_euclid(3600) * 3600, 0)
                 .ok_or_else(|| invalid("account request timeline exceeds supported timestamps"))?;
@@ -483,7 +483,7 @@ pub struct DashboardObservation {
     pub recent_requests: Vec<UsageListRecord>,
 }
 
-/// 使用记录列表所需的窄投影；完整执行、路由和客户端详情按 ID 单独读取。
+/// 使用记录列表所需的窄投影；完整执行、路由和客户端详情按 ID 单独读取
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
     pub client_api_key_name: Option<String>,

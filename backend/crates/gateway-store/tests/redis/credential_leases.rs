@@ -1,3 +1,5 @@
+//! 验证账号调度租约的容量、续租、失效与释放
+
 use std::time::Duration;
 
 use gateway_store::redis::{

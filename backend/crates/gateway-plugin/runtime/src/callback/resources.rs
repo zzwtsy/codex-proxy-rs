@@ -1,3 +1,5 @@
+//! 将插件自有资源回调绑定到宿主管理端口与实例身份
+
 use super::{
     admin::{encode, map_admin_error, mutation_context},
     denied, invalid,
@@ -71,7 +73,7 @@ impl PluginResources {
                         &self.owner,
                         request.resource_key,
                         CreateAccountGroup {
-                            disable_fast: false,
+                            fast_mode: gateway_core::account::FastMode::Default,
                             name: request.name,
                             description: request.description,
                             color: AccountGroupColor::parse(&request.color).ok_or_else(invalid)?,

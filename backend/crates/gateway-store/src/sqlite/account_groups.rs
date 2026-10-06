@@ -24,8 +24,8 @@ use gateway_admin::{
 };
 use gateway_core::{
     account::{
-        AccountErrorReason, AccountStatusFacts, CredentialState, QuotaAccessState, QuotaEvidence,
-        QuotaState,
+        AccountErrorReason, AccountStatusFacts, CredentialState, FastMode, QuotaAccessState,
+        QuotaEvidence, QuotaState,
     },
     metering::Decimal,
     routing::AccountGroupId,
@@ -86,7 +86,7 @@ impl SqliteAccountGroupRepository {
 
     async fn load_record(&self, id: &str) -> AdminStoreResult<Option<AccountGroupRecord>> {
         let row = sqlx::query(
-            "select g.id, g.name, g.description, g.color, g.enabled, g.disable_fast,
+            "select g.id, g.name, g.description, g.color, g.enabled, g.fast_mode,
                     g.created_at_us, g.updated_at_us,
                     (select count(*) from account_group_accounts m where m.account_group_id = g.id)
                       as member_count,
@@ -179,7 +179,7 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
             .ok_or_else(|| invalid_admin("page is too large"))?;
 
         let mut statement = sqlx::QueryBuilder::<Sqlite>::new(
-            "select g.id, g.name, g.description, g.color, g.enabled, g.disable_fast,
+            "select g.id, g.name, g.description, g.color, g.enabled, g.fast_mode,
                     g.created_at_us, g.updated_at_us,
                     (select count(*) from account_group_accounts m where m.account_group_id = g.id)
                       as member_count,
@@ -332,7 +332,7 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
             vec![
                 "name".to_owned(),
                 "description".to_owned(),
-                "disable_fast".to_owned(),
+                "fast_mode".to_owned(),
             ],
         );
         let revision = self
@@ -342,14 +342,14 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
                     let name_key = normalize_name_key(&command.name);
                     sqlx::query(
                         "insert into account_groups
-                         (id, name, description, color, disable_fast, enabled, created_at_us, updated_at_us, name_key)
+                         (id, name, description, color, fast_mode, enabled, created_at_us, updated_at_us, name_key)
                          values (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, ?7)",
                     )
                     .bind(command.id.as_str())
                     .bind(&command.name)
                     .bind(&command.description)
                     .bind(command.color.as_str())
-                    .bind(i64::from(command.disable_fast))
+                    .bind(command.fast_mode.as_str())
                     .bind(now)
                     .bind(name_key)
                     .execute(&mut **transaction)
@@ -380,7 +380,7 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
             vec![
                 "name".to_owned(),
                 "description".to_owned(),
-                "disable_fast".to_owned(),
+                "fast_mode".to_owned(),
             ],
         );
         let revision = self
@@ -390,7 +390,7 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
                     let now = Utc::now().timestamp_micros();
                     let result = sqlx::query(
                         "update account_groups set name = ?2, description = ?3, color = ?4,
-                           disable_fast = coalesce(?5, disable_fast),
+                           fast_mode = coalesce(?5, fast_mode),
                            updated_at_us = max(updated_at_us, ?6), name_key = ?7
                          where id = ?1",
                     )
@@ -398,7 +398,7 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
                     .bind(command.name)
                     .bind(command.description)
                     .bind(command.color.as_str())
-                    .bind(command.disable_fast.map(i64::from))
+                    .bind(command.fast_mode.map(FastMode::as_str))
                     .bind(now)
                     .bind(name_key)
                     .execute(&mut **transaction)
@@ -553,9 +553,11 @@ fn records_from_rows(
             )
             .map_err(|error| admin_store_error(ENTITY, error))?;
             Ok(AccountGroupRecord {
-                disable_fast: read_i64(&row, "disable_fast")
-                    .map_err(|error| admin_store_error(ENTITY, error))?
-                    != 0,
+                fast_mode: FastMode::parse(
+                    &read_text(&row, "fast_mode")
+                        .map_err(|error| admin_store_error(ENTITY, error))?,
+                )
+                .ok_or_else(|| invalid_admin("invalid account group fast mode"))?,
                 id,
                 name,
                 description,

@@ -1,3 +1,5 @@
+//! 验证 Client Key 登录、会话有效期与失效 Key 的会话撤销
+
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
@@ -281,6 +283,25 @@ impl AuthStore for MemoryKeyAuthStore {
             .expect("client sessions")
             .insert(session_id.to_owned(), session.clone());
         Ok(())
+    }
+
+    async fn renew_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSession,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> AdminStoreResult<Option<AuthSession>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(session_id) {
+            if session.expires_at <= chrono::Utc::now() {
+                return Ok(None);
+            }
+            if session == expected {
+                session.expires_at = expires_at;
+            }
+            return Ok(Some(session.clone()));
+        }
+        Ok(None)
     }
 
     async fn delete_session(&self, session_id: &str) -> AdminStoreResult<Option<AuthSession>> {

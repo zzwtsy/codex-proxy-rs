@@ -1,3 +1,5 @@
+//! 编译插件观察订阅，投影请求事实并调度有界事件通知
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -82,12 +84,15 @@ impl ObserverEntry {
                             .result
                             .as_object()
                             .is_some_and(serde_json::Map::is_empty)) => {}
-            Ok(_) => tracing::warn!(
-                plugin_id = self.plugin_id,
-                instance_id = self.instance_id,
-                request_id,
-                "插件观察返回了无效结果"
-            ),
+            Ok(_) => {
+                self.session.invalid_response(Stage::Observation);
+                tracing::warn!(
+                    plugin_id = self.plugin_id,
+                    instance_id = self.instance_id,
+                    request_id,
+                    "插件观察返回了无效结果"
+                );
+            }
             Err(error) => {
                 tracing::warn!(plugin_id = self.plugin_id, instance_id = self.instance_id, request_id, %error, "插件观察失败")
             }

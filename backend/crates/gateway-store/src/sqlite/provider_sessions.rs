@@ -7,8 +7,9 @@ use futures::future::BoxFuture;
 use gateway_core::{
     account::ProviderAccountId,
     provider_ports::{
-        ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionExclusionPort,
-        ProviderSessionExclusions, ProviderStoreError, ProviderStoreErrorKind,
+        ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionAlias,
+        ProviderSessionBinding, ProviderSessionExclusionPort, ProviderSessionExclusions,
+        ProviderStoreError, ProviderStoreErrorKind,
     },
     routing::ProviderKind,
 };
@@ -45,6 +46,15 @@ impl SqliteProviderSessionAffinityRepository {
             .map_err(|_| provider_invalid("encode provider session affinity key"))
     }
 
+    fn alias_key(
+        provider_kind: &ProviderKind,
+        alias: &ProviderSessionAffinityKey,
+    ) -> Result<String, ProviderStoreError> {
+        let scope = format!("{}\0{}", provider_kind.as_str(), alias.expose_to_store());
+        resource_fingerprint("provider session alias", &scope)
+            .map_err(|_| provider_invalid("encode provider session alias key"))
+    }
+
     fn ttl(ttl: Duration) -> Result<i64, ProviderStoreError> {
         if ttl.is_zero() || ttl > MAX_SESSION_STATE_TTL {
             return Err(provider_invalid("validate provider session affinity TTL"));
@@ -58,21 +68,23 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
         &'a self,
         provider_kind: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-    ) -> BoxFuture<'a, Result<Option<ProviderAccountId>, ProviderStoreError>> {
+    ) -> BoxFuture<'a, Result<Option<ProviderSessionBinding>, ProviderStoreError>> {
         Box::pin(async move {
             let fingerprint = Self::key(provider_kind, key)?;
             let now = datetime_to_micros(Utc::now());
-            let account_id = sqlx::query_scalar::<_, String>(
-                "SELECT account_id FROM provider_session_affinity                  WHERE session_fingerprint = ? AND expires_at_us > ?",
+            let binding = sqlx::query_as::<_, (String, String)>(
+                "SELECT account_id, revision FROM provider_session_affinity
+                 WHERE session_fingerprint = ? AND expires_at_us > ?",
             )
             .bind(&fingerprint)
             .bind(now)
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| provider_unavailable("load provider session affinity"))?;
-            if account_id.is_none() {
+            if binding.is_none() {
                 sqlx::query(
-                    "DELETE FROM provider_session_affinity                      WHERE session_fingerprint = ? AND expires_at_us <= ?",
+                    "DELETE FROM provider_session_affinity
+                     WHERE session_fingerprint = ? AND expires_at_us <= ?",
                 )
                 .bind(fingerprint)
                 .bind(now)
@@ -80,124 +92,13 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
                 .await
                 .map_err(|_| provider_unavailable("clean expired provider session affinity"))?;
             }
-            account_id
-                .map(|account_id| {
-                    ProviderAccountId::new(account_id)
-                        .map_err(|_| provider_invalid("decode provider session affinity"))
+            binding
+                .map(|(account_id, revision)| {
+                    let account_id = ProviderAccountId::new(account_id)
+                        .map_err(|_| provider_invalid("decode provider session affinity"))?;
+                    ProviderSessionBinding::new(account_id, revision)
                 })
                 .transpose()
-        })
-    }
-
-    fn bind<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        account_id: &'a ProviderAccountId,
-        ttl: Duration,
-    ) -> BoxFuture<'a, Result<(), ProviderStoreError>> {
-        Box::pin(async move {
-            let fingerprint = Self::key(provider_kind, key)?;
-            let ttl = Self::ttl(ttl)?;
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("bind provider session affinity"))?;
-            super::acquire_write_lock(&mut transaction)
-                .await
-                .map_err(|_| provider_unavailable("bind provider session affinity"))?;
-            let expires_at = datetime_to_micros(Utc::now())
-                .checked_add(ttl)
-                .ok_or_else(|| provider_invalid("validate provider session affinity expiry"))?;
-            sqlx::query(
-                "INSERT INTO provider_session_affinity                  (session_fingerprint, account_id, revision, expires_at_us) VALUES (?, ?, 1, ?)                  ON CONFLICT (session_fingerprint) DO UPDATE SET                    account_id = excluded.account_id, revision = provider_session_affinity.revision + 1,                    expires_at_us = excluded.expires_at_us",
-            )
-            .bind(fingerprint)
-            .bind(account_id.as_str())
-            .bind(expires_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| provider_unavailable("bind provider session affinity"))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("bind provider session affinity"))
-        })
-    }
-
-    fn claim_or_load<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        candidate_account_id: &'a ProviderAccountId,
-        ttl: Duration,
-    ) -> BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>> {
-        Box::pin(async move {
-            let fingerprint = Self::key(provider_kind, key)?;
-            let candidate = candidate_account_id.as_str();
-            let ttl = Self::ttl(ttl)?;
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("claim provider session affinity"))?;
-            super::acquire_write_lock(&mut transaction)
-                .await
-                .map_err(|_| provider_unavailable("claim provider session affinity"))?;
-            let now = datetime_to_micros(Utc::now());
-            let expires_at = now
-                .checked_add(ttl)
-                .ok_or_else(|| provider_invalid("validate provider session affinity expiry"))?;
-            sqlx::query(
-                "INSERT INTO provider_session_affinity                  (session_fingerprint, account_id, revision, expires_at_us) VALUES (?, ?, 1, ?)                  ON CONFLICT (session_fingerprint) DO NOTHING",
-            )
-            .bind(&fingerprint)
-            .bind(candidate)
-            .bind(expires_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| provider_unavailable("claim provider session affinity"))?;
-            let mut account_id: Option<String> = sqlx::query_scalar(
-                "UPDATE provider_session_affinity                  SET account_id = ?, revision = revision + 1, expires_at_us = ?                  WHERE session_fingerprint = ? AND expires_at_us <= ?                  RETURNING account_id",
-            )
-            .bind(candidate)
-            .bind(expires_at)
-            .bind(&fingerprint)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|_| provider_unavailable("claim provider session affinity"))?;
-            if account_id.is_none() {
-                account_id = sqlx::query_scalar(
-                    "SELECT account_id FROM provider_session_affinity WHERE session_fingerprint = ?",
-                )
-                .bind(&fingerprint)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|_| provider_unavailable("load provider session affinity"))?;
-            }
-            if account_id.as_deref() == Some(candidate) {
-                sqlx::query(
-                    "UPDATE provider_session_affinity SET expires_at_us = ?, revision = revision + 1                      WHERE session_fingerprint = ? AND expires_at_us > ? AND account_id = ?",
-                )
-                .bind(expires_at)
-                .bind(&fingerprint)
-                .bind(now)
-                .bind(candidate)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|_| provider_unavailable("refresh provider session affinity"))?;
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("claim provider session affinity"))?;
-            ProviderAccountId::new(
-                account_id
-                    .ok_or_else(|| provider_unavailable("claim provider session affinity"))?,
-            )
-            .map_err(|_| provider_invalid("decode provider session affinity"))
         })
     }
 
@@ -205,10 +106,10 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
         &'a self,
         provider_kind: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-        expected_account_id: &'a ProviderAccountId,
-        replacement_account_id: &'a ProviderAccountId,
+        expected: Option<&'a ProviderSessionBinding>,
+        account_id: &'a ProviderAccountId,
         ttl: Duration,
-    ) -> BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>> {
+    ) -> BoxFuture<'a, Result<Option<ProviderSessionBinding>, ProviderStoreError>> {
         Box::pin(async move {
             let fingerprint = Self::key(provider_kind, key)?;
             let ttl = Self::ttl(ttl)?;
@@ -216,68 +117,150 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
                 .pool
                 .begin()
                 .await
-                .map_err(|_| provider_unavailable("compare provider session affinity"))?;
+                .map_err(|_| provider_unavailable("admit provider session affinity"))?;
             super::acquire_write_lock(&mut transaction)
                 .await
-                .map_err(|_| provider_unavailable("compare provider session affinity"))?;
+                .map_err(|_| provider_unavailable("admit provider session affinity"))?;
             let now = datetime_to_micros(Utc::now());
+            let current = sqlx::query_as::<_, (String, String)>(
+                "SELECT account_id, revision FROM provider_session_affinity
+                 WHERE session_fingerprint = ? AND expires_at_us > ?",
+            )
+            .bind(&fingerprint)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| provider_unavailable("load provider session affinity"))?
+            .map(|(current_account, revision)| {
+                let current_account = ProviderAccountId::new(current_account)
+                    .map_err(|_| provider_invalid("decode provider session affinity"))?;
+                ProviderSessionBinding::new(current_account, revision)
+            })
+            .transpose()?;
+
+            if current.as_ref() != expected {
+                return Ok(None);
+            }
+
+            let binding = match expected.filter(|binding| binding.account_id() == account_id) {
+                Some(binding) => binding.clone(),
+                None => ProviderSessionBinding::new(
+                    account_id.clone(),
+                    format!("a{}", &Uuid::new_v4().simple().to_string()[1..]),
+                )?,
+            };
             let expires_at = now
                 .checked_add(ttl)
                 .ok_or_else(|| provider_invalid("validate provider session affinity expiry"))?;
             sqlx::query(
-                "INSERT INTO provider_session_affinity                  (session_fingerprint, account_id, revision, expires_at_us) VALUES (?, ?, 1, ?)                  ON CONFLICT (session_fingerprint) DO NOTHING",
+                "INSERT INTO provider_session_affinity
+                 (session_fingerprint, account_id, revision, expires_at_us)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT (session_fingerprint) DO UPDATE SET
+                   account_id = excluded.account_id,
+                   revision = excluded.revision,
+                   expires_at_us = excluded.expires_at_us",
             )
-            .bind(&fingerprint)
-            .bind(replacement_account_id.as_str())
+            .bind(fingerprint)
+            .bind(binding.account_id().as_str())
+            .bind(binding.revision())
             .bind(expires_at)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("compare provider session affinity"))?;
-            let mut account_id: Option<String> = sqlx::query_scalar(
-                "UPDATE provider_session_affinity                  SET account_id = ?, revision = revision + 1, expires_at_us = ?                  WHERE session_fingerprint = ? AND (expires_at_us <= ? OR account_id = ?)                  RETURNING account_id",
-            )
-            .bind(replacement_account_id.as_str())
-            .bind(expires_at)
-            .bind(&fingerprint)
-            .bind(now)
-            .bind(expected_account_id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|_| provider_unavailable("compare provider session affinity"))?;
-            if account_id.is_none() {
-                account_id = sqlx::query_scalar(
-                    "SELECT account_id FROM provider_session_affinity WHERE session_fingerprint = ?",
-                )
-                .bind(&fingerprint)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|_| provider_unavailable("load provider session affinity"))?;
-            }
+            .map_err(|_| provider_unavailable("admit provider session affinity"))?;
             transaction
                 .commit()
                 .await
-                .map_err(|_| provider_unavailable("compare provider session affinity"))?;
-            ProviderAccountId::new(
-                account_id
-                    .ok_or_else(|| provider_unavailable("compare provider session affinity"))?,
-            )
-            .map_err(|_| provider_invalid("decode provider session affinity"))
+                .map_err(|_| provider_unavailable("admit provider session affinity"))?;
+            Ok(Some(binding))
         })
     }
 
-    fn clear<'a>(
+    fn load_alias<'a>(
         &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+    ) -> BoxFuture<'a, Result<Option<ProviderSessionAlias>, ProviderStoreError>> {
+        Box::pin(async move {
+            let fingerprint = Self::alias_key(provider, alias)?;
+            let now = datetime_to_micros(Utc::now());
+            let value = sqlx::query_as::<_, (String, i64)>(
+                "SELECT session_key, follow_only FROM provider_session_aliases
+                 WHERE alias_fingerprint = ? AND expires_at_us > ?",
+            )
+            .bind(&fingerprint)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| provider_unavailable("load provider session alias"))?;
+            if value.is_none() {
+                sqlx::query(
+                    "DELETE FROM provider_session_aliases
+                     WHERE alias_fingerprint = ? AND expires_at_us <= ?",
+                )
+                .bind(fingerprint)
+                .bind(now)
+                .execute(&self.pool)
+                .await
+                .map_err(|_| provider_unavailable("clean expired provider session alias"))?;
+            }
+            value
+                .map(|(session_key, follow_only)| {
+                    Ok(ProviderSessionAlias {
+                        session_key: ProviderSessionAffinityKey::try_new(session_key)?,
+                        follow_only: follow_only != 0,
+                    })
+                })
+                .transpose()
+        })
+    }
+
+    fn bind_alias<'a>(
+        &'a self,
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+        session: &'a ProviderSessionAlias,
+        ttl: Duration,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
         Box::pin(async move {
-            let fingerprint = Self::key(provider_kind, key)?;
-            let result =
-                sqlx::query("DELETE FROM provider_session_affinity WHERE session_fingerprint = ?")
-                    .bind(fingerprint)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|_| provider_unavailable("clear provider session affinity"))?;
+            let fingerprint = Self::alias_key(provider, alias)?;
+            let ttl = Self::ttl(ttl)?;
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| provider_unavailable("bind provider session alias"))?;
+            super::acquire_write_lock(&mut transaction)
+                .await
+                .map_err(|_| provider_unavailable("bind provider session alias"))?;
+            let now = datetime_to_micros(Utc::now());
+            let expires_at = now
+                .checked_add(ttl)
+                .ok_or_else(|| provider_invalid("validate provider session alias expiry"))?;
+            let result = sqlx::query(
+                "INSERT INTO provider_session_aliases
+                 (alias_fingerprint, session_key, follow_only, expires_at_us)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT (alias_fingerprint) DO UPDATE SET
+                   session_key = excluded.session_key,
+                   follow_only = excluded.follow_only,
+                   expires_at_us = excluded.expires_at_us
+                 WHERE provider_session_aliases.expires_at_us <= ?
+                    OR (provider_session_aliases.session_key = excluded.session_key
+                        AND provider_session_aliases.follow_only = excluded.follow_only)",
+            )
+            .bind(fingerprint)
+            .bind(session.session_key.expose_to_store())
+            .bind(i64::from(session.follow_only))
+            .bind(expires_at)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| provider_unavailable("bind provider session alias"))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| provider_unavailable("bind provider session alias"))?;
             Ok(result.rows_affected() > 0)
         })
     }

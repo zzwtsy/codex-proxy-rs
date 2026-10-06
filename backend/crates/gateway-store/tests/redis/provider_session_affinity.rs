@@ -1,3 +1,5 @@
+//! 验证会话绑定的并发认领、版本比较、过期和存储损坏边界
+
 use std::time::Duration;
 
 use gateway_core::account::ProviderAccountId;
@@ -8,152 +10,153 @@ use redis::aio::ConnectionManager;
 use uuid::Uuid;
 
 #[tokio::test]
-async fn session_affinity_should_round_trip_without_exposing_the_raw_session_key() {
-    let Some((repository, mut connection, namespace)) = affinity_repository().await else {
+async fn concurrent_claims_admit_exactly_one_account() {
+    let Some((repo, mut connection, namespace)) = affinity_repository().await else {
         return;
     };
-    let provider = ProviderKind::new("openai").expect("provider");
-    let key = ProviderSessionAffinityKey::try_new("session-secret-value").expect("affinity key");
-    let account = ProviderAccountId::new("acct_first").expect("account");
-
-    repository
-        .bind(&provider, &key, &account, Duration::from_secs(60))
-        .await
-        .expect("bind affinity");
-
-    assert_eq!(
-        repository
-            .load(&provider, &key)
-            .await
-            .expect("load affinity"),
-        Some(account)
+    let provider = ProviderKind::new("openai").unwrap();
+    let key = ProviderSessionAffinityKey::try_new("secret-session").unwrap();
+    let first = ProviderAccountId::new("acct_first").unwrap();
+    let second = ProviderAccountId::new("acct_second").unwrap();
+    let (a, b) = tokio::join!(
+        repo.compare_and_bind(&provider, &key, None, &first, Duration::from_secs(60)),
+        repo.compare_and_bind(&provider, &key, None, &second, Duration::from_secs(60))
     );
-    let keys = redis::cmd("KEYS")
-        .arg(format!("{namespace}:*"))
-        .query_async::<Vec<String>>(&mut connection)
-        .await
-        .expect("list affinity keys");
-    assert_eq!(keys.len(), 1);
-    assert!(!keys[0].contains("session-secret-value"));
-}
-
-#[tokio::test]
-async fn session_affinity_should_overwrite_the_previous_account() {
-    let Some((repository, _connection, _namespace)) = affinity_repository().await else {
-        return;
-    };
-    let provider = ProviderKind::new("openai").expect("provider");
-    let key = ProviderSessionAffinityKey::try_new("overwrite-session").expect("affinity key");
-    let first = ProviderAccountId::new("acct_first").expect("first account");
-    let second = ProviderAccountId::new("acct_second").expect("second account");
-
-    repository
-        .bind(&provider, &key, &first, Duration::from_secs(60))
-        .await
-        .expect("bind first affinity");
-    repository
-        .bind(&provider, &key, &second, Duration::from_secs(60))
-        .await
-        .expect("overwrite affinity");
-
-    assert_eq!(
-        repository
-            .load(&provider, &key)
-            .await
-            .expect("load affinity"),
-        Some(second)
-    );
-}
-
-#[tokio::test]
-async fn session_affinity_claim_should_keep_the_first_account() {
-    let Some((repository, _connection, _namespace)) = affinity_repository().await else {
-        return;
-    };
-    let provider = ProviderKind::new("openai").expect("provider");
-    let key = ProviderSessionAffinityKey::try_new("claim-session").expect("affinity key");
-    let first = ProviderAccountId::new("acct_first").expect("first account");
-    let second = ProviderAccountId::new("acct_second").expect("second account");
-
-    let first_winner = repository
-        .claim_or_load(&provider, &key, &first, Duration::from_secs(60))
-        .await
-        .expect("claim first affinity");
-    let second_winner = repository
-        .claim_or_load(&provider, &key, &second, Duration::from_secs(60))
-        .await
-        .expect("load existing affinity");
-
-    assert_eq!((first_winner, second_winner), (first.clone(), first));
-}
-
-#[tokio::test]
-async fn session_affinity_compare_should_not_replace_a_newer_winner() {
-    let Some((repository, _connection, _namespace)) = affinity_repository().await else {
-        return;
-    };
-    let provider = ProviderKind::new("openai").expect("provider");
-    let key = ProviderSessionAffinityKey::try_new("compare-session").expect("affinity key");
-    let first = ProviderAccountId::new("acct_first").expect("first account");
-    let second = ProviderAccountId::new("acct_second").expect("second account");
-    let stale = ProviderAccountId::new("acct_stale").expect("stale account");
-    repository
-        .bind(&provider, &key, &first, Duration::from_secs(60))
-        .await
-        .expect("seed affinity");
-
-    let migrated = repository
-        .compare_and_bind(&provider, &key, &first, &second, Duration::from_secs(60))
-        .await
-        .expect("migrate expected affinity");
-    let stale_result = repository
-        .compare_and_bind(&provider, &key, &first, &stale, Duration::from_secs(60))
-        .await
-        .expect("reject stale affinity migration");
-
-    assert_eq!((migrated, stale_result), (second.clone(), second));
-}
-
-#[tokio::test]
-async fn session_affinity_should_apply_ttl_and_support_explicit_clear() {
-    let Some((repository, mut connection, namespace)) = affinity_repository().await else {
-        return;
-    };
-    let provider = ProviderKind::new("openai").expect("provider");
-    let key = ProviderSessionAffinityKey::try_new("ttl-session").expect("affinity key");
-    let account = ProviderAccountId::new("acct_ttl").expect("account");
-
-    repository
-        .bind(&provider, &key, &account, Duration::from_secs(60))
-        .await
-        .expect("bind affinity");
-    let redis_key = redis::cmd("KEYS")
-        .arg(format!("{namespace}:*"))
-        .query_async::<Vec<String>>(&mut connection)
-        .await
-        .expect("list affinity keys")
+    let winners = [a.unwrap(), b.unwrap()]
         .into_iter()
-        .next()
-        .expect("affinity key exists");
-    let ttl = redis::cmd("PTTL")
-        .arg(redis_key)
-        .query_async::<i64>(&mut connection)
-        .await
-        .expect("read affinity TTL");
-    assert!((1..=60_000).contains(&ttl));
-
-    assert!(
-        repository
-            .clear(&provider, &key)
-            .await
-            .expect("clear affinity")
-    );
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(winners.len(), 1);
     assert_eq!(
-        repository
-            .load(&provider, &key)
+        repo.load(&provider, &key).await.unwrap().as_ref(),
+        winners.first()
+    );
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{namespace}:*"))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    assert!(!keys[0].contains("secret-session"));
+    let ttl: i64 = redis::cmd("PTTL")
+        .arg(&keys[0])
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((1..=60_000).contains(&ttl));
+}
+
+#[tokio::test]
+async fn stale_revision_cannot_overwrite_an_account_that_returned_to_the_session() {
+    let Some((repo, _, _)) = affinity_repository().await else {
+        return;
+    };
+    let provider = ProviderKind::new("openai").unwrap();
+    let key = ProviderSessionAffinityKey::try_new("aba-session").unwrap();
+    let a = ProviderAccountId::new("acct_a").unwrap();
+    let b = ProviderAccountId::new("acct_b").unwrap();
+    let ttl = Duration::from_secs(60);
+    let first = repo
+        .compare_and_bind(&provider, &key, None, &a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = repo
+        .compare_and_bind(&provider, &key, Some(&first), &b, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let third = repo
+        .compare_and_bind(&provider, &key, Some(&second), &a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.revision(), third.revision());
+    assert!(
+        repo.compare_and_bind(&provider, &key, Some(&first), &b, ttl)
             .await
-            .expect("load cleared affinity"),
-        None
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(repo.load(&provider, &key).await.unwrap(), Some(third));
+}
+
+#[tokio::test]
+async fn renewal_preserves_revision_but_expiration_requires_fresh_claim() {
+    let Some((repo, mut connection, namespace)) = affinity_repository().await else {
+        return;
+    };
+    let provider = ProviderKind::new("openai").unwrap();
+    let key = ProviderSessionAffinityKey::try_new("expired-session").unwrap();
+    let a = ProviderAccountId::new("acct_a").unwrap();
+    let ttl = Duration::from_secs(60);
+    let first = repo
+        .compare_and_bind(&provider, &key, None, &a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let renewed = repo
+        .compare_and_bind(&provider, &key, Some(&first), &a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, renewed);
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{namespace}:*"))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: bool = redis::cmd("PEXPIRE")
+        .arg(&keys[0])
+        .arg(0)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        repo.compare_and_bind(&provider, &key, Some(&first), &a, ttl)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(repo.load(&provider, &key).await.unwrap().is_none());
+    let fresh = repo
+        .compare_and_bind(&provider, &key, None, &a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.revision(), fresh.revision());
+}
+
+#[tokio::test]
+async fn damaged_binding_is_an_error_and_cannot_be_claimed_as_absent() {
+    let Some((repo, mut connection, namespace)) = affinity_repository().await else {
+        return;
+    };
+    let provider = ProviderKind::new("openai").unwrap();
+    let key = ProviderSessionAffinityKey::try_new("damaged-session").unwrap();
+    let a = ProviderAccountId::new("acct_a").unwrap();
+    let ttl = Duration::from_secs(60);
+    repo.compare_and_bind(&provider, &key, None, &a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{namespace}:*"))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg(&keys[0])
+        .arg("invalid-binding")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(repo.load(&provider, &key).await.is_err());
+    assert!(
+        repo.compare_and_bind(&provider, &key, None, &a, ttl)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -163,13 +166,75 @@ async fn affinity_repository() -> Option<(
     String,
 )> {
     let redis_url = crate::support::test_env("CPR_TEST_REDIS_URL")?;
-    let client = redis::Client::open(redis_url).expect("valid CPR_TEST_REDIS_URL");
-    let connection = client
+    let connection = redis::Client::open(redis_url)
+        .unwrap()
         .get_connection_manager()
         .await
-        .expect("connect test Redis");
+        .unwrap();
     let namespace = format!("gateway-store-affinity-test-{}", Uuid::new_v4());
-    let repository = RedisProviderSessionAffinityRepository::new(connection.clone(), &namespace)
-        .expect("valid test namespace");
+    let repository =
+        RedisProviderSessionAffinityRepository::new(connection.clone(), &namespace).unwrap();
     Some((repository, connection, namespace))
+}
+
+#[tokio::test]
+async fn turn_alias_cannot_be_reassigned_and_follows_session_migration() {
+    let Some((repo, _, _)) = affinity_repository().await else {
+        return;
+    };
+    let provider = ProviderKind::new("openai").unwrap();
+    let turn = ProviderSessionAffinityKey::try_new("client-turn").unwrap();
+    let session = ProviderSessionAffinityKey::try_new("client-session").unwrap();
+    let other = ProviderSessionAffinityKey::try_new("other-session").unwrap();
+    let a = ProviderAccountId::new("acct_a").unwrap();
+    let b = ProviderAccountId::new("acct_b").unwrap();
+    let ttl = Duration::from_secs(60);
+    let alias = gateway_core::provider_ports::ProviderSessionAlias {
+        session_key: session.clone(),
+        follow_only: true,
+    };
+    let other_alias = gateway_core::provider_ports::ProviderSessionAlias {
+        session_key: other,
+        follow_only: true,
+    };
+    assert!(
+        repo.bind_alias(&provider, &turn, &alias, ttl)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repo
+            .bind_alias(&provider, &turn, &other_alias, ttl)
+            .await
+            .unwrap()
+    );
+    let different_role = gateway_core::provider_ports::ProviderSessionAlias {
+        session_key: session.clone(),
+        follow_only: false,
+    };
+    assert!(
+        !repo
+            .bind_alias(&provider, &turn, &different_role, ttl)
+            .await
+            .unwrap()
+    );
+    let first = repo
+        .compare_and_bind(&provider, &session, None, &a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    repo.compare_and_bind(&provider, &session, Some(&first), &b, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    let target = repo.load_alias(&provider, &turn).await.unwrap().unwrap();
+    assert!(target.follow_only);
+    assert_eq!(
+        repo.load(&provider, &target.session_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .account_id(),
+        &b
+    );
 }

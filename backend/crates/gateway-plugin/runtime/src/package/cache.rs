@@ -1,3 +1,5 @@
+//! 将已验证插件包解压到独立私有目录，并持有可执行资源
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -6,7 +8,7 @@ use std::{
 
 use super::{PackageError, ValidatedPackage};
 
-/// 每次准备创建独立私有目录；存储中的包体为权威，缓存不会被原地升级。
+/// 每次准备创建独立私有目录；存储中的包体为权威，缓存不会被原地升级
 pub struct PreparedPackage {
     directory: tempfile::TempDir,
     executable: PathBuf,
@@ -14,13 +16,9 @@ pub struct PreparedPackage {
 }
 
 impl ValidatedPackage {
-    pub fn prepare(
-        self: &Arc<Self>,
-        cache: &Path,
-        host_version: &semver::Version,
-    ) -> Result<PreparedPackage, PackageError> {
+    pub fn prepare(self: &Arc<Self>, cache: &Path) -> Result<PreparedPackage, PackageError> {
         self.manifest
-            .package_for(host_version, std::env::consts::OS, std::env::consts::ARCH)?;
+            .package_for_platform(std::env::consts::OS, std::env::consts::ARCH)?;
         fs::create_dir_all(cache).map_err(|_| PackageError::Cache)?;
         let directory = tempfile::Builder::new()
             .prefix("plugin-")

@@ -1,3 +1,5 @@
+//! 插件模型路由与账号调度调用，以及请求事实的线协议投影
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -147,9 +149,13 @@ async fn route_with_entry(
         .await
         .map_err(|_| ())?;
     if !reply.payload.is_empty() {
+        invocation.session.invalid_response(Stage::Routing);
         return Err(());
     }
-    let decision: WireModelRouteDecision = serde_json::from_value(reply.result).map_err(|_| ())?;
+    let decision: WireModelRouteDecision = invocation
+        .session
+        .decode_response(Stage::Routing, reply.result)
+        .map_err(|_| ())?;
     match decision {
         WireModelRouteDecision::Unhandled => Ok(ModelRouteDecision::Unhandled),
         WireModelRouteDecision::Reject => Ok(ModelRouteDecision::Reject),
@@ -229,10 +235,13 @@ async fn schedule_with_entry(
         .await
         .map_err(|_| ())?;
     if !reply.payload.is_empty() {
+        invocation.session.invalid_response(Stage::Scheduling);
         return Err(());
     }
-    let decision: WireAccountScheduleDecision =
-        serde_json::from_value(reply.result).map_err(|_| ())?;
+    let decision: WireAccountScheduleDecision = invocation
+        .session
+        .decode_response(Stage::Scheduling, reply.result)
+        .map_err(|_| ())?;
     match decision {
         WireAccountScheduleDecision::Delegate => Ok(AccountScheduleDecision::Delegate),
         WireAccountScheduleDecision::Reject => Ok(AccountScheduleDecision::Reject),

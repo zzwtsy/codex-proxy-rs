@@ -1,3 +1,5 @@
+//! 插件管理页面资源读取、请求转发与响应解码
+
 mod callback;
 mod registration;
 mod validation;
@@ -108,11 +110,13 @@ impl ManagementEntry {
             .map_err(|_| {
                 AdminError::unavailable("插件管理调用未完成；副作用可能已发生，请查询后再重试")
             })?;
-        decode_response(reply, &route.response_content_types, limits)
+        decode_response(reply, &route.response_content_types, limits).inspect_err(|_| {
+            self.session.invalid_response(Stage::Management);
+        })
     }
 }
 
-// 管理 API 与公开回调共用类型和正文预算校验，完整响应头由 HTTP 入口解码。
+// 管理 API 与公开回调共用类型和正文预算校验，完整响应头由 HTTP 入口解码
 fn decode_response(
     reply: RpcReply,
     allowed_content_types: &[String],

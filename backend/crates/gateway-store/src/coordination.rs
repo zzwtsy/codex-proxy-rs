@@ -60,6 +60,7 @@ impl SessionSubjectRecord {
 pub struct AuthSessionRecord {
     pub subject: SessionSubjectRecord,
     pub expires_at: DateTime<Utc>,
+    pub absolute_expires_at: Option<DateTime<Utc>>,
 }
 
 impl AuthSessionRecord {
@@ -70,6 +71,14 @@ impl AuthSessionRecord {
                 entity: "authentication state",
                 message: "session expiry must be in the future".to_owned(),
             });
+        }
+        if self
+            .absolute_expires_at
+            .is_some_and(|limit| self.expires_at > limit)
+        {
+            return Err(auth_state_invalid(
+                "session expiry is outside its absolute lifetime",
+            ));
         }
         Ok(())
     }
@@ -82,6 +91,12 @@ pub trait AuthStateRepository: Send + Sync {
     async fn store_session(&self, session_id: &str, session: &AuthSessionRecord)
     -> StoreResult<()>;
     async fn delete_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>>;
+    async fn renew_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSessionRecord,
+        expires_at: DateTime<Utc>,
+    ) -> StoreResult<Option<AuthSessionRecord>>;
     async fn consume_login_attempt(
         &self,
         source: &str,
@@ -138,6 +153,39 @@ impl AuthStateRepository for LocalAuthStateRepository {
         let mut state = self.state.lock().await;
         let session = state.sessions.remove(&key);
         Ok(session.filter(|session| session.expires_at > Utc::now()))
+    }
+
+    async fn renew_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSessionRecord,
+        expires_at: DateTime<Utc>,
+    ) -> StoreResult<Option<AuthSessionRecord>> {
+        let Some(absolute_expires_at) = expected.absolute_expires_at else {
+            return Err(auth_state_invalid("session has no renewable lifetime"));
+        };
+        if expires_at < expected.expires_at || expires_at > absolute_expires_at {
+            return Err(auth_state_invalid(
+                "session renewal is outside its lifetime",
+            ));
+        }
+
+        let mut renewed = expected.clone();
+        renewed.expires_at = expires_at;
+        renewed.validate()?;
+
+        let key = resource_fingerprint("authentication session", session_id)?;
+        let now = Utc::now();
+        let mut state = self.state.lock().await;
+        state.sessions.retain(|_, session| session.expires_at > now);
+        match state.sessions.get(&key) {
+            Some(current) if current == expected => {
+                state.sessions.insert(key, renewed.clone());
+                Ok(Some(renewed))
+            }
+            Some(current) => Ok(Some(current.clone())),
+            None => Ok(None),
+        }
     }
 
     async fn consume_login_attempt(

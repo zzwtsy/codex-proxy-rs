@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 
 use gateway_core::{
-    account::ProviderAccountId,
+    account::{FastMode, ProviderAccountId},
     routing::snapshot::{
         SnapshotAccountGroupFacts, SnapshotAccountGroupMemberFacts, SnapshotClientPolicyFacts,
         SnapshotFacts, SnapshotProviderAccountFacts, SnapshotStoreError,
@@ -96,7 +96,7 @@ pub struct RuntimeSnapshotData {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotAccountGroupData {
-    pub disable_fast: bool,
+    pub fast_mode: FastMode,
     pub id: AccountGroupId,
     pub name: String,
     pub enabled: bool,
@@ -156,7 +156,7 @@ pub(crate) fn snapshot_data_into_facts(
         .into_iter()
         .map(|group| {
             SnapshotAccountGroupFacts::new(group.id, group.name, group.enabled)
-                .with_disable_fast(group.disable_fast)
+                .with_fast_mode(group.fast_mode)
         })
         .collect();
     let provider_accounts = data

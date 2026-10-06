@@ -156,19 +156,21 @@ impl RuntimeSnapshotRepository for SqliteRuntimeSnapshotRepository {
             .collect::<StoreResult<Vec<_>>>()?;
 
         let group_rows =
-            sqlx::query("select id, name, enabled, disable_fast from account_groups order by id")
+            sqlx::query("select id, name, enabled, fast_mode from account_groups order by id")
                 .fetch_all(&mut *transaction)
                 .await
                 .map_err(|_| sqlite_unavailable("load SQLite snapshot account groups"))?;
         let account_groups = group_rows
             .into_iter()
             .map(|row| {
+                let fast_mode = read_string(&row, "fast_mode")?;
                 Ok(SnapshotAccountGroupData {
                     id: gateway_core::routing::AccountGroupId::new(read_string(&row, "id")?)
                         .map_err(|_| invalid("persisted account group ID is invalid"))?,
                     name: read_string(&row, "name")?,
                     enabled: read_i64(&row, "enabled")? != 0,
-                    disable_fast: read_i64(&row, "disable_fast")? != 0,
+                    fast_mode: gateway_core::account::FastMode::parse(&fast_mode)
+                        .ok_or_else(|| invalid("persisted account group fast mode is invalid"))?,
                 })
             })
             .collect::<StoreResult<Vec<_>>>()?;

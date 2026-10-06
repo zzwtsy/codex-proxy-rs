@@ -1,4 +1,4 @@
-//! Admin 认证与设置 adapter。
+//! Admin 认证与设置 adapter
 
 use super::*;
 use std::{collections::BTreeMap, sync::Arc};
@@ -586,28 +586,24 @@ impl AuthStore for AuthStoreAdapter {
     }
 
     async fn store_session(&self, session_id: &str, session: &AuthSession) -> AdminStoreResult<()> {
-        let subject = match &session.subject {
-            SessionSubject::Admin {
-                admin_user_id,
-                credential_fingerprint,
-            } => SessionSubjectRecord::Admin {
-                admin_user_id: admin_user_id.clone(),
-                credential_fingerprint: credential_fingerprint.clone(),
-            },
-            SessionSubject::Key { client_key_id } => SessionSubjectRecord::Key {
-                client_key_id: client_key_id.as_str().to_owned(),
-            },
-        };
         self.state
-            .store_session(
-                session_id,
-                &AuthSessionRecord {
-                    subject,
-                    expires_at: session.expires_at,
-                },
-            )
+            .store_session(session_id, &auth_session_record(session))
             .await
             .map_err(|error| admin_store_error("authentication session", error))
+    }
+
+    async fn renew_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSession,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> AdminStoreResult<Option<AuthSession>> {
+        self.state
+            .renew_session(session_id, &auth_session_record(expected), expires_at)
+            .await
+            .map_err(|error| admin_store_error("authentication session renewal", error))?
+            .map(auth_session)
+            .transpose()
     }
 
     async fn delete_session(&self, session_id: &str) -> AdminStoreResult<Option<AuthSession>> {
@@ -698,5 +694,26 @@ fn auth_session(record: AuthSessionRecord) -> AdminStoreResult<AuthSession> {
     Ok(AuthSession {
         subject,
         expires_at: record.expires_at,
+        absolute_expires_at: record.absolute_expires_at,
     })
+}
+
+fn auth_session_record(session: &AuthSession) -> redis::AuthSessionRecord {
+    let subject = match &session.subject {
+        SessionSubject::Admin {
+            admin_user_id,
+            credential_fingerprint,
+        } => redis::SessionSubjectRecord::Admin {
+            admin_user_id: admin_user_id.clone(),
+            credential_fingerprint: credential_fingerprint.clone(),
+        },
+        SessionSubject::Key { client_key_id } => redis::SessionSubjectRecord::Key {
+            client_key_id: client_key_id.as_str().to_owned(),
+        },
+    };
+    redis::AuthSessionRecord {
+        subject,
+        expires_at: session.expires_at,
+        absolute_expires_at: session.absolute_expires_at,
+    }
 }

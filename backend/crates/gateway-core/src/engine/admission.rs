@@ -1,4 +1,4 @@
-//! Client Key 准入、释放与进程启动恢复的中立契约。
+//! Client Key 准入、释放与进程启动恢复的中立契约
 
 use std::time::{Duration, SystemTime};
 
@@ -15,7 +15,7 @@ pub struct ClientAdmissionRequest {
     pub model_request_id: ModelRequestId,
     pub client_api_key_id: ClientApiKeyId,
     pub lease_ttl: Duration,
-    /// 有等待者时只允许队首取得槽位，RPM 仍由原子准入检查。
+    /// 有等待者时只允许队首取得槽位，RPM 仍由原子准入检查
     pub allow_concurrency_acquire: bool,
     pub limits: RateLimits,
 }
@@ -62,7 +62,7 @@ pub struct ClientAdmissionRestoreResult {
 pub struct ClientAdmissionError;
 
 pub trait ClientAdmissionPort: Send + Sync {
-    /// 仅续期已经准入的并发槽位，不重复消费 RPM。
+    /// 仅续期已经准入的并发槽位，不重复消费 RPM
     fn maintain(
         &self,
         _key: &ClientApiKeyId,
@@ -73,7 +73,7 @@ pub trait ClientAdmissionPort: Send + Sync {
         Box::new(())
     }
 
-    /// 请求 future 被取消时移交幂等释放，具体实现拥有异步清理执行器。
+    /// 请求 future 被取消时移交幂等释放，具体实现拥有异步清理执行器
     fn abandon(&self, client_api_key_id: &ClientApiKeyId, model_request_id: &ModelRequestId);
 
     fn admit(
@@ -108,7 +108,7 @@ pub struct ClientAdmissionStartupRecoveryReport {
     pub restored_running_requests: u64,
 }
 
-/// 监听端口前完成 PostgreSQL 终态收敛与 Redis 热状态恢复。
+/// 监听端口前完成 PostgreSQL 终态收敛与 Redis 热状态恢复
 pub async fn restore_client_admission_startup(
     execution: &dyn ExecutionStore,
     recovery: &dyn ClientAdmissionRecoveryPort,

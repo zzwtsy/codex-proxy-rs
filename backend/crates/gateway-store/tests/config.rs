@@ -1,3 +1,5 @@
+//! 验证存储配置的备份路径与连接池容量约束。
+
 use std::process::Command;
 
 use gateway_store::{StoreConfig, StoreError, StorePoolConfig};

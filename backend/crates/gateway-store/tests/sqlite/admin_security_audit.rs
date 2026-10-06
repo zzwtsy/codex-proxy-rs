@@ -130,6 +130,7 @@ async fn sqlite_auth_store_keeps_sessions_process_local_and_limits_login_attempt
             credential_fingerprint: "credential-fingerprint".to_owned(),
         },
         expires_at: Utc::now() + ChronoDuration::minutes(10),
+        absolute_expires_at: None,
     };
     first_process
         .store_session("session_local", &session)

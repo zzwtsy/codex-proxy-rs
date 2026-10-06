@@ -1,3 +1,5 @@
+//! 验证执行记录端口的请求、尝试、恢复租约与快照持久化
+
 use std::time::{Duration as StdDuration, SystemTime};
 
 use chrono::{DateTime, Duration, Utc};
@@ -214,7 +216,7 @@ async fn merged_model_less_first_attempt_should_match_sequential_semantics() {
         (1, "not_sent", "openai", "running", None, None)
     );
 
-    // 后续 attempt 沿用常规 CAS 递增路径；已持久化的 sent 水位不被重试重置。
+    // 后续 attempt 沿用常规 CAS 递增路径；已持久化的 sent 水位不被重试重置
     repository
         .mark_upstream_send_state(
             "req_merged",
@@ -1453,7 +1455,7 @@ async fn diagnostic_trace_is_finalized_atomically_and_available_for_failed_reque
     database.close().await;
 }
 
-// 只构造已接纳的入口事实；未选择账号、未出站，也没有上游用量。
+// 只构造已接纳的入口事实；未选择账号、未出站，也没有上游用量
 pub(super) fn accepted_request(id: &str) -> CoreNewModelRequest {
     let started_at = SystemTime::from(
         DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
@@ -1488,7 +1490,7 @@ pub(super) fn accepted_request(id: &str) -> CoreNewModelRequest {
 pub(super) fn early_failure(request: &CoreNewModelRequest) -> CoreModelRequestFinalization {
     let trace = TraceContext::new(request.id.as_str());
     trace.record("request.started", json!({"operation": "generate"}));
-    // trace 的 index 是预备阶段关联，不证明已经拿到账号、建流或实际发送。
+    // trace 的 index 是预备阶段关联，不证明已经拿到账号、建流或实际发送
     let preparation = trace.attempt(1);
     preparation.record(
         "attempt.started",
@@ -1675,7 +1677,7 @@ async fn zero_attempt_failure_is_queryable_without_fabricating_upstream_facts() 
     assert_eq!(error.upstream_request_id, None);
     assert_eq!(error.raw_upstream_error, None);
 
-    // 路由入口不等于已选择 Provider；没有平台事实时不能被平台/attempt 筛选命中。
+    // 路由入口不等于已选择 Provider；没有平台事实时不能被平台/attempt 筛选命中
     for filter in [
         OpsErrorFilter {
             provider_kind: Some("openai".to_owned()),

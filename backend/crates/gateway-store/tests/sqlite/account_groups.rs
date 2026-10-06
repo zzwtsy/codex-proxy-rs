@@ -8,7 +8,7 @@ use gateway_admin::{
     },
     ports::store::AccountGroupStore,
 };
-use gateway_core::routing::AccountGroupId;
+use gateway_core::{account::FastMode, routing::AccountGroupId};
 use gateway_store::{SqliteStoreConfig, sqlite, sqlite::SqliteAccountGroupRepository};
 
 #[tokio::test]
@@ -26,7 +26,7 @@ async fn sqlite_account_groups_preserve_cas_audit_membership_and_list_contracts(
     let create = repository
         .create_account_group(
             NewAccountGroup {
-                disable_fast: true,
+                fast_mode: FastMode::Disabled,
                 id: id.clone(),
                 name: "Production".to_owned(),
                 description: Some("primary account pool".to_owned()),
@@ -37,12 +37,15 @@ async fn sqlite_account_groups_preserve_cas_audit_membership_and_list_contracts(
         .await
         .unwrap();
     assert_eq!(create.config_revision.get(), 2);
-    assert!(create.record.as_ref().unwrap().disable_fast);
+    assert_eq!(
+        create.record.as_ref().unwrap().fast_mode,
+        FastMode::Disabled
+    );
 
     let update = repository
         .update_account_group(
             UpdateAccountGroup {
-                disable_fast: None,
+                fast_mode: None,
                 id: id.clone(),
                 name: "Production Renamed".to_owned(),
                 description: None,
@@ -52,7 +55,10 @@ async fn sqlite_account_groups_preserve_cas_audit_membership_and_list_contracts(
         )
         .await
         .unwrap();
-    assert!(update.record.as_ref().unwrap().disable_fast);
+    assert_eq!(
+        update.record.as_ref().unwrap().fast_mode,
+        FastMode::Disabled
+    );
     assert_eq!(update.record.as_ref().unwrap().name, "Production Renamed");
 
     let disabled = repository
@@ -118,7 +124,7 @@ async fn sqlite_account_group_member_facts_use_persisted_status_and_default_slot
     repository
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: group.clone(),
                 name: "Member facts".to_owned(),
                 description: None,
@@ -200,7 +206,7 @@ async fn sqlite_account_group_usage_includes_retained_costs_and_separates_today(
     repository
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: group.clone(),
                 name: "Usage facts".to_owned(),
                 description: None,

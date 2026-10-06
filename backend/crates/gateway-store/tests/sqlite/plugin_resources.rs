@@ -8,6 +8,7 @@ use gateway_admin::{
     ports::{plugin_resources::PluginResourceStore, store::AdminStoreErrorKind},
 };
 use gateway_core::{
+    account::FastMode,
     policy::{ClientApiKeyId, RateLimits},
     routing::AccountGroupId,
 };
@@ -31,7 +32,7 @@ async fn sqlite_plugin_resources_commit_ownership_revision_and_audit_atomically(
             &owner,
             "primary".to_owned(),
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: group_id.clone(),
                 name: "Plugin Straße".to_owned(),
                 description: None,
@@ -59,7 +60,7 @@ async fn sqlite_plugin_resources_commit_ownership_revision_and_audit_atomically(
             &owner,
             "primary".to_owned(),
             NewAccountGroup {
-                disable_fast: true,
+                fast_mode: FastMode::Disabled,
                 id: AccountGroupId::new("grp_abcdef0123456789abcdef0123456789")
                     .expect("unused group ID"),
                 name: "Ignored replacement".to_owned(),
@@ -135,7 +136,7 @@ async fn sqlite_plugin_resources_commit_ownership_revision_and_audit_atomically(
             &owner,
             "stale".to_owned(),
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: AccountGroupId::new("grp_11111111111111111111111111111111")
                     .expect("unused group ID"),
                 name: "Stale owner group".to_owned(),
@@ -178,7 +179,7 @@ async fn sqlite_plugin_resource_membership_reconciliation_is_idempotent() {
             &owner,
             "primary".to_owned(),
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: group_id,
                 name: "Plugin group".to_owned(),
                 description: None,

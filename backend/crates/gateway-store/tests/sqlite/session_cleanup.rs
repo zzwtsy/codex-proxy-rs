@@ -66,18 +66,21 @@ impl Fixture {
             .unwrap();
     }
 
-    async fn counts(&self) -> (i64, i64) {
-        sqlx::query_as("select (select count(*) from provider_session_affinity), (select count(*) from provider_session_exclusions)")
+    async fn counts(&self) -> (i64, i64, i64) {
+        sqlx::query_as("select (select count(*) from provider_session_affinity), (select count(*) from provider_session_exclusions), (select count(*) from provider_session_aliases)")
             .fetch_one(&self.pool).await.unwrap()
     }
 
     async fn seed(&self, count: i64, expiry: i64) {
         sqlx::query("with recursive numbers(n) as (values (1) union all select n + 1 from numbers where n < ?1)
             insert into provider_session_affinity (session_fingerprint, account_id, revision, expires_at_us)
-            select 'session-' || n, 'acct_test', 1, ?2 from numbers")
+            select 'session-' || n, 'acct_test', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', ?2 from numbers")
             .bind(count).bind(expiry).execute(&self.pool).await.unwrap();
         sqlx::query("insert into provider_session_exclusions (session_fingerprint, account_id, revision, expires_at_us)
             select session_fingerprint, account_id, 'generation-1', expires_at_us from provider_session_affinity")
+            .execute(&self.pool).await.unwrap();
+        sqlx::query("insert into provider_session_aliases (alias_fingerprint, session_key, follow_only, expires_at_us)
+            select 'alias-' || substr(session_fingerprint, 9), 'opaque-session', 0, expires_at_us from provider_session_affinity")
             .execute(&self.pool).await.unwrap();
     }
 }
@@ -92,12 +95,14 @@ async fn sqlite_session_cleanup_bounds_each_table_and_preserves_live_sessions() 
         .bind(future).execute(&fixture.pool).await.unwrap();
     sqlx::query("update provider_session_exclusions set expires_at_us = ?1 where session_fingerprint = 'session-1006'")
         .bind(future).execute(&fixture.pool).await.unwrap();
+    sqlx::query("update provider_session_aliases set expires_at_us = ?1 where alias_fingerprint = 'alias-1006'")
+        .bind(future).execute(&fixture.pool).await.unwrap();
     fixture.cycle().await;
-    assert_eq!(fixture.counts().await, (6, 6));
+    assert_eq!(fixture.counts().await, (6, 6, 6));
     fixture.cycle().await;
-    assert_eq!(fixture.counts().await, (1, 1));
+    assert_eq!(fixture.counts().await, (1, 1, 1));
     fixture.cycle().await;
-    assert_eq!(fixture.counts().await, (1, 1));
+    assert_eq!(fixture.counts().await, (1, 1, 1));
     let survivor: String =
         sqlx::query_scalar("select session_fingerprint from provider_session_affinity")
             .fetch_one(&fixture.pool)
@@ -123,6 +128,11 @@ async fn sqlite_session_cleanup_observes_renewal_committed_while_waiting_for_wri
         .execute(&mut *renewal)
         .await
         .unwrap();
+    sqlx::query("update provider_session_aliases set expires_at_us = ?1")
+        .bind(future)
+        .execute(&mut *renewal)
+        .await
+        .unwrap();
     let pool = fixture.pool.clone();
     let mut cleanup = tokio::spawn(async move {
         fixture.cycle().await;
@@ -135,7 +145,7 @@ async fn sqlite_session_cleanup_observes_renewal_committed_while_waiting_for_wri
     );
     renewal.commit().await.unwrap();
     let fixture = cleanup.await.unwrap();
-    assert_eq!(fixture.counts().await, (1, 1));
+    assert_eq!(fixture.counts().await, (1, 1, 1));
     pool.close().await;
 }
 
@@ -154,7 +164,7 @@ async fn sqlite_session_cleanup_retries_after_partial_failure_and_honors_cancell
         ))
         .await
         .unwrap();
-    assert_eq!(fixture.counts().await, (1, 1));
+    assert_eq!(fixture.counts().await, (1, 1, 1));
     sqlx::query("alter table provider_session_exclusions rename to saved_exclusions")
         .execute(&fixture.pool)
         .await
@@ -180,6 +190,6 @@ async fn sqlite_session_cleanup_retries_after_partial_failure_and_honors_cancell
         .await
         .unwrap();
     fixture.cycle().await;
-    assert_eq!(fixture.counts().await, (0, 0));
+    assert_eq!(fixture.counts().await, (0, 0, 0));
     fixture.pool.close().await;
 }

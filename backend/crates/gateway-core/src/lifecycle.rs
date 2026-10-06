@@ -1,22 +1,20 @@
-//! 请求与连接的截止、租约、取消和 drain 契约。
+//! 请求与连接的截止、租约、取消和 drain 契约
 
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use futures::{
-    channel::oneshot,
-    future::{BoxFuture, pending},
-};
+use event_listener::Event;
+use futures::future::{BoxFuture, pending};
 use futures_timer::Delay;
 
 struct CancellationState {
     cancelled: AtomicBool,
-    waiters: Mutex<Vec<oneshot::Sender<()>>>,
+    event: Event,
 }
 
-/// 可克隆的请求、任务与连接取消信号。
+/// 可克隆的请求、任务与连接取消信号
 #[derive(Clone)]
 pub struct CancellationToken {
     state: Arc<CancellationState>,
@@ -44,13 +42,13 @@ impl CancellationToken {
         Self {
             state: Arc::new(CancellationState {
                 cancelled: AtomicBool::new(false),
-                waiters: Mutex::new(Vec::new()),
+                event: Event::new(),
             }),
             ancestors: Arc::from([]),
         }
     }
 
-    /// 创建只从父级继承取消的子 token；取消子级不会反向取消父请求。
+    /// 创建只从父级继承取消的子 token；取消子级不会反向取消父请求
     #[must_use]
     pub fn child_token(&self) -> Self {
         let ancestors = std::iter::once(Arc::clone(&self.state))
@@ -59,7 +57,7 @@ impl CancellationToken {
         Self {
             state: Arc::new(CancellationState {
                 cancelled: AtomicBool::new(false),
-                waiters: Mutex::new(Vec::new()),
+                event: Event::new(),
             }),
             ancestors: ancestors.into(),
         }
@@ -69,13 +67,7 @@ impl CancellationToken {
         if self.state.cancelled.swap(true, Ordering::AcqRel) {
             return;
         }
-        let waiters = {
-            let mut guard = lock_unpoisoned(&self.state.waiters);
-            std::mem::take(&mut *guard)
-        };
-        for waiter in waiters {
-            let _ = waiter.send(());
-        }
+        self.state.event.notify(usize::MAX);
     }
 
     #[must_use]
@@ -103,25 +95,17 @@ fn wait_for_state(state: Arc<CancellationState>) -> BoxFuture<'static, ()> {
         if state.cancelled.load(Ordering::Acquire) {
             return;
         }
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut waiters = lock_unpoisoned(&state.waiters);
-            if state.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            waiters.push(sender);
+        // listener 随等待 future 丢弃而注销，避免 select 败选分支在自身及祖先状态中积累
+        let listener = state.event.listen();
+        // 注册后复查，覆盖取消发生在首次检查与注册之间的竞态
+        if state.cancelled.load(Ordering::Acquire) {
+            return;
         }
-        let _ = receiver.await;
+        listener.await;
     })
 }
 
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// 进程已进入 drain，新连接不得再注册。
+/// 进程已进入 drain，新连接不得再注册
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionDraining;
 
@@ -133,17 +117,17 @@ impl fmt::Display for ConnectionDraining {
 
 impl std::error::Error for ConnectionDraining {}
 
-/// 一次成功的活跃连接注册。
+/// 一次成功的活跃连接注册
 ///
-/// 实现必须在 guard `Drop` 时原子减少活跃连接计数。
+/// 实现必须在 guard `Drop` 时原子减少活跃连接计数
 pub trait ConnectionGuard: Send + 'static {}
 
-/// API 消费、Host 实现的进程连接生命周期。
+/// API 消费、Host 实现的进程连接生命周期
 pub trait ConnectionLifecycle: Send + Sync {
-    /// 原子地检查 drain 状态并注册一个活跃连接。
+    /// 原子地检查 drain 状态并注册一个活跃连接
     ///
     /// 当本方法成功时，drain 必须等待返回的 guard 被释放；
-    /// 当 drain 已经线性化生效时，本方法必须返回 [`ConnectionDraining`]。
+    /// 当 drain 已经线性化生效时，本方法必须返回 [`ConnectionDraining`]
     fn try_register(&self) -> Result<Box<dyn ConnectionGuard>, ConnectionDraining>;
 
     fn cancellation(&self) -> CancellationToken;
@@ -151,11 +135,11 @@ pub trait ConnectionLifecycle: Send + Sync {
     fn is_draining(&self) -> bool;
 }
 
-/// 请求默认没有总时长限制；显式截止与用于异常回收的可续期租约分开。
+/// 请求默认没有总时长限制；显式截止与用于异常回收的可续期租约分开
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Deadline(Option<SystemTime>);
 
-/// 租约失去续期后有界回收，不作为模型请求的总执行预算。
+/// 租约失去续期后有界回收，不作为模型请求的总执行预算
 pub const REQUEST_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 
 impl Deadline {
@@ -214,6 +198,6 @@ impl From<SystemTime> for Deadline {
     }
 }
 
-/// 持有者释放即停止续期，具体执行器由 Store 提供。
+/// 持有者释放即停止续期，具体执行器由 Store 提供
 pub trait LeaseGuard: Send + Sync {}
 impl<T: Send + Sync> LeaseGuard for T {}

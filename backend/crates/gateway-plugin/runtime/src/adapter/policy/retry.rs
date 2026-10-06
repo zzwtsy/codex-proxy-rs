@@ -1,3 +1,5 @@
+//! 将宿主允许的恢复路径交给插件重试策略裁决，并处理调用失败
+
 use std::{sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
@@ -28,7 +30,7 @@ pub(super) fn decide(
                     input.facts.model.as_deref(),
                 )
         }) {
-            // 整条委托链共享预算，不能每个插件重新取得完整等待时间。
+            // 整条委托链共享预算，不能每个插件重新取得完整等待时间
             let remaining = timeout
                 .min(input.facts.remaining_deadline)
                 .saturating_sub(started.elapsed());
@@ -96,9 +98,14 @@ async fn call(
             .as_object()
             .is_none_or(|fields| fields.len() != 1)
     {
+        invocation.session.invalid_response(Stage::Retry);
         return Err(());
     }
-    match serde_json::from_value::<WireDecision>(reply.result).map_err(|_| ())? {
+    match invocation
+        .session
+        .decode_response::<WireDecision>(Stage::Retry, reply.result)
+        .map_err(|_| ())?
+    {
         WireDecision::Delegate => Ok(RetryDecision::Delegate),
         WireDecision::Stop => Ok(RetryDecision::Stop),
         WireDecision::Retry if input.facts.retry_allowed => Ok(RetryDecision::Retry),

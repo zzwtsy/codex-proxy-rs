@@ -1,3 +1,5 @@
+//! 验证插件归档摘要、资源清单、解压限制与图标绑定
+
 use std::collections::BTreeMap;
 
 use gateway_admin::{
@@ -341,8 +343,8 @@ fn duplicate_contribution_keys_are_rejected_before_map_overwrite() {
         "main":"bin/worker",
         "runtime":"trustedProcess",
         "contributes":{
-            "middleware":{"id":"test.example.first","version":3,"stages":["request"]},
-            "middleware":{"id":"test.example.second","version":3,"stages":["request"]}
+            "middleware":{"id":"test.example.first","version":4,"stages":["request"]},
+            "middleware":{"id":"test.example.second","version":4,"stages":["request"]}
         }
     }"#;
     let archive = crate::support::archive(BTreeMap::from([(

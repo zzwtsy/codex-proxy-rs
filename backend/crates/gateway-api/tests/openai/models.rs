@@ -1,3 +1,5 @@
+//! 模型列表、详情与客户端原生目录接口的投影及访问校验测试
+
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -6,6 +8,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use gateway_core::account::FastMode;
 use gateway_core::engine::execution::{
     AuthenticatedClient, ClientAuthenticationError, ExecutionService, StartExecution,
     StartProviderExecution, StartedExecution,
@@ -206,7 +209,7 @@ async fn request_settings_reach_query_terminal_without_mutating_authenticated_ba
                 runtime["model_mappings"] = serde_json::json!({"model-a":"plugin-model"});
                 runtime["concurrency_wait_timeout_seconds"] = serde_json::json!(30);
                 settings.runtime = serde_json::from_value(runtime).unwrap();
-                settings.disable_fast = true;
+                settings.fast_mode = FastMode::Disabled;
             }),
             ..Default::default()
         }));
@@ -226,7 +229,10 @@ async fn request_settings_reach_query_terminal_without_mutating_authenticated_ba
             execution.client.snapshot().mapped_model("model-a"),
             "model-a"
         );
-        assert!(!execution.client.policy().account_scope().disable_fast());
+        assert_ne!(
+            execution.client.policy().account_scope().fast_mode(),
+            FastMode::Disabled
+        );
     }
 }
 

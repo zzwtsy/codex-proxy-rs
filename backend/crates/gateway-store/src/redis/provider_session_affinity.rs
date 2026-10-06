@@ -1,11 +1,11 @@
-//! Provider 会话亲和性的可丢失 Redis 映射。
+//! 会话账号绑定的 Redis 版本快照、原子认领与续期
 
 use std::time::Duration;
 
 use gateway_core::account::ProviderAccountId;
 use gateway_core::provider_ports::{
-    ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderStoreError,
-    ProviderStoreErrorKind,
+    ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionBinding,
+    ProviderStoreError, ProviderStoreErrorKind,
 };
 use gateway_core::routing::ProviderKind;
 use redis::aio::ConnectionManager;
@@ -16,23 +16,47 @@ use super::{namespace, resource_fingerprint};
 
 const MAX_SESSION_AFFINITY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-const CLAIM_OR_LOAD_SCRIPT: &str = r#"
-local current = redis.call('GET', KEYS[1])
-if current then
-  return current
-end
-redis.call('PSETEX', KEYS[1], tonumber(ARGV[2]), ARGV[1])
-return ARGV[1]
-"#;
-
+// 比较完整记录而非账号 ID；冲突时既不改绑定，也不续期
 const COMPARE_AND_BIND_SCRIPT: &str = r#"
 local current = redis.call('GET', KEYS[1])
-if not current or current == ARGV[1] then
+if (not current and ARGV[1] == '') or current == ARGV[1] then
   redis.call('PSETEX', KEYS[1], tonumber(ARGV[3]), ARGV[2])
-  return ARGV[2]
+  return 1
 end
-return current
+return 0
 "#;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BindingRecord {
+    account_id: String,
+    revision: String,
+}
+
+impl BindingRecord {
+    fn encode(binding: &ProviderSessionBinding) -> Result<String, ProviderStoreError> {
+        serde_json::to_string(&Self {
+            account_id: binding.account_id().as_str().to_owned(),
+            revision: binding.revision().to_owned(),
+        })
+        .map_err(|_| provider_invalid("encode provider session binding"))
+    }
+
+    fn decode(raw: &str) -> Result<ProviderSessionBinding, ProviderStoreError> {
+        let record: Self = serde_json::from_str(raw)
+            .map_err(|_| provider_invalid("decode provider session binding"))?;
+        let account = ProviderAccountId::new(record.account_id)
+            .map_err(|_| provider_invalid("decode provider session binding account"))?;
+        ProviderSessionBinding::new(account, record.revision)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AliasRecord {
+    session_key: String,
+    follow_only: bool,
+}
 
 #[derive(Clone)]
 pub struct RedisProviderSessionAffinityRepository {
@@ -61,7 +85,7 @@ impl RedisProviderSessionAffinityRepository {
         let fingerprint = resource_fingerprint("provider session affinity", &scope)
             .map_err(|_| provider_invalid("encode provider session affinity key"))?;
         Ok(format!(
-            "{}:scheduler:affinity:{{{fingerprint}}}",
+            "{}:scheduler:session-binding:{{{fingerprint}}}",
             self.namespace
         ))
     }
@@ -72,61 +96,15 @@ impl ProviderSessionAffinityPort for RedisProviderSessionAffinityRepository {
         &'a self,
         provider_kind: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-    ) -> futures::future::BoxFuture<'a, Result<Option<ProviderAccountId>, ProviderStoreError>> {
+    ) -> futures::future::BoxFuture<'a, Result<Option<ProviderSessionBinding>, ProviderStoreError>>
+    {
         Box::pin(async move {
-            let mut connection = self.connection.clone();
-            let account_id = redis::cmd("GET")
+            let raw = redis::cmd("GET")
                 .arg(self.key(provider_kind, key)?)
-                .query_async::<Option<String>>(&mut connection)
+                .query_async::<Option<String>>(&mut self.connection.clone())
                 .await
-                .map_err(|_| provider_unavailable("load provider session affinity"))?;
-            account_id
-                .map(|account_id| {
-                    ProviderAccountId::new(account_id)
-                        .map_err(|_| provider_invalid("decode provider session affinity"))
-                })
-                .transpose()
-        })
-    }
-
-    fn bind<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        account_id: &'a ProviderAccountId,
-        ttl: Duration,
-    ) -> futures::future::BoxFuture<'a, Result<(), ProviderStoreError>> {
-        Box::pin(async move {
-            let ttl_millis = session_affinity_ttl_millis(ttl)?;
-            let mut connection = self.connection.clone();
-            redis::cmd("PSETEX")
-                .arg(self.key(provider_kind, key)?)
-                .arg(ttl_millis)
-                .arg(account_id.as_str())
-                .query_async::<()>(&mut connection)
-                .await
-                .map_err(|_| provider_unavailable("bind provider session affinity"))
-        })
-    }
-
-    fn claim_or_load<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        candidate_account_id: &'a ProviderAccountId,
-        ttl: Duration,
-    ) -> futures::future::BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>> {
-        Box::pin(async move {
-            let ttl_millis = session_affinity_ttl_millis(ttl)?;
-            let mut connection = self.connection.clone();
-            let effective_account_id = redis::Script::new(CLAIM_OR_LOAD_SCRIPT)
-                .key(self.key(provider_kind, key)?)
-                .arg(candidate_account_id.as_str())
-                .arg(ttl_millis)
-                .invoke_async::<String>(&mut connection)
-                .await
-                .map_err(|_| provider_unavailable("claim provider session affinity"))?;
-            decode_account_id(effective_account_id)
+                .map_err(|_| provider_unavailable("load provider session binding"))?;
+            raw.as_deref().map(BindingRecord::decode).transpose()
         })
     }
 
@@ -134,38 +112,84 @@ impl ProviderSessionAffinityPort for RedisProviderSessionAffinityRepository {
         &'a self,
         provider_kind: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-        expected_account_id: &'a ProviderAccountId,
-        replacement_account_id: &'a ProviderAccountId,
+        expected: Option<&'a ProviderSessionBinding>,
+        account_id: &'a ProviderAccountId,
         ttl: Duration,
-    ) -> futures::future::BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>> {
+    ) -> futures::future::BoxFuture<'a, Result<Option<ProviderSessionBinding>, ProviderStoreError>>
+    {
         Box::pin(async move {
             let ttl_millis = session_affinity_ttl_millis(ttl)?;
-            let mut connection = self.connection.clone();
-            let effective_account_id = redis::Script::new(COMPARE_AND_BIND_SCRIPT)
+            let expected_raw = expected
+                .map(BindingRecord::encode)
+                .transpose()?
+                .unwrap_or_default();
+            // 同账号命中仅续期；初次认领及换号生成新版本
+            let binding = match expected.filter(|binding| binding.account_id() == account_id) {
+                Some(binding) => binding.clone(),
+                None => ProviderSessionBinding::new(
+                    account_id.clone(),
+                    uuid::Uuid::new_v4().simple().to_string(),
+                )?,
+            };
+            let applied = redis::Script::new(COMPARE_AND_BIND_SCRIPT)
                 .key(self.key(provider_kind, key)?)
-                .arg(expected_account_id.as_str())
-                .arg(replacement_account_id.as_str())
+                .arg(expected_raw)
+                .arg(BindingRecord::encode(&binding)?)
                 .arg(ttl_millis)
-                .invoke_async::<String>(&mut connection)
+                .invoke_async::<bool>(&mut self.connection.clone())
                 .await
-                .map_err(|_| provider_unavailable("compare provider session affinity"))?;
-            decode_account_id(effective_account_id)
+                .map_err(|_| provider_unavailable("admit provider session binding"))?;
+            Ok(applied.then_some(binding))
+        })
+    }
+    fn load_alias<'a>(
+        &'a self,
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Option<gateway_core::provider_ports::ProviderSessionAlias>, ProviderStoreError>,
+    > {
+        Box::pin(async move {
+            let value = redis::cmd("GET")
+                .arg(format!("{}:alias", self.key(provider, alias)?))
+                .query_async::<Option<String>>(&mut self.connection.clone())
+                .await
+                .map_err(|_| provider_unavailable("load session alias"))?;
+            value
+                .map(|raw| {
+                    let record: AliasRecord = serde_json::from_str(&raw)
+                        .map_err(|_| provider_invalid("decode session alias"))?;
+                    Ok(gateway_core::provider_ports::ProviderSessionAlias {
+                        session_key: ProviderSessionAffinityKey::try_new(record.session_key)?,
+                        follow_only: record.follow_only,
+                    })
+                })
+                .transpose()
         })
     }
 
-    fn clear<'a>(
+    fn bind_alias<'a>(
         &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+        session: &'a gateway_core::provider_ports::ProviderSessionAlias,
+        ttl: Duration,
     ) -> futures::future::BoxFuture<'a, Result<bool, ProviderStoreError>> {
         Box::pin(async move {
-            let mut connection = self.connection.clone();
-            redis::cmd("DEL")
-                .arg(self.key(provider_kind, key)?)
-                .query_async::<u64>(&mut connection)
-                .await
-                .map(|removed| removed > 0)
-                .map_err(|_| provider_unavailable("clear provider session affinity"))
+            let record = serde_json::to_string(&AliasRecord {
+                session_key: session.session_key.expose_to_store().to_owned(),
+                follow_only: session.follow_only,
+            })
+            .map_err(|_| provider_invalid("encode session alias"))?;
+            redis::Script::new("local current = redis.call('GET', KEYS[1]); if not current or current == ARGV[1] then redis.call('PSETEX', KEYS[1], tonumber(ARGV[3]), ARGV[2]); return 1 end; return 0")
+                .key(format!("{}:alias", self.key(provider, alias)?))
+                // 缺失与同目标均可写入，冲突不能覆盖另一会话
+                .arg(&record)
+                .arg(&record)
+                .arg(session_affinity_ttl_millis(ttl)?)
+                .invoke_async::<bool>(&mut self.connection.clone()).await
+                .map_err(|_| provider_unavailable("bind session alias"))
         })
     }
 }
@@ -176,11 +200,6 @@ fn session_affinity_ttl_millis(ttl: Duration) -> Result<u64, ProviderStoreError>
     }
     u64::try_from(ttl.as_millis())
         .map_err(|_| provider_invalid("validate provider session affinity TTL"))
-}
-
-fn decode_account_id(account_id: String) -> Result<ProviderAccountId, ProviderStoreError> {
-    ProviderAccountId::new(account_id)
-        .map_err(|_| provider_invalid("decode provider session affinity"))
 }
 
 fn provider_unavailable(operation: &'static str) -> ProviderStoreError {

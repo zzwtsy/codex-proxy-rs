@@ -1,3 +1,5 @@
+//! 验证插件认证的身份映射、回退条件与发布后的权限撤销
+
 use gateway_admin::model::client_keys::SetClientKeyEnabled;
 use gateway_core::{
     engine::{authentication::ClientAuthenticationRequest, execution::ClientAuthenticationError},
@@ -127,6 +129,14 @@ async fn rejection_unmapped_principal_and_plugin_supplied_key_id_fail_closed() {
             authentication,
             Err(ClientAuthenticationError::InvalidKey)
         ));
+        assert!(
+            core.snapshots()
+                .acquire()
+                .unwrap()
+                .extensions()
+                .unwrap()
+                .is_ready()
+        );
         close(environment, runtime, core).await;
     }
 
@@ -150,6 +160,21 @@ async fn rejection_unmapped_principal_and_plugin_supplied_key_id_fail_closed() {
         authentication,
         Err(ClientAuthenticationError::ProviderUnavailable)
     ));
+    assert!(
+        !core
+            .snapshots()
+            .acquire()
+            .unwrap()
+            .extensions()
+            .unwrap()
+            .is_ready()
+    );
+    for probe in core.health_probes() {
+        assert!(matches!(
+            probe.check().await,
+            gateway_core::health::HealthState::Healthy
+        ));
+    }
     close(environment, runtime, core).await;
 }
 

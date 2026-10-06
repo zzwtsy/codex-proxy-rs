@@ -1,4 +1,4 @@
-//! Account group management use cases.
+//! 账号分组的查询、配置与运行态容量聚合用例
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -29,7 +29,7 @@ use crate::{
 
 use super::{map_store_error, publish_committed};
 
-/// API-facing account group management service.
+/// 面向 API 的账号分组管理服务
 #[async_trait]
 pub trait AccountGroupService: Send + Sync {
     async fn list(&self, query: AccountGroupListQuery) -> Result<AccountGroupPage, AdminError>;
@@ -144,7 +144,7 @@ impl AccountGroupService for DefaultAccountGroupService {
                         id,
                         name: command.name,
                         description: command.description,
-                        disable_fast: command.disable_fast,
+                        fast_mode: command.fast_mode,
                         color: command.color,
                     },
                     context,

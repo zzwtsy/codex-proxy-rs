@@ -1,4 +1,4 @@
-//! 冻结宿主基线与请求显式改写；派生快照只属于当前调用，不发布全局配置。
+//! 冻结宿主基线与请求显式改写；派生快照只属于当前调用，不发布全局配置
 
 use std::{
     collections::BTreeMap,
@@ -9,6 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::account::FastMode;
 use crate::policy::{ClientApiKeyId, ClientPolicy, ClientSettings, RateLimits};
 use crate::routing::RuntimeSnapshot;
 
@@ -16,14 +17,14 @@ pub(crate) mod compiled;
 mod values;
 pub use values::SettingsValues;
 
-/// 一次模型调用的有效设置；改写只影响当前请求，不发布配置或修改持久化 revision。
+/// 一次模型调用的有效设置；改写只影响当前请求，不发布配置或修改持久化 revision
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionSettings {
     pub runtime: SettingsValues,
-    pub disable_fast: bool,
+    pub fast_mode: FastMode,
     pub client_limits: RateLimits,
-    /// null 表示不限制总时长；显式时限从请求开始计时，改写不重置计时原点。
+    /// null 表示不限制总时长；显式时限从请求开始计时，改写不重置计时原点
     pub timeout_ms: Option<u64>,
 }
 
@@ -40,7 +41,7 @@ struct ExecutionOverrides {
     defaults: Arc<ClientSettings>,
     client_key_id: String,
     input: Arc<ExecutionSettings>,
-    disable_fast: Option<SettingOverride<bool>>,
+    fast_mode: Option<SettingOverride<FastMode>>,
     client_limits: Option<SettingOverride<RateLimits>>,
     timeout_ms: Option<SettingOverride<Option<u64>>>,
 }
@@ -51,7 +52,7 @@ struct HttpTimeout {
     change: Option<SettingOverride<Option<u64>>>,
 }
 
-/// 共享值均不可变；同级子调用的修改不会回写父调用。
+/// 共享值均不可变；同级子调用的修改不会回写父调用
 #[derive(Clone, Debug)]
 pub struct RequestSettings {
     baseline: Arc<RuntimeSnapshot>,
@@ -99,7 +100,7 @@ impl RequestSettings {
         self.effective.settings()
     }
 
-    /// 来源与有效值分开查询，不允许插件伪造其他实例的写入来源。
+    /// 来源与有效值分开查询，不允许插件伪造其他实例的写入来源
     pub fn inspect(&self) -> Value {
         serde_json::json!({
             "config_revision": self.baseline.revision().get(),
@@ -118,7 +119,7 @@ impl RequestSettings {
         self.replace_scoped(self.values(), values, instance_id)
     }
 
-    /// Key 画像等隐式作用域结果不记录成插件改写，避免随后切换 Key 时泄漏。
+    /// Key 画像等隐式作用域结果不记录成插件改写，避免随后切换 Key 时泄漏
     fn replace_scoped(
         &self,
         previous: &SettingsValues,
@@ -133,7 +134,7 @@ impl RequestSettings {
         let order = self.order.checked_add(1).ok_or(InvalidSettings)?;
         let mut overrides = self.overrides.as_ref().clone();
         let effective_values = self.values();
-        // 每个已声明设置项整体替换，不猜测画像对象、数组或 null 的深合并含义。
+        // 每个已声明设置项整体替换，不猜测画像对象、数组或 null 的深合并含义
         for (name, value) in next.as_object().ok_or(InvalidSettings)? {
             if current.get(name) != Some(value) {
                 overrides.insert(
@@ -146,7 +147,7 @@ impl RequestSettings {
                 );
             }
         }
-        // 只把本层实际修改的字段写回宿主层，作用域默认值不参与继承。
+        // 只把本层实际修改的字段写回宿主层，作用域默认值不参与继承
         let values = if previous == effective_values {
             values
         } else {
@@ -166,7 +167,7 @@ impl RequestSettings {
         })
     }
 
-    /// 持续会话的新请求读取当前宿主快照，只继承明确改写的字段。
+    /// 持续会话的新请求读取当前宿主快照，只继承明确改写的字段
     pub fn rebase(&self, snapshot: Arc<RuntimeSnapshot>) -> Result<Self, InvalidSettings> {
         if Arc::ptr_eq(&self.baseline, &snapshot) {
             return Ok(self.clone());
@@ -188,13 +189,13 @@ impl RequestSettings {
         })
     }
 
-    /// 认证、模型入口和插件视图共用解析规则，派生策略不改变 Key 默认值。
+    /// 认证、模型入口和插件视图共用解析规则，派生策略不改变 Key 默认值
     #[must_use]
     pub fn apply_policy(&self, policy: ClientPolicy) -> ClientPolicy {
         let values = self.resolve_execution(policy.key_id().as_str(), policy.defaults(), None);
         policy.with_settings(
             values.runtime.request_profiles(),
-            values.disable_fast,
+            values.fast_mode,
             values.client_limits,
         )
     }
@@ -210,7 +211,7 @@ impl RequestSettings {
             defaults: policy.defaults().clone(),
             client_key_id: policy.key_id().as_str().to_owned(),
             input: Arc::new(input),
-            disable_fast: previous.and_then(|scope| scope.disable_fast.clone()),
+            fast_mode: previous.and_then(|scope| scope.fast_mode.clone()),
             client_limits: previous.and_then(|scope| scope.client_limits.clone()),
             timeout_ms: previous.and_then(|scope| scope.timeout_ms.clone()),
         }));
@@ -238,7 +239,7 @@ impl RequestSettings {
             .as_ref()
             .filter(|scope| scope.client_key_id == key);
         let mut runtime = self.values().clone();
-        // Key 画像覆盖宿主默认，插件显式覆盖整个设置项；此优先级只在这里解释。
+        // Key 画像覆盖宿主默认，插件显式覆盖整个设置项；此优先级只在这里解释
         if !self.overrides.contains_key("request_profiles") && !defaults.request_profiles.is_empty()
         {
             let mut profiles = runtime.request_profiles().clone();
@@ -247,9 +248,9 @@ impl RequestSettings {
         }
         ExecutionSettings {
             runtime,
-            disable_fast: overrides
-                .and_then(|scope| scope.disable_fast.as_ref())
-                .map_or(defaults.disable_fast, |change| change.value),
+            fast_mode: overrides
+                .and_then(|scope| scope.fast_mode.as_ref())
+                .map_or(defaults.fast_mode, |change| change.value),
             client_limits: overrides
                 .and_then(|scope| scope.client_limits.as_ref())
                 .map_or(defaults.limits, |change| change.value),
@@ -285,7 +286,7 @@ impl RequestSettings {
         let previous = self.execution_values().ok_or(InvalidSettings)?;
         let mut updated =
             self.replace_scoped(&previous.runtime, values.runtime.clone(), instance_id)?;
-        if previous.disable_fast == values.disable_fast
+        if previous.fast_mode == values.fast_mode
             && previous.client_limits == values.client_limits
             && previous.timeout_ms == values.timeout_ms
         {
@@ -297,11 +298,11 @@ impl RequestSettings {
         } else {
             updated.order
         };
-        if previous.disable_fast != values.disable_fast {
-            scope.disable_fast = Some(SettingOverride {
+        if previous.fast_mode != values.fast_mode {
+            scope.fast_mode = Some(SettingOverride {
                 instance_id: instance_id.to_owned(),
                 order,
-                value: values.disable_fast,
+                value: values.fast_mode,
             });
         }
         if previous.client_limits != values.client_limits {

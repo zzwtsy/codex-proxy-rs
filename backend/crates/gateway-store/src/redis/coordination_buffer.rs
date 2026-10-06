@@ -1,7 +1,7 @@
-//! 可由 TTL 或后续反馈收敛的 Redis 写副作用队列。
+//! 可由 TTL 或后续反馈收敛的 Redis 写副作用队列
 //!
 //! Continuation affinity 决定下一轮 Provider 与账号，必须在响应 ID 可复用前
-//! 获得 Redis 确认，因此不属于本模块的可丢失副作用。
+//! 获得 Redis 确认，因此不属于本模块的可丢失副作用
 
 use std::sync::Arc;
 use std::{
@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, mpsc};
 const DEFAULT_QUEUE_CAPACITY: usize = 4_096;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 准入读取保持强一致；终态释放只做有界入队，Redis 失败由 worker 吸收。
+/// 准入读取保持强一致；终态释放只做有界入队，Redis 失败由 worker 吸收
 #[derive(Clone)]
 pub struct BufferedClientAdmissionPort {
     inner: Arc<dyn ClientAdmissionPort>,

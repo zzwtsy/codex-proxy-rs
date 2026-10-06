@@ -1,3 +1,5 @@
+//! 验证插件观察计划的范围、顺序、去重与有界异步通知
+
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc, time::Duration};
 
 use gateway_admin::{
@@ -211,7 +213,7 @@ async fn wait_for_lines(path: &std::path::Path, count: usize) -> Vec<serde_json:
         loop {
             let lines = std::fs::read_to_string(path)
                 .unwrap_or_default()
-                // 子进程先追加 JSON 再写换行；只解析已经提交完整行的记录。
+                // 子进程先追加 JSON 再写换行；只解析已经提交完整行的记录
                 .split_inclusive('\n')
                 .filter(|line| line.ends_with('\n'))
                 .map(|line| serde_json::from_str(line).unwrap())
@@ -523,6 +525,46 @@ async fn websocket_observer_bounds_event_count_and_payload_bytes_without_blockin
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(wait_for_lines(&healthy_completed, 1).await.len(), 1);
     super::wait_until_empty(byte_cache.path()).await;
+}
+
+#[tokio::test]
+async fn malformed_observer_response_stops_only_the_observer() {
+    let marker_directory = tempfile::tempdir().unwrap();
+    let completed = marker_directory.path().join("healthy.jsonl");
+    let (cache, _store, runtime) = setup(
+        vec![
+            (
+                "invalid",
+                serde_json::json!({"invalid_response_method":"observer.observe"}),
+                vec![binding(EventKind::RequestCompleted, 1)],
+            ),
+            (
+                "healthy",
+                serde_json::json!({"observation_marker":completed}),
+                vec![binding(EventKind::RequestCompleted, 2)],
+            ),
+        ],
+        RpcLimits::default(),
+    )
+    .await;
+    let generation = gateway_core::runtime::extensions::ExtensionPreparationPort::prepare(
+        &runtime,
+        ConfigRevision::new(1).unwrap(),
+    )
+    .await
+    .unwrap();
+    let plan = runtime.observer_registry().resolve(&generation).unwrap();
+    plan.dispatch(
+        generation.clone(),
+        observation("req_invalid_observer", RequestObservationOutcome::Succeeded)
+            .with_provider(ProviderKind::new("openai").unwrap()),
+    );
+    wait_for_lines(&completed, 1).await;
+    assert!(!generation.is_ready());
+    assert!(generation.can_serve());
+    drop(plan);
+    drop(generation);
+    super::wait_until_empty(cache.path()).await;
 }
 
 #[tokio::test]

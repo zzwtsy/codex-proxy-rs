@@ -1,4 +1,4 @@
-//! 请求资源的续期任务随 guard 回收；失败不能让仍在执行的请求失去并发约束。
+//! 请求资源的续期任务随 guard 回收；失败不能让仍在执行的请求失去并发约束
 
 use std::time::Duration;
 
@@ -53,7 +53,7 @@ impl LeaseRenewal {
                     () = tokio::time::sleep(delay) => {}
                 }
             }
-            // 显式执行截止由 Core 归类为 timeout，租约不把它抢先改成 cancelled。
+            // 显式执行截止由 Core 归类为 timeout，租约不把它抢先改成 cancelled
             if !deadline.is_elapsed()
                 && let Some(cancellation) = &cancellation
             {

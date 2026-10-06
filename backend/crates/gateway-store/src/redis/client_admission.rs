@@ -1,4 +1,4 @@
-//! Client API Key 的 Redis RPM/并发原子准入与热状态恢复。
+//! Client API Key 的 Redis RPM/并发原子准入与热状态恢复
 
 use std::{collections::HashSet, time::Duration};
 
@@ -17,7 +17,7 @@ use crate::{StoreError, StoreResult, redis_unavailable, require_nonempty};
 
 use super::{MAX_REDIS_EXACT_INTEGER, namespace, resource_fingerprint};
 
-// 只刷新既有并发成员，不写 RPM 窗口，也不复活已过期或已释放的租约。
+// 只刷新既有并发成员，不写 RPM 窗口，也不复活已过期或已释放的租约
 const RENEW_SCRIPT: &str = r#"
 local clock = redis.call('TIME')
 local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)

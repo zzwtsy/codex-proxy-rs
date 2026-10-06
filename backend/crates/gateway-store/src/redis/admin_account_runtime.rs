@@ -1,4 +1,4 @@
-//! Redis cooldown 与凭据租约到 Admin 账号运行态端口的组合。
+//! 将 Redis cooldown 与凭据租约信号组合为 Admin 账号运行态端口。
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -20,7 +20,7 @@ use super::{
     RedisCredentialLeaseRepository,
 };
 
-/// 仅用于保留 PostgreSQL+Redis 组合的便捷构造；运行态接口不依赖 Redis 类型。
+/// 只组合可丢失 Redis 事实；不持有 PostgreSQL 或执行状态投影。
 #[derive(Clone)]
 pub struct RedisAdminAccountRuntimeStore {
     inner: AccountRuntimeStoreAdapter,

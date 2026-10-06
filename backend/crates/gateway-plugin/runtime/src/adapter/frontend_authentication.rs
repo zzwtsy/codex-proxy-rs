@@ -1,3 +1,5 @@
+//! 编译插件客户端认证绑定，并将认证结果映射为宿主身份
+
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
@@ -65,7 +67,7 @@ pub(crate) async fn prepare_entry(
     }))
 }
 
-/// 认证器恢复失败仍占据认证入口，不能静默改走其他认证路径。
+/// 认证器恢复失败仍占据认证入口，不能静默改走其他认证路径
 pub(crate) fn unavailable_entry(instance: &PluginInstance) -> Option<FrontendAuthenticationEntry> {
     instance
         .bindings
@@ -214,10 +216,14 @@ impl FrontendAuthenticationPlan for PluginFrontendAuthenticationPlan {
                 .await
                 .map_err(|_| FrontendAuthenticationError)?;
             if reply.result != serde_json::json!({}) {
+                session.invalid_response(Stage::Authentication);
                 return Err(FrontendAuthenticationError);
             }
-            let result: FrontendAuthenticationResult =
-                serde_json::from_slice(&reply.payload).map_err(|_| FrontendAuthenticationError)?;
+            let result: FrontendAuthenticationResult = serde_json::from_slice(&reply.payload)
+                .map_err(|_| {
+                    session.invalid_response(Stage::Authentication);
+                    FrontendAuthenticationError
+                })?;
             match result {
                 FrontendAuthenticationResult::Authenticated { principal }
                     if valid_principal(&principal) =>
@@ -225,6 +231,7 @@ impl FrontendAuthenticationPlan for PluginFrontendAuthenticationPlan {
                     Ok(FrontendAuthenticationDecision::Authenticated { principal })
                 }
                 FrontendAuthenticationResult::Authenticated { .. } => {
+                    session.invalid_response(Stage::Authentication);
                     Err(FrontendAuthenticationError)
                 }
                 FrontendAuthenticationResult::NotMatched {} => {

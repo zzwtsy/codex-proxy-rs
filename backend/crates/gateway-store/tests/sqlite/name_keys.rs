@@ -12,6 +12,7 @@ use gateway_admin::{
     ports::store::{AccountGroupStore, ClientKeyStore},
 };
 use gateway_core::{
+    account::FastMode,
     policy::{ClientApiKeyId, RateLimits},
     routing::AccountGroupId,
 };
@@ -82,7 +83,7 @@ async fn sqlite_name_keys_normalize_duplicates_searches_updates_and_cursors() {
     let created_group = groups
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: first_group.clone(),
                 name: "Straße".to_owned(),
                 description: None,
@@ -96,7 +97,7 @@ async fn sqlite_name_keys_normalize_duplicates_searches_updates_and_cursors() {
     groups
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: second_group.clone(),
                 name: "CAFÉ".to_owned(),
                 description: None,
@@ -109,7 +110,7 @@ async fn sqlite_name_keys_normalize_duplicates_searches_updates_and_cursors() {
     groups
         .create_account_group(
             NewAccountGroup {
-                disable_fast: false,
+                fast_mode: FastMode::Default,
                 id: sigma_group,
                 name: "ΟΣ".to_owned(),
                 description: None,
@@ -140,7 +141,7 @@ async fn sqlite_name_keys_normalize_duplicates_searches_updates_and_cursors() {
             groups
                 .create_account_group(
                     NewAccountGroup {
-                        disable_fast: false,
+                        fast_mode: FastMode::Default,
                         id: AccountGroupId::new(id).unwrap(),
                         name: name.to_owned(),
                         description: None,
@@ -167,7 +168,7 @@ async fn sqlite_name_keys_normalize_duplicates_searches_updates_and_cursors() {
     let updated_group = groups
         .update_account_group(
             UpdateAccountGroup {
-                disable_fast: None,
+                fast_mode: None,
                 id: second_group.clone(),
                 name: "Cafe\u{301}".to_owned(),
                 description: None,

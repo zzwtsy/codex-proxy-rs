@@ -1,3 +1,5 @@
+//! 验证 Redis 准入的参数边界、并发容量与租约恢复
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};

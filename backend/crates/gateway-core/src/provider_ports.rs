@@ -1,4 +1,4 @@
-//! Provider 运行时所需的中立存储能力。
+//! Provider 运行时所需的中立存储能力
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -19,7 +19,7 @@ use crate::validation::{IdentifierError, validate_text};
 
 const MAX_PENDING_FLOW_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// Provider 可据此决定是否重试，但看不到 SQL、Redis 或秘密原文。
+/// Provider 可据此决定是否重试，但看不到 SQL、Redis 或秘密原文
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderStoreErrorKind {
     Unavailable,
@@ -27,7 +27,7 @@ pub enum ProviderStoreErrorKind {
     Conflict,
 }
 
-/// Provider 存储端口的脱敏错误。
+/// Provider 存储端口的脱敏错误
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("provider store {operation} failed: {kind:?}")]
 pub struct ProviderStoreError {
@@ -47,7 +47,7 @@ impl ProviderStoreError {
     }
 }
 
-/// 一个 Provider 的完整可重建调度状态。
+/// 一个 Provider 的完整可重建调度状态
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSchedulingState {
     signals: BTreeMap<ProviderAccountId, AccountRuntimeSignals>,
@@ -77,7 +77,7 @@ impl ProviderSchedulingState {
     }
 }
 
-/// 请求级账号 lease 的全部中立事实。
+/// 请求级账号 lease 的全部中立事实
 #[derive(Debug, Clone)]
 pub struct ProviderSchedulingLeaseRequest {
     provider_kind: ProviderKind,
@@ -152,7 +152,7 @@ impl ProviderSchedulingLeaseRequest {
     }
 }
 
-/// Lease 生命周期由具体 Store guard 管理，Provider 只能持有。
+/// Lease 生命周期由具体 Store guard 管理，Provider 只能持有
 pub trait ProviderLeaseGuard: Send + Sync + 'static {}
 
 impl<T> ProviderLeaseGuard for T where T: Send + Sync + 'static {}
@@ -174,7 +174,7 @@ impl fmt::Debug for ProviderLeaseAcquisition {
     }
 }
 
-/// Provider 运行时会持有的三类 lease；刷新必须同时持有全局容量与账号互斥 lease。
+/// Provider 运行时会持有的三类 lease；刷新必须同时持有全局容量与账号互斥 lease
 #[derive(Debug, Clone)]
 pub enum ProviderLeaseRequest {
     Scheduling(ProviderSchedulingLeaseRequest),
@@ -196,7 +196,7 @@ pub trait ProviderLeasePort: Send + Sync {
     ) -> BoxFuture<'_, Result<ProviderLeaseAcquisition, ProviderStoreError>>;
 
     /// 读取指定账号当前的在途请求数；只用于容量熔断的峰值证据，
-    /// 支持租约信号的存储实现覆盖，否则视为不可观测（空映射）。
+    /// 支持租约信号的存储实现覆盖，否则视为不可观测（空映射）
     fn account_in_flight<'a>(
         &'a self,
         account_ids: &'a [ProviderAccountId],
@@ -206,7 +206,7 @@ pub trait ProviderLeasePort: Send + Sync {
     }
 }
 
-/// Provider 从原始会话锚点派生的不可逆亲和键。
+/// Provider 从原始会话锚点派生的不可逆亲和键
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderSessionAffinityKey(String);
 
@@ -239,59 +239,88 @@ impl fmt::Debug for ProviderSessionAffinityKey {
     }
 }
 
-/// 可丢失的会话到账号偏好；Provider 负责先把原始会话标识哈希为不透明键。
+/// 会话绑定快照；版本区分同一账号的不同认领，防止过期和 A → B → A 后的旧写入
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSessionBinding {
+    account_id: ProviderAccountId,
+    revision: String,
+}
+
+impl ProviderSessionBinding {
+    pub fn new(
+        account_id: ProviderAccountId,
+        revision: String,
+    ) -> Result<Self, ProviderStoreError> {
+        if revision.len() != 32 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ProviderStoreError::new(
+                ProviderStoreErrorKind::InvalidData,
+                "decode provider session binding revision",
+            ));
+        }
+        Ok(Self {
+            account_id,
+            revision,
+        })
+    }
+
+    #[must_use]
+    pub const fn account_id(&self) -> &ProviderAccountId {
+        &self.account_id
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+}
+
+/// 已观测请求关联及其账号迁移权限，由 Provider 解释协议后写入
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSessionAlias {
+    pub session_key: ProviderSessionAffinityKey,
+    pub follow_only: bool,
+}
+
+/// 客户端作用域内的会话账号绑定，原始会话身份由 Provider 哈希后传入
 pub trait ProviderSessionAffinityPort: Send + Sync {
     fn load<'a>(
         &'a self,
         provider_kind: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-    ) -> BoxFuture<'a, Result<Option<ProviderAccountId>, ProviderStoreError>>;
+    ) -> BoxFuture<'a, Result<Option<ProviderSessionBinding>, ProviderStoreError>>;
 
-    fn bind<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        account_id: &'a ProviderAccountId,
-        ttl: Duration,
-    ) -> BoxFuture<'a, Result<(), ProviderStoreError>>;
-
-    /// 仅在亲和键尚未绑定时写入候选账号，并返回原子操作后的实际绑定。
-    ///
-    /// 已存在的绑定绝不会被候选账号覆盖；同一根会话的并发首次请求据此收敛到
-    /// 单一账号。TTL 只在首次写入时设置，已有绑定由成功反馈负责刷新。
-    fn claim_or_load<'a>(
-        &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
-        candidate_account_id: &'a ProviderAccountId,
-        ttl: Duration,
-    ) -> BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>>;
-
-    /// 仅当当前绑定等于 `expected_account_id`（或键已过期）时写入新账号，
-    /// 并返回原子操作后的实际绑定。
-    ///
-    /// Provider 用它迁移不可用账号，以及在成功后以 `expected == replacement`
-    /// 刷新 TTL；迟到的旧账号成功不能覆盖较新的会话 winner。
+    /// 在发送前原子认领、续期或迁移；None 表示快照已变化，调用方必须释放租约重新选择
+    /// expected 为 None 只允许首次认领，已有快照必须连同版本匹配
     fn compare_and_bind<'a>(
         &'a self,
         provider_kind: &'a ProviderKind,
         key: &'a ProviderSessionAffinityKey,
-        expected_account_id: &'a ProviderAccountId,
-        replacement_account_id: &'a ProviderAccountId,
+        expected: Option<&'a ProviderSessionBinding>,
+        account_id: &'a ProviderAccountId,
         ttl: Duration,
-    ) -> BoxFuture<'a, Result<ProviderAccountId, ProviderStoreError>>;
+    ) -> BoxFuture<'a, Result<Option<ProviderSessionBinding>, ProviderStoreError>>;
 
-    fn clear<'a>(
+    /// 显式观测到的请求关联只指向会话键，不缓存账号，迁移后仍读取当前绑定
+    fn load_alias<'a>(
         &'a self,
-        provider_kind: &'a ProviderKind,
-        key: &'a ProviderSessionAffinityKey,
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+    ) -> BoxFuture<'a, Result<Option<ProviderSessionAlias>, ProviderStoreError>>;
+
+    /// 只允许首次关联或同目标续期，冲突时禁止把同一轮次改指其他会话
+    fn bind_alias<'a>(
+        &'a self,
+        provider: &'a ProviderKind,
+        alias: &'a ProviderSessionAffinityKey,
+        session: &'a ProviderSessionAlias,
+        ttl: Duration,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>>;
 }
 
-/// Provider 会话内已失败账号的可丢失排除集。
+/// Provider 会话内已失败账号的可丢失排除集
 ///
 /// Provider 自行派生会话键并决定何时写入或清理；Core 只承载调度所需的账号 ID
-/// 与 compare-and-swap revision，不解释任一 Provider 协议字段。
+/// 与 compare-and-swap revision，不解释任一 Provider 协议字段
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSessionExclusions {
     excluded_accounts: BTreeSet<ProviderAccountId>,
@@ -318,9 +347,9 @@ impl ProviderSessionExclusions {
     }
 }
 
-/// 可丢失的 Provider 会话级账号排除状态。
+/// 可丢失的 Provider 会话级账号排除状态
 ///
-/// 该端口不接收协议正文；Provider 只能以不可逆会话键、账号 ID 和固定 TTL 操作。
+/// 该端口不接收协议正文；Provider 只能以不可逆会话键、账号 ID 和固定 TTL 操作
 pub trait ProviderSessionExclusionPort: Send + Sync {
     fn load<'a>(
         &'a self,
@@ -344,7 +373,7 @@ pub trait ProviderSessionExclusionPort: Send + Sync {
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>>;
 }
 
-/// 所有 Provider 共享的 OAuth refresh 并发容量。
+/// 所有 Provider 共享的 OAuth refresh 并发容量
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderRefreshCapacityRequest {
     max_concurrent: NonZeroU32,
@@ -391,32 +420,32 @@ impl ProviderRefreshLeaseRequest {
     }
 }
 
-/// Provider 定义的 catalog cache 作用域。
+/// Provider 定义的 catalog cache 作用域
 ///
-/// Core 不解释其值；例如 Provider 可以使用套餐、区域或产品线作为共享目录边界。
+/// Core 不解释其值；例如 Provider 可以使用套餐、区域或产品线作为共享目录边界
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderCatalogScope(String);
 
 impl ProviderCatalogScope {
-    /// 创建一个稳定且可用于 Redis 隔离键的 Provider-owned 作用域。
+    /// 创建一个稳定且可用于 Redis 隔离键的 Provider-owned 作用域
     ///
     /// # Errors
     ///
-    /// 空值、过长文本或控制字符会被拒绝。
+    /// 空值、过长文本或控制字符会被拒绝
     pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
         let value = value.into();
         validate_text(&value, 128, false, None)?;
         Ok(Self(value))
     }
 
-    /// 返回 Provider-owned 作用域文本。
+    /// 返回 Provider-owned 作用域文本
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// Opaque catalog cache 的 Provider 与 Provider-owned 作用域。
+/// Opaque catalog cache 的 Provider 与 Provider-owned 作用域
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCatalogCacheKey {
     provider_kind: ProviderKind,
@@ -457,10 +486,11 @@ pub trait ProviderCatalogCachePort: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<OpaqueProviderData>, ProviderStoreError>>;
 }
 
-/// Provider 从官方制品核验出的可重建请求画像。
+/// Provider 从官方制品核验出的可重建请求画像
 ///
 /// Core 只用单调制品序号约束覆盖顺序；具体版本字段由对应 Provider 放在
-/// `profile` 中解释。每个 Provider 的各制品分别保留一份最新画像。
+/// `profile` 中解释
+/// 每个 Provider 的各制品分别保留一份最新画像
 #[derive(Clone, PartialEq)]
 pub struct ProviderArtifactProfile {
     provider_kind: ProviderKind,
@@ -527,10 +557,10 @@ impl fmt::Debug for ProviderArtifactProfile {
 }
 
 pub trait ProviderArtifactProfileCachePort: Send + Sync {
-    /// 覆盖同一 Provider、同一制品的固定 cache key。
+    /// 覆盖同一 Provider、同一制品的固定 cache key
     ///
     /// 返回 `false` 表示 Store 已持有更高的制品序号；相同序号但内容不同必须返回
-    /// [`ProviderStoreErrorKind::Conflict`]，不能静默改写已核验画像。
+    /// [`ProviderStoreErrorKind::Conflict`]，不能静默改写已核验画像
     fn replace_if_newer(
         &self,
         profile: ProviderArtifactProfile,
@@ -544,7 +574,7 @@ pub trait ProviderArtifactProfileCachePort: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<ProviderArtifactProfile>, ProviderStoreError>>;
 }
 
-/// Redis 中可重建的账号状态投影。
+/// Redis 中可重建的账号状态投影
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCredentialState {
     account_id: ProviderAccountId,
@@ -614,24 +644,24 @@ pub trait ProviderCredentialStatePort: Send + Sync {
         account_id: &'a ProviderAccountId,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>>;
 
-    /// 记录一次瞬态刷新失败并返回窗口内累计失败次数；每次失败刷新 TTL。
+    /// 记录一次瞬态刷新失败并返回窗口内累计失败次数；每次失败刷新 TTL
     fn record_refresh_backoff<'a>(
         &'a self,
         account_id: &'a ProviderAccountId,
         window: Duration,
     ) -> BoxFuture<'a, Result<u32, ProviderStoreError>>;
 
-    /// 凭据完整成功轮换后清零失败计数，退避窗口重新从 base 起步。
+    /// 凭据完整成功轮换后清零失败计数，退避窗口重新从 base 起步
     fn clear_refresh_backoff<'a>(
         &'a self,
         account_id: &'a ProviderAccountId,
     ) -> BoxFuture<'a, Result<(), ProviderStoreError>>;
 }
 
-/// 账号级 cooldown 的来源类别；调度状态统一按 `rate_limited` 处理。
+/// 账号级 cooldown 的来源类别；调度状态统一按 `rate_limited` 处理
 pub use crate::account::AccountCooldownKind as ProviderCooldownKind;
 
-/// 可丢失的账号冷却事实，不进入持久状态；探测冻结到期后仍需确认恢复。
+/// 可丢失的账号冷却事实，不进入持久状态；探测冻结到期后仍需确认恢复
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCooldown {
     account_id: ProviderAccountId,
@@ -699,10 +729,10 @@ impl ProviderCooldown {
     }
 }
 
-/// 可丢失 cooldown 的细粒度作用域。
+/// 可丢失 cooldown 的细粒度作用域
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProviderCooldownScope {
-    /// 只阻止同一账号调用指定上游模型。
+    /// 只阻止同一账号调用指定上游模型
     UpstreamModel(UpstreamModelId),
 }
 
@@ -727,7 +757,7 @@ impl ProviderCooldownScope {
     }
 }
 
-/// 不进入账号持久状态的账号+作用域 cooldown。
+/// 不进入账号持久状态的账号+作用域 cooldown
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderScopedCooldown {
     account_id: ProviderAccountId,
@@ -808,16 +838,16 @@ pub trait ProviderCooldownPort: Send + Sync {
         through_revision: CredentialRevision,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>>;
 
-    /// 删除账号时清除该账号全部 account/model scope cooldown key。
-    /// 生命周期与 credential revision 无关；不要求调用方持有 revision。
+    /// 删除账号时清除该账号全部 account/model scope cooldown key
+    /// 生命周期与 credential revision 无关；不要求调用方持有 revision
     fn clear_all<'a>(
         &'a self,
         account_id: &'a ProviderAccountId,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>>;
 
     /// 记录一次容量类失败并返回滑动窗口内的累计次数，同时把观测到的账号
-    /// 在途并发并入窗口峰值（`in_flight` 为 0 表示本次未观测，跳过峰值更新）。
-    /// 只服务容量熔断触发器；调用频率受失败频率约束，不需要批量接口。
+    /// 在途并发并入窗口峰值（`in_flight` 为 0 表示本次未观测，跳过峰值更新）
+    /// 只服务容量熔断触发器；调用频率受失败频率约束，不需要批量接口
     fn record_capacity_failure<'a>(
         &'a self,
         account_id: &'a ProviderAccountId,
@@ -825,14 +855,14 @@ pub trait ProviderCooldownPort: Send + Sync {
         in_flight: u32,
     ) -> BoxFuture<'a, Result<u32, ProviderStoreError>>;
 
-    /// 普通请求成功后原子清除临时限流及失败证据；必须保留任何容量冻结。
+    /// 普通请求成功后原子清除临时限流及失败证据；必须保留任何容量冻结
     fn clear_after_success<'a>(
         &'a self,
         account_id: &'a ProviderAccountId,
         through_revision: CredentialRevision,
     ) -> BoxFuture<'a, Result<(), ProviderStoreError>>;
 
-    /// 读取窗口内观测到的在途并发峰值；无证据时返回 `None`。
+    /// 读取窗口内观测到的在途并发峰值；无证据时返回 `None`
     fn capacity_peak_in_flight<'a>(
         &'a self,
         account_id: &'a ProviderAccountId,
@@ -869,10 +899,10 @@ impl ProviderRefreshPolicy {
         self.concurrency
     }
 
-    /// 判断 AT 是否已经进入当前配置的提前刷新窗口。
+    /// 判断 AT 是否已经进入当前配置的提前刷新窗口
     ///
     /// `margin` 是运行时策略，不投影为账号的持久化时间字段；已过期 AT 也需要
-    /// 尝试用 RT 恢复，因此视为到期。
+    /// 尝试用 RT 恢复，因此视为到期
     #[must_use]
     pub fn is_refresh_due(
         self,
@@ -884,19 +914,63 @@ impl ProviderRefreshPolicy {
             Err(_) => true,
         }
     }
+
+    /// 按账号派生 `[0, margin]` 内的整秒错峰偏移。
+    ///
+    /// 网关以固定周期扫描到期账号，到期时刻相同的账号会在同一轮齐刷，
+    /// 在 auth.openai.com 侧形成单 IP 批量刷新特征。偏移从账号 ID 的
+    /// 稳定哈希派生（与退避扰动同源、独立 salt），跨扫描与重启保持不变；
+    /// 只会增大有效提前量，不会比配置的 margin 更贴近过期时刻。
+    #[must_use]
+    pub fn refresh_stagger(self, account_id: &ProviderAccountId) -> Duration {
+        // margin 以整秒配置；秒级粒度在默认 300s 下对应约 10 个扫描槽位。
+        let bound = u32::try_from(self.margin.as_secs()).unwrap_or(u32::MAX);
+        Duration::from_secs(u64::from(stable_factor(
+            account_id.as_str(),
+            "refresh-stagger",
+            0,
+            bound,
+        )))
+    }
+
+    /// 含账号错峰偏移的到期判定；扫描路径先按 [`Self::staggered_refresh_bound`]
+    /// 取回候选超集，再用它在内存中收窄到本轮真正到期的账号。
+    #[must_use]
+    pub fn is_refresh_due_staggered(
+        self,
+        account_id: &ProviderAccountId,
+        access_token_expires_at: SystemTime,
+        observed_at: SystemTime,
+    ) -> bool {
+        let staggered_margin = self.margin.saturating_add(self.refresh_stagger(account_id));
+        match access_token_expires_at.duration_since(observed_at) {
+            Ok(remaining) => remaining <= staggered_margin,
+            Err(_) => true,
+        }
+    }
+
+    /// 错峰候选窗口上界；覆盖 margin 与最大偏移之和。
+    ///
+    /// 与 [`Self::refresh_stagger`] 的值域同址维护：偏移上限为 margin，
+    /// 因此 `2 × margin` 必然覆盖最大有效提前量。
+    #[must_use]
+    pub fn staggered_refresh_bound(self) -> Duration {
+        self.margin.saturating_mul(2)
+    }
 }
 
-/// 指数退避基准延迟；attempt=1 即为该值。
+/// 指数退避基准延迟；attempt=1 即为该值
 const REFRESH_BACKOFF_BASE_DELAY: Duration = Duration::from_secs(5);
-/// 每多一次连续失败，基准延迟乘以该因子。
+/// 每多一次连续失败，基准延迟乘以该因子
 const REFRESH_BACKOFF_FACTOR: u32 = 3;
-/// 退避延迟上限，避免连续失败时无限增长。
+/// 退避延迟上限，避免连续失败时无限增长
 const REFRESH_BACKOFF_CAP: Duration = Duration::from_secs(300);
 
-/// 基于连续失败计数的指数退避重试时刻；复用 `provider_refresh_retry_at` 的稳定扰动。
+/// 基于连续失败计数的指数退避重试时刻；复用 `provider_refresh_retry_at` 的稳定扰动
 ///
-/// `attempt` 为窗口内累计失败次数（0 与 1 等价，均取基准延迟）。延迟按
-/// `base * factor^(attempt-1)` 增长并封顶到 `REFRESH_BACKOFF_CAP`。
+/// `attempt` 为窗口内累计失败次数（0 与 1 等价，均取基准延迟）
+/// 延迟按
+/// `base * factor^(attempt-1)` 增长并封顶到 `REFRESH_BACKOFF_CAP`
 pub fn provider_refresh_backoff_at(
     account_id: &ProviderAccountId,
     observed_at: SystemTime,
@@ -913,7 +987,7 @@ pub fn provider_refresh_backoff_at(
     provider_refresh_retry_at(account_id, observed_at, base_delay, reason)
 }
 
-/// 临时失败后的持久重试时刻；稳定扰动避免多实例同频重试。
+/// 临时失败后的持久重试时刻；稳定扰动避免多实例同频重试
 pub fn provider_refresh_retry_at(
     account_id: &ProviderAccountId,
     observed_at: SystemTime,
@@ -949,7 +1023,7 @@ fn invalid_refresh_policy(operation: &'static str) -> ProviderStoreError {
 }
 
 pub trait ProviderRuntimePolicyPort: Send + Sync {
-    /// 原子推进预热执行游标，重启或时钟回拨后不重复领取已消费的时刻。
+    /// 原子推进预热执行游标，重启或时钟回拨后不重复领取已消费的时刻
     fn claim_warmup_slot<'a>(
         &'a self,
         _timezone: crate::time::DeploymentTimeZone,
@@ -962,7 +1036,7 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
             ))
         })
     }
-    /// 仅首次启动写入该 Provider 的默认选择；已保存的管理配置始终优先。
+    /// 仅首次启动写入该 Provider 的默认选择；已保存的管理配置始终优先
     fn initialize_request_profile<'a>(
         &'a self,
         _provider: &'a ProviderKind,
@@ -971,10 +1045,11 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
         Box::pin(async move { Ok(initial) })
     }
 
-    /// 读取候选配置版本实际引用的全局与 Client Key 画像配置。
+    /// 读取候选配置版本实际引用的全局与 Client Key 画像配置
     ///
     /// 实现必须在同一数据库快照内核对 revision，且只返回画像投影，不能读取 Key
-    /// 明文。Provider 代次据此在发布前拒绝已失效的选择。
+    /// 明文
+    /// Provider 代次据此在发布前拒绝已失效的选择
     fn load_request_profile_configurations<'a>(
         &'a self,
         _revision: ConfigRevision,
@@ -987,14 +1062,14 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
         &self,
     ) -> BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>>;
 
-    /// 读取账号容量熔断策略；默认关闭，只有实现运行时设置的存储需要覆盖。
+    /// 读取账号容量熔断策略；默认关闭，只有实现运行时设置的存储需要覆盖
     fn load_freeze_policy(
         &self,
     ) -> BoxFuture<'_, Result<ProviderFreezePolicy, ProviderStoreError>> {
         Box::pin(async move { Ok(ProviderFreezePolicy::disabled()) })
     }
 
-    /// 读取账号模型预激活策略；默认关闭，只有实现运行时设置的存储需要覆盖。
+    /// 读取账号模型预激活策略；默认关闭，只有实现运行时设置的存储需要覆盖
     fn load_warmup_policy(
         &self,
     ) -> BoxFuture<'_, Result<ProviderWarmupPolicy, ProviderStoreError>> {
@@ -1003,7 +1078,7 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
 }
 
 /// 账号容量熔断（自动冻结）策略；来源于 `runtime_settings`，
-/// 由 Provider 触发路径与恢复 worker 共享同一份配置事实。
+/// 由 Provider 触发路径与恢复 worker 共享同一份配置事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFreezePolicy {
     enabled: bool,
@@ -1017,7 +1092,7 @@ pub struct ProviderFreezePolicy {
 
 impl ProviderFreezePolicy {
     /// 边界与迁移 `0010_account_auto_freeze.sql` 的 check 约束一致；
-    /// store 层写入前已校验，这里兜底防御越界配置。
+    /// store 层写入前已校验，这里兜底防御越界配置
     pub fn try_new(
         enabled: bool,
         threshold: u32,
@@ -1053,7 +1128,7 @@ impl ProviderFreezePolicy {
         })
     }
 
-    /// 功能关闭时的全零策略；触发路径与 worker 都以此短路。
+    /// 功能关闭时的全零策略；触发路径与 worker 都以此短路
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
@@ -1072,19 +1147,19 @@ impl ProviderFreezePolicy {
         self.enabled
     }
 
-    /// 窗口内触发冻结的请求级失败次数阈值。
+    /// 窗口内触发冻结的请求级失败次数阈值
     #[must_use]
     pub const fn threshold(&self) -> u32 {
         self.threshold
     }
 
-    /// 失败计数滑动窗口；每次失败都会顺延窗口。
+    /// 失败计数滑动窗口；每次失败都会顺延窗口
     #[must_use]
     pub const fn window(&self) -> Duration {
         self.window
     }
 
-    /// 冻结时长；探测失败后的顺延也使用该值。
+    /// 冻结时长；探测失败后的顺延也使用该值
     #[must_use]
     pub const fn freeze_duration(&self) -> Duration {
         self.freeze_duration
@@ -1095,7 +1170,7 @@ impl ProviderFreezePolicy {
         self.probe_enabled
     }
 
-    /// 探测模型；`None` 表示由 worker 选择账号可用的第一个模型。
+    /// 探测模型；`None` 表示由 worker 选择账号可用的第一个模型
     #[must_use]
     pub fn probe_model(&self) -> Option<&str> {
         self.probe_model.as_deref()
@@ -1107,7 +1182,7 @@ impl ProviderFreezePolicy {
     }
 }
 
-/// 校验每日预激活时间格式，如 "08:00" 或 "08:00,13:00"。
+/// 校验每日预激活时间格式，如 "08:00" 或 "08:00,13:00"
 #[must_use]
 pub fn valid_warmup_schedule_time(value: &str) -> bool {
     if value.is_empty()
@@ -1135,7 +1210,7 @@ pub fn valid_warmup_schedule_time(value: &str) -> bool {
     true
 }
 
-/// 账号模型预激活（预热）策略；来源于 `runtime_settings`。
+/// 账号模型预激活（预热）策略；来源于 `runtime_settings`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderWarmupPolicy {
     enabled: bool,
@@ -1194,7 +1269,7 @@ impl ProviderWarmupPolicy {
         self.model.as_deref()
     }
 
-    /// 解析每日时间列表，返回如 `vec![(8, 0)]`。
+    /// 解析每日时间列表，返回如 `vec![(8, 0)]`
     #[must_use]
     pub fn scheduled_times(&self) -> Vec<(u32, u32)> {
         self.schedule_time
@@ -1210,7 +1285,7 @@ impl ProviderWarmupPolicy {
     }
 }
 
-/// OAuth pending flow 的原始绑定只在 Provider 与 Store 边界内短暂存在。
+/// OAuth pending flow 的原始绑定只在 Provider 与 Store 边界内短暂存在
 #[derive(Clone, PartialEq, Eq)]
 pub struct OAuthPendingBinding(String);
 
@@ -1315,10 +1390,10 @@ pub enum OAuthPendingPutOutcome {
     AlreadyExists,
 }
 
-/// OAuth 回调处理取得临时 flow 的独占权结果。
+/// OAuth 回调处理取得临时 flow 的独占权结果
 ///
 /// 与一次性消费不同，Provider 在上游换取令牌失败时可以释放 claim，让同一 flow
-/// 使用新的回调地址重试；只有完整校验成功后才会消费 flow。
+/// 使用新的回调地址重试；只有完整校验成功后才会消费 flow
 #[derive(Clone, PartialEq)]
 pub enum OAuthPendingClaimOutcome {
     Claimed(OpaqueProviderData),
@@ -1386,7 +1461,7 @@ pub trait OAuthPendingFlowPort: Send + Sync {
     ) -> BoxFuture<'a, Result<OAuthPendingConsumeOutcome, ProviderStoreError>>;
 }
 
-/// Provider 只能按能力取用端口，无法取得 Redis client 或 repository 集合。
+/// Provider 只能按能力取用端口，无法取得 Redis client 或 repository 集合
 #[derive(Clone)]
 pub struct ProviderStorePorts {
     accounts: Arc<dyn ProviderAccountStore>,
@@ -1404,7 +1479,7 @@ pub struct ProviderStorePorts {
 
 impl ProviderStorePorts {
     #[must_use]
-    // 每个参数代表独立能力端口；合并为单一配置对象会隐藏 Provider 能力边界。
+    // 每个参数代表独立能力端口；合并为单一配置对象会隐藏 Provider 能力边界
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         accounts: Arc<dyn ProviderAccountStore>,

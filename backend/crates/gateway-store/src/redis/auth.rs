@@ -1,4 +1,4 @@
-//! 控制面统一会话与双层固定窗口登录限流。
+//! 控制面统一会话与双层固定窗口登录限流
 
 use std::time::Duration;
 
@@ -53,6 +53,46 @@ impl RedisAuthStateRepository {
 
 #[async_trait]
 impl AuthStateRepository for RedisAuthStateRepository {
+    async fn renew_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSessionRecord,
+        expires_at: DateTime<Utc>,
+    ) -> StoreResult<Option<AuthSessionRecord>> {
+        if expires_at < expected.expires_at
+            || expected
+                .absolute_expires_at
+                .is_none_or(|limit| expires_at > limit)
+        {
+            return Err(auth_invalid("session renewal is outside its lifetime"));
+        }
+        let renewed = AuthSessionRecord {
+            expires_at,
+            ..expected.clone()
+        };
+        renewed.validate()?;
+        let expiry = redis_expiry(renewed.expires_at)?;
+        // 比较和写入在同一脚本完成；GET 会检查 Redis 到期，退出后的键不能复活
+        let payload: Option<String> = Script::new(
+            r#"
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then
+    redis.call('SET', KEYS[1], ARGV[2], 'PXAT', ARGV[3], 'XX')
+    return ARGV[2]
+end
+return current
+"#,
+        )
+        .key(self.session_key(session_id)?)
+        .arg(encode_session(expected)?)
+        .arg(encode_session(&renewed)?)
+        .arg(expiry)
+        .invoke_async(&mut self.connection.clone())
+        .await
+        .map_err(|_| redis_unavailable("renew authentication session"))?;
+        payload.map(|value| decode_session(&value)).transpose()
+    }
+
     async fn load_session(&self, session_id: &str) -> StoreResult<Option<AuthSessionRecord>> {
         let key = self.session_key(session_id)?;
         let mut connection = self.connection.clone();
@@ -71,13 +111,7 @@ impl AuthStateRepository for RedisAuthStateRepository {
     ) -> StoreResult<()> {
         let key = self.session_key(session_id)?;
         session.validate()?;
-        let expires_at_millis = u64::try_from(session.expires_at.timestamp_millis())
-            .map_err(|_| auth_invalid("session expiry is outside the supported range"))?;
-        if expires_at_millis > MAX_REDIS_EXACT_INTEGER {
-            return Err(auth_invalid(
-                "session expiry is outside the supported range",
-            ));
-        }
+        let expires_at_millis = redis_expiry(session.expires_at)?;
         let payload = encode_session(session)?;
         let mut connection = self.connection.clone();
         redis::cmd("SET")
@@ -142,6 +176,8 @@ impl AuthStateRepository for RedisAuthStateRepository {
 struct AuthSessionWire {
     subject: SessionSubjectRecord,
     expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    absolute_expires_at: Option<String>,
 }
 
 fn encode_session(session: &AuthSessionRecord) -> StoreResult<String> {
@@ -150,6 +186,9 @@ fn encode_session(session: &AuthSessionRecord) -> StoreResult<String> {
         expires_at: session
             .expires_at
             .to_rfc3339_opts(SecondsFormat::Nanos, true),
+        absolute_expires_at: session
+            .absolute_expires_at
+            .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true)),
     })
     .map_err(|_| auth_invalid("session value cannot be encoded"))
 }
@@ -167,6 +206,7 @@ fn decode_session(value: &str) -> StoreResult<AuthSessionRecord> {
     Ok(AuthSessionRecord {
         subject: wire.subject,
         expires_at,
+        absolute_expires_at: wire.absolute_expires_at.as_deref().map(parse).transpose()?,
     })
 }
 
@@ -175,4 +215,15 @@ fn auth_invalid(message: &str) -> StoreError {
         entity: "authentication state",
         message: message.to_owned(),
     }
+}
+
+fn redis_expiry(expires_at: DateTime<Utc>) -> StoreResult<u64> {
+    let millis = u64::try_from(expires_at.timestamp_millis())
+        .map_err(|_| auth_invalid("session expiry is outside the supported range"))?;
+    if millis > MAX_REDIS_EXACT_INTEGER {
+        return Err(auth_invalid(
+            "session expiry is outside the supported range",
+        ));
+    }
+    Ok(millis)
 }

@@ -1,4 +1,4 @@
-//! xAI 上游失败分类、账号反馈与恢复决策。
+//! xAI 上游失败分类、账号反馈与恢复决策
 
 use super::*;
 use gateway_core::error::ProviderDiagnostic;
@@ -384,7 +384,7 @@ pub(super) fn map_request_error(error: GrokRequestEncodeError) -> ProviderError 
     ))
 }
 
-/// 将选择阶段失败映射为带结构化 code 与 retry_after 的 Provider 错误。
+/// 将选择阶段失败映射为带结构化 code 与 retry_after 的 Provider 错误
 pub(super) fn map_selection_error(error: GrokSessionSelectorError) -> ProviderError {
     let (retry_after, message, code) = match error {
         GrokSessionSelectorError::QueueRejected(error) => {

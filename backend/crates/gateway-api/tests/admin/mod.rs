@@ -1,3 +1,5 @@
+//! 管理控制面 HTTP 接口的测试入口
+
 mod plugins;
 use std::{
     collections::BTreeMap,
@@ -69,6 +71,7 @@ use gateway_admin::{
 };
 use gateway_api::auth::SessionState;
 use gateway_core::{
+    account::FastMode,
     account::{AccountStatusFacts, CredentialState, ProviderAccountId, QuotaState},
     engine::{
         execution::{ClientAuthenticationError, ClientKeyVerifier},
@@ -182,6 +185,7 @@ impl AdminTestFixture {
         ];
         let bundle = gateway_admin::initialize(
             AdminConfig {
+                session_absolute_ttl_minutes: 30 * 24 * 60,
                 session_ttl_minutes: 60,
                 default_username: "admin_1".to_owned(),
                 default_password: InitialAdminPassword::new("strong-admin-password"),
@@ -310,6 +314,7 @@ impl MemoryAuthStore {
                     },
                     admin_user_id: "admin_1".to_owned(),
                 },
+                absolute_expires_at: None,
                 expires_at: Utc::now() + Duration::hours(1),
             },
         );
@@ -321,6 +326,15 @@ impl MemoryAuthStore {
 
     pub fn fail_audit(&self, fail: bool) {
         self.fail_audit.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_session_expiry(&self, session_id: &str, expires_at: chrono::DateTime<Utc>) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get_mut(session_id)
+            .unwrap()
+            .expires_at = expires_at;
     }
 
     pub fn session_count(&self) -> usize {
@@ -392,6 +406,25 @@ impl AuthStore for MemoryAuthStore {
             .expect("sessions")
             .insert(session_id.to_owned(), session.clone());
         Ok(())
+    }
+
+    async fn renew_session(
+        &self,
+        session_id: &str,
+        expected: &AuthSession,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> AdminStoreResult<Option<AuthSession>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(session_id) {
+            if session.expires_at <= chrono::Utc::now() {
+                return Ok(None);
+            }
+            if session == expected {
+                session.expires_at = expires_at;
+            }
+            return Ok(Some(session.clone()));
+        }
+        Ok(None)
     }
 
     async fn delete_session(&self, session_id: &str) -> AdminStoreResult<Option<AuthSession>> {
@@ -655,7 +688,7 @@ impl MemoryAccountGroupStore {
             (
                 primary_id.clone(),
                 AccountGroupRecord {
-                    disable_fast: false,
+                    fast_mode: FastMode::Default,
                     id: primary_id,
                     name: "Alpha routing".to_owned(),
                     description: Some("Primary traffic".to_owned()),
@@ -677,7 +710,7 @@ impl MemoryAccountGroupStore {
             (
                 secondary_id.clone(),
                 AccountGroupRecord {
-                    disable_fast: false,
+                    fast_mode: FastMode::Default,
                     id: secondary_id,
                     name: "Beta routing".to_owned(),
                     description: None,
@@ -793,7 +826,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         let mut state = self.state.lock().expect("account groups");
         let now = Utc::now();
         let record = AccountGroupRecord {
-            disable_fast: command.disable_fast,
+            fast_mode: command.fast_mode,
             id: command.id.clone(),
             name: command.name,
             description: command.description,
@@ -825,8 +858,8 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         record.name = command.name;
         record.description = command.description;
         record.color = command.color;
-        if let Some(disable_fast) = command.disable_fast {
-            record.disable_fast = disable_fast;
+        if let Some(fast_mode) = command.fast_mode {
+            record.fast_mode = fast_mode;
         }
         record.updated_at = Utc::now();
         mutation(&mut state, command.id, true)

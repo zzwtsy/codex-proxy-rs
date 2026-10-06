@@ -8,7 +8,7 @@
 | --- | --- |
 | 安装与启动 | [手动安装](#手动安装) · [启动](#启动) · [公网访问](#公网访问) |
 | 接入客户端 | [客户端配置](#客户端配置) · [登录与生图排查](#登录与生图排查) |
-| 日常运维 | [运行设置](#启动后的运行设置) · [持久化与日志](#持久化与备份) · [请求排查](#请求错误排查) · [密码轮换](#密码语义) |
+| 日常运维 | [运行设置](#启动后的运行设置) · [小内存优化](#小内存优化) · [持久化与日志](#持久化与备份) · [请求排查](#请求错误排查) · [密码轮换](#密码语义) |
 | 更新与恢复 | [镜像升级](#镜像升级与源码构建) · [在线更新](#管理端在线更新) · [备份与恢复](#备份与恢复) · [优雅关停](#优雅关停) |
 | 运行源码 | [开发与源码联调](../docs/development.md) |
 
@@ -27,6 +27,8 @@
 Compose 命令从安装目录运行，并通过 `--env-file .env` 显式加载 Compose 插值。PostgreSQL + Redis 模式将服务密码传给应用和基础设施容器；SQLite 模式不读取数据库或 Redis 密码，也不声明这些服务。后端进程本身不读取 `.env`。
 PostgreSQL 模式的密码从 `store.database.password` 或 `CPR_DATABASE_PASSWORD` 读取；Redis 密码可留空、省略，或将 `CPR_REDIS_PASSWORD` 设为空以关闭认证。镜像、构建与发布选项仍通过 Compose 环境变量配置。配置加载会忽略未知字段，并在启动控制台提示字段名；
 不输出对应值。缺少必填字段时会指出缺项并停止启动，已知字段的类型和取值仍需合法；可选字段省略时使用默认值
+
+可选的 Linux/glibc 内存分配策略通过 `config.yaml` 的 `services.app-runtime` 桥接到应用容器；默认关闭，配置和重建方式见[小内存优化](#小内存优化)
 
 后端从当前目录向上查找 `deploy/config.yaml`，相对数据、日志和静态资源路径以该文件所在目录解析
 
@@ -51,6 +53,44 @@ host:
 切换时区保留已打开限额窗口的 UTC 边界与用量，到期后按新时区续接；不会因重启立即清零。
 备份调度从切换后的当前时刻计算未来执行点，不补跑旧时区漏过的任务，已入队任务保持原状态。
 夏令时中不存在的预热或 Cron 时刻跳过，重复时刻只选较早一次。日志日期与保留规则见[日志与保留窗口](#日志与保留窗口)
+
+### 小内存优化
+
+Linux/glibc 部署可选择更积极地归还请求结束后的空闲内存，适合内存紧张且请求后 RSS 长时间偏高的机器。
+该选项默认关闭，官方 Linux 镜像支持；更频繁的映射与回收可能增加 CPU 开销，应结合实际负载观察
+
+在 `deploy/config.yaml` 的 `services.app-runtime.environment` 中设置 `GLIBC_TUNABLES`，空字符串表示不启用额外调优：
+
+```yaml
+services:
+  app-runtime:
+    environment:
+      GLIBC_TUNABLES: 'glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072'
+```
+
+已有部署使用当前 Compose 模板时，需将 `config.example.yaml` 的 `app-runtime` 段合并到现有 `services` 下，保留 PostgreSQL 和 Redis 的桥接配置。
+即使不开启优化，也保留该段并将值设为 `''`；Compose 从这里取得参数，无需在 `compose.yaml` 重复填写
+
+校验并重建应用容器使配置生效；`docker compose restart` 不会更新容器环境变量：
+
+```bash
+docker compose -f deploy/compose.yaml config --quiet
+docker compose -f deploy/compose.yaml up -d --no-build --no-deps --force-recreate codex-proxy-rs
+```
+
+此配置将 glibc 的 mmap 与 trim 阈值固定为 128 KiB，关闭对应的动态阈值调整。
+如已有 `GLIBC_TUNABLES`，用冒号合并这两个参数，避免重复同名项；同时检查是否另设了 `MALLOC_MMAP_THRESHOLD_` 或 `MALLOC_TRIM_THRESHOLD_`，统一在一处维护。
+参数含义见 [glibc 文档](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)
+
+关闭时删除这两个参数；没有其他 tunable 时将值恢复为 `''`，然后再次重建应用容器。
+`services` 是 Compose 桥接区，直接运行二进制不会读取这一段。Linux/glibc 二进制部署需由启动器在进程启动前设置同一环境变量，例如：
+
+```bash
+GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072 ./codex-proxy-rs
+```
+
+该变量由 glibc 在进程启动时读取，不支持管理端热更新。
+它不设置内存上限，不释放仍被请求或连接持有的缓冲，也不处理容器文件缓存；观察时分别比较进程 RSS、cgroup 的 `anon` 与 `file`
 
 ## 部署结构
 
@@ -116,8 +156,12 @@ chmod 0600 .env
 ```
 
 管理员初始密码至少需要 12 个字符，不能是常见弱口令，也不能包含 `$`。
-`client.session_ttl_minutes` 控制统一登录中密钥身份的固定会话有效期，默认 1440 分钟；管理员有效期仍由
-`admin.session_ttl_minutes` 控制。两种身份共用一个 Cookie，成功登录替换旧会话；不改变 `/v1/*` 鉴权和限额
+管理员的 `admin.session_ttl_minutes` 控制不活动期限，`admin.session_absolute_ttl_minutes` 控制从登录起计算的最长有效期，
+后者省略时为 43200 分钟（30 天）。配置模板分别为 10080 分钟（7 天）和 43200 分钟；已有配置保留自己的不活动期限。
+使用管理页面时会自动续期，最终到期时间不超过最长有效期；修改配置需重启，已有会话的最长有效期不会因此延长。
+缺少最长有效期记录的会话保持原有固定期限，重新登录后应用续期策略。
+`client.session_ttl_minutes` 控制密钥身份的固定有效期，默认 1440 分钟，不随活动续期。
+两种身份共用一个 Cookie，成功登录替换当前浏览器的旧会话；不改变 `/v1/*` 鉴权和限额
 
 应用要求 PostgreSQL 密码非空，接受任意字符串；Redis 密码可留空或省略，留空时连接 URL 不包含密码认证。
 默认 Compose 的内置 PostgreSQL 与 Redis 仍要求密码，安装器为它们生成 48 位十六进制值并据此校验
@@ -251,7 +295,9 @@ HTTP 传输不加密，公网部署仍建议使用 HTTPS。
 并设置 `X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform`。
 反向代理仍需允许这些响应头生效；首个事件到达前的等待也需要足够的读取超时
 
-网关默认不限制模型请求的总执行时长。OpenAI 上游流默认有 300 秒空闲超时，持续收到数据不会因总时长超过 600 秒而中断
+网关默认不限制模型请求的总执行时长。OpenAI 上游流默认有 300 秒空闲超时，持续收到数据不会因总时长超过 600 秒而中断。
+`api.request_timeout_seconds` 默认 `null`，只控制 HTTP 路由返回响应前的等待，不是流式正文或 WebSocket 每轮执行的总时限。
+排队、插件显式执行期限与客户端断开的边界见 [请求期限](../docs/api.md#请求期限)
 
 OpenAI 上游池化 WebSocket 默认每 25 秒发送一次 Ping，发出后允许等待 30 秒；
 收到 Pong 或其他入站帧即解除本次心跳截止，持续无响应则以 `pong_timeout` 关闭连接。
@@ -516,6 +562,7 @@ Redis 和应用容器，不需要删除 Redis 数据目录。
 | --- | --- |
 | `config.yaml` 含 `openai.wire_profile.location` | 该字段会被忽略，可删除；如需继续覆盖请求位置，将值填入管理端全局请求位置并开启开关，数据库初始化不会自动导入 |
 | `config.yaml` 含 `host.logging.file.max_files` | 该字段会被忽略，可删除；日志按 `retention_days` 保留，`max_file_size_mb` 只控制分片大小 |
+| 使用带 `app-runtime` 继承的 Compose，现有 `config.yaml` 缺少对应段 | 合并模板中的 `services.app-runtime`，保留原凭据桥接；不开启内存优化时将 `GLIBC_TUNABLES` 设为 `''`，见 [小内存优化](#小内存优化) |
 | 使用旧管理员认证接口或 Cookie | 改用 `/api/auth/*` 并重新登录；会话合同见 [认证 API](../docs/api.md#4-浏览器认证) |
 
 更新部署文件后，从安装目录拉取目标版本镜像并重建应用容器：
@@ -636,8 +683,8 @@ Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.ta
 | `plugin-release-manifest.json` | 固定宿主版本、提交、平台与支持的插件合同；插件列表当前为空 |
 | 可执行文件同目录的 `plugins/official` | 随受信宿主发行物部署的只读目录，与二进制、Web 资源成套更新或恢复 |
 
-- 下载更新时校验发行身份，插件合同不兼容不阻止安装。点击重启时检查已安装目标版本，列出不兼容插件的名称和原因；确认后批量停用并重启，保留包体、配置、密钥和私有数据，取消不修改插件状态
-- 回滚仍检查启用插件与旧宿主的兼容性，不兼容时先停用对应插件。更新或回滚期间的并发配置变更会阻止切换，文件替换失败或取消时恢复整组文件
+- 下载更新时校验发行身份，插件合同不兼容不阻止安装。点击重启时检查已安装目标版本，列出不兼容插件的名称和原因；确认后保留启用配置并重启，逐个尝试启动插件，版本警告持续显示
+- 回滚同样在重启前提示插件兼容风险，不因版本不匹配批量停用插件。更新或回滚期间的并发配置变更会阻止切换，文件替换失败或取消时恢复整组文件
 - 非空官方清单中的包经身份、平台和摘要校验后幂等导入；导入不确认信任、不创建配置、不启用，也不删除旧包。管理员确认信任后才执行默认配置流程；重复摘要保留首次安装出处
 - `sealed` 是构建封口标记，不是密码学签名。普通上传、URL 或 GitHub 安装不能获得 `builtin` 身份，独立教学示例也不例外
 

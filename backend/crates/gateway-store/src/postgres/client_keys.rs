@@ -1,4 +1,4 @@
-//! 明文 `client_api_keys` 的 PostgreSQL owner。
+//! 明文 `client_api_keys` 的 PostgreSQL owner
 
 use gateway_admin::model::audit::MutationAuditOperation;
 use std::{
@@ -467,6 +467,8 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
 }
 
 /// PostgreSQL API Key 最近使用时间的 Store 绑定。
+///
+/// 认证成功后按一秒窗口合并写回最后使用时间；只记录稳定 Key ID，不把认证材料放入异步队列或日志。
 #[derive(Clone)]
 pub struct PgClientApiKeyUsageSink {
     inner: crate::client_key_usage::BufferedClientApiKeyUsageSink,
@@ -524,7 +526,7 @@ impl crate::client_key_usage::ClientApiKeyLastUsedRepository for PgClientApiKeyR
     }
 }
 
-/// Admin 用例所需的 Client Key 事务能力。
+/// Admin 用例所需的 Client Key 事务能力
 #[derive(Clone)]
 pub struct PgAdminClientKeyStore {
     keys: PgClientApiKeyRepository,
@@ -540,7 +542,7 @@ impl PgAdminClientKeyStore {
         }
     }
 
-    /// 会话恢复只读启用状态，不加载明文凭据或其他 Key 的资料。
+    /// 会话恢复只读启用状态，不加载明文凭据或其他 Key 的资料
     pub async fn is_enabled(&self, id: &ClientApiKeyId) -> AdminStoreResult<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM client_api_keys WHERE id = $1 AND enabled)",
@@ -598,7 +600,7 @@ impl ClientKeyStore for PgAdminClientKeyStore {
                 super::plugins::begin_plugin_mutation(&self.keys.pool, owner).await?
             }
         };
-        // 保持与完整 Key 编辑相同的锁顺序；绝不读出整份配置再覆盖写回。
+        // 保持与完整 Key 编辑相同的锁顺序；绝不读出整份配置再覆盖写回
         sqlx::query("select config_revision from runtime_settings where id=1 for update")
             .execute(&mut *tx)
             .await
@@ -1087,8 +1089,8 @@ async fn ensure_client_key_name_available(
     id: &str,
     name: &str,
 ) -> StoreResult<()> {
-    // 调用方已通过递增配置版本持有控制面行锁，查重与写入在同一事务内串行执行。
-    // 不回填历史重名数据；创建和保存时统一校验，更新排除当前记录。
+    // 调用方已通过递增配置版本持有控制面行锁，查重与写入在同一事务内串行执行
+    // 不回填历史重名数据；创建和保存时统一校验，更新排除当前记录
     let duplicate: bool = sqlx::query_scalar(
         "select exists(select 1 from client_api_keys
          where lower(btrim(name)) = lower($1) and id <> $2)",

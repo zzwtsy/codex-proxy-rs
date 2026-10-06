@@ -1,5 +1,8 @@
+//! 验证插件上游适配复用原生账号、保留槽位与凭据更新
+
 use super::*;
 use gateway_core::account::AccountRuntimeSignals;
+use gateway_core::account::FastMode;
 use gateway_core::engine::upstream_adapter::{
     UpstreamAccountConnection, UpstreamAdapter, UpstreamAdapterInvocation, UpstreamAdapterPlan,
 };
@@ -62,7 +65,7 @@ impl gateway_core::engine::upstream_adapter::UpstreamAdapter for AdapterProbe {
                 Some("chatgpt-acct_provider_contract".as_bytes().to_vec())
             );
             assert!(header("cookie").is_none());
-            assert!(invocation.context.disable_fast());
+            assert_eq!(invocation.context.fast_mode(), FastMode::Disabled);
             let Operation::Generate(generate) = &invocation.operation else {
                 panic!("adapter must receive the original operation kind");
             };
@@ -131,7 +134,7 @@ async fn upstream_adapter_reuses_selected_native_account_inside_attempt_onion_an
             ModelRequestId::new("req_adapter_native").unwrap(),
             ClientApiKeyId::new("key_openai_contract").unwrap(),
         )
-        .with_disable_fast(true)
+        .with_fast_mode(FastMode::Disabled)
         .with_upstream_adapters(Some(
             gateway_core::engine::upstream_adapter::FrozenUpstreamAdapterPlan::new(
                 Arc::new(AdapterProbe {
@@ -260,7 +263,7 @@ async fn selected_adapter_connection(
 
 #[tokio::test]
 async fn guardian_reservation_survives_upstream_adapters_and_metadata_precedence() {
-    // 上限 2、已有 1 个在途请求：预留启用时只有 Guardian 能继续取得租约。
+    // 上限 2、已有 1 个在途请求：预留启用时只有 Guardian 能继续取得租约
     for (subagent, turn_kind, reserved, allowed) in [
         (Some("guardian"), None, 1, true),
         (None, Some("guardian"), 1, true),
@@ -377,7 +380,7 @@ async fn upstream_adapter_reloads_rotated_credentials_and_proxy_without_acceptin
     let before = store.account(account_id).unwrap();
     assert_eq!(old.outbound_proxy(), Some(&old_proxy));
 
-    // 使用原生刷新成功后的 CAS 入口；适配器不能复制令牌或缓存第二份账号代理。
+    // 使用原生刷新成功后的 CAS 入口；适配器不能复制令牌或缓存第二份账号代理
     let revision = store
         .repository()
         .rotate_refreshed_oauth_secret(
@@ -418,7 +421,7 @@ async fn upstream_adapter_reloads_rotated_credentials_and_proxy_without_acceptin
         );
     }
 
-    // 旧请求的 401 不能使已轮换凭据失效，未发送失败也不能污染账号状态。
+    // 旧请求的 401 不能使已轮换凭据失效，未发送失败也不能污染账号状态
     for (connection, send_state) in [
         (&old, UpstreamSendState::Sent),
         (&current, UpstreamSendState::NotSent),

@@ -37,7 +37,8 @@ use gateway_core::{
     policy::ClientApiKeyId,
     provider_ports::{
         ProviderCooldown, ProviderCooldownKind, ProviderCooldownPort, ProviderLeasePort,
-        ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionExclusionPort,
+        ProviderSessionAffinityKey, ProviderSessionAffinityPort, ProviderSessionAlias,
+        ProviderSessionExclusionPort,
     },
     routing::ProviderKind,
 };
@@ -779,40 +780,82 @@ async fn sqlite_session_affinity_cas_and_exclusions_are_visible_across_pools() {
     let account_b = ProviderAccountId::new("acct_b").unwrap();
     let ttl = std::time::Duration::from_secs(60);
 
+    let initial = first_affinity
+        .compare_and_bind(&kind, &key, None, &account_a, ttl)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        first_affinity
-            .claim_or_load(&kind, &key, &account_a, ttl)
-            .await
-            .unwrap(),
-        account_a,
+        second_affinity.load(&kind, &key).await.unwrap(),
+        Some(initial.clone())
     );
     assert_eq!(
         second_affinity
-            .claim_or_load(&kind, &key, &account_b, ttl)
+            .compare_and_bind(&kind, &key, Some(&initial), &account_a, ttl)
             .await
             .unwrap(),
-        account_a,
+        Some(initial.clone()),
     );
-    assert_eq!(
+    assert!(
         second_affinity
-            .compare_and_bind(&kind, &key, &account_b, &account_b, ttl)
+            .compare_and_bind(&kind, &key, None, &account_b, ttl)
             .await
-            .unwrap(),
-        account_a,
+            .unwrap()
+            .is_none()
     );
-    assert_eq!(
-        second_affinity
-            .compare_and_bind(&kind, &key, &account_a, &account_b, ttl)
-            .await
-            .unwrap(),
-        account_b,
-    );
+    let migrated = second_affinity
+        .compare_and_bind(&kind, &key, Some(&initial), &account_b, ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(initial.revision(), migrated.revision());
     assert_eq!(
         first_affinity.load(&kind, &key).await.unwrap(),
-        Some(account_b.clone()),
+        Some(migrated.clone()),
     );
-    assert!(first_affinity.clear(&kind, &key).await.unwrap());
-    assert_eq!(second_affinity.load(&kind, &key).await.unwrap(), None);
+    assert!(
+        first_affinity
+            .compare_and_bind(&kind, &key, Some(&initial), &account_a, ttl)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let alias_key = ProviderSessionAffinityKey::try_new("observed-request").unwrap();
+    let alias = ProviderSessionAlias {
+        session_key: key.clone(),
+        follow_only: true,
+    };
+    assert!(
+        first_affinity
+            .bind_alias(&kind, &alias_key, &alias, ttl)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        second_affinity.load_alias(&kind, &alias_key).await.unwrap(),
+        Some(alias.clone()),
+    );
+    assert!(
+        second_affinity
+            .bind_alias(&kind, &alias_key, &alias, ttl)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !second_affinity
+            .bind_alias(
+                &kind,
+                &alias_key,
+                &ProviderSessionAlias {
+                    session_key: ProviderSessionAffinityKey::try_new("different-session").unwrap(),
+                    follow_only: false,
+                },
+                ttl,
+            )
+            .await
+            .unwrap()
+    );
 
     let first_state = first_exclusion
         .record_failure(&kind, &key, &account_a, ttl)

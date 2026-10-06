@@ -1,4 +1,4 @@
-//! Provider、账号与 OAuth refresh 的 Redis lease/fencing。
+//! Provider、账号与 OAuth refresh 的 Redis lease/fencing
 
 use std::collections::BTreeMap;
 use std::sync::{
@@ -148,7 +148,7 @@ impl RedisCredentialLeaseRepository {
         })
     }
 
-    /// 获取带 Drop 释放语义的通用 lease guard，供 Provider refresh/task 组合器使用。
+    /// 获取带 Drop 释放语义的通用 lease guard，供 Provider refresh/task 组合器使用
     pub async fn try_acquire_guard(
         &self,
         request: CredentialLeaseRequest,
@@ -157,7 +157,7 @@ impl RedisCredentialLeaseRepository {
         Ok(grant.map(|grant| CredentialLeaseGuard::new(Arc::new(self.clone()), request, grant)))
     }
 
-    /// 原子推进跨进程共享、按 Client Key 与 Provider 隔离的调度游标。
+    /// 原子推进跨进程共享、按 Client Key 与 Provider 隔离的调度游标
     pub async fn advance_scheduling_cursor(
         &self,
         client_api_key_id: &ClientApiKeyId,
@@ -289,7 +289,7 @@ impl RedisCredentialLeaseRepository {
     }
 }
 
-/// Store-owned 的通用 Provider lease 能力；具体 Provider 不感知 Redis。
+/// Store-owned 的通用 Provider lease 能力；具体 Provider 不感知 Redis
 pub(crate) struct RedisProviderLeaseCoordinator {
     repository: RedisCredentialLeaseRepository,
     process_id: String,

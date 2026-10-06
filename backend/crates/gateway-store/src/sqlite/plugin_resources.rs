@@ -104,14 +104,14 @@ impl PluginResourceStore for SqlitePluginResourceStore {
         let name_key = normalize_name_key(&command.name);
         sqlx::query(
             "insert into account_groups
-             (id, name, description, color, disable_fast, enabled, created_at_us, updated_at_us, name_key)
+             (id, name, description, color, fast_mode, enabled, created_at_us, updated_at_us, name_key)
              values (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, ?7)",
         )
         .bind(command.id.as_str())
         .bind(&command.name)
         .bind(&command.description)
         .bind(command.color.as_str())
-        .bind(i64::from(command.disable_fast))
+        .bind(command.fast_mode.as_str())
         .bind(now)
         .bind(name_key)
         .execute(&mut *transaction)

@@ -1,4 +1,4 @@
-//! Worker 贡献、调度定义与健康探针。
+//! Worker 贡献、调度定义与健康探针
 
 use super::*;
 use gateway_core::task::DaemonTask;
@@ -10,7 +10,7 @@ pub(crate) struct CommandStoreWriters {
     pub(crate) execution_idle: Option<postgres::ExecutionBufferIdle>,
 }
 
-/// 短生命周期 CLI 只运行数据面必需的三个写泵，不注册恢复、保留或维护 Worker。
+/// 短生命周期 CLI 只运行数据面必需的三个写泵，不注册恢复、保留或维护 Worker
 pub struct CommandStoreDrain {
     cancellation: gateway_core::lifecycle::CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<Result<(), WorkerTaskError>>>,

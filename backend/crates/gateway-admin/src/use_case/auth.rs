@@ -1,4 +1,4 @@
-//! 控制面登录、会话恢复与身份校验的唯一 owner。
+//! 控制面登录、会话恢复与身份校验的唯一 owner
 
 use std::{net::IpAddr, sync::Arc, time::Duration as StdDuration};
 
@@ -25,7 +25,7 @@ use crate::{
 
 use super::map_store_error;
 
-/// 所有控制面接口消费同一个会话服务，权限由服务端身份决定。
+/// 所有控制面接口消费同一个会话服务，权限由服务端身份决定
 #[async_trait]
 pub trait AuthService: Send + Sync {
     async fn change_password(
@@ -36,6 +36,10 @@ pub trait AuthService: Send + Sync {
     ) -> Result<(), AdminError>;
     async fn ensure_default_admin(&self, password: &str) -> Result<bool, AdminError>;
     async fn session(&self, session_id: Option<&str>) -> Result<Option<AuthSession>, AdminError>;
+    async fn renew_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<AuthSession>, AdminError>;
     async fn resolve_admin_user_id(
         &self,
         session_id: Option<&str>,
@@ -58,6 +62,7 @@ const LOGIN_ATTEMPTS_GLOBAL: u32 = 200;
 pub(crate) struct DefaultAuthService {
     default_admin_user_id: String,
     admin_session_ttl: Duration,
+    admin_session_absolute_ttl: Duration,
     key_session_ttl: Duration,
     store: Arc<dyn AuthStore>,
     verifier: Arc<dyn ClientKeyVerifier>,
@@ -68,6 +73,7 @@ impl DefaultAuthService {
     pub(crate) fn new(
         default_admin_user_id: impl Into<String>,
         admin_session_ttl_minutes: u64,
+        admin_session_absolute_ttl_minutes: u64,
         key_session_ttl_minutes: u64,
         store: Arc<dyn AuthStore>,
         verifier: Arc<dyn ClientKeyVerifier>,
@@ -75,6 +81,7 @@ impl DefaultAuthService {
         Self {
             default_admin_user_id: default_admin_user_id.into(),
             admin_session_ttl: session_ttl(admin_session_ttl_minutes),
+            admin_session_absolute_ttl: session_ttl(admin_session_absolute_ttl_minutes),
             key_session_ttl: session_ttl(key_session_ttl_minutes),
             store,
             verifier,
@@ -208,7 +215,7 @@ impl AuthService for DefaultAuthService {
         {
             return Err(AdminError::conflict("密码已变更，请重新登录"));
         }
-        // 密码事务提交后旧指纹不再匹配，会话撤销不依赖 Redis 删除成功。
+        // 密码事务提交后旧指纹不再匹配，会话撤销不依赖 Redis 删除成功
         Ok(())
     }
 
@@ -232,8 +239,12 @@ impl AuthService for DefaultAuthService {
         else {
             return Ok(None);
         };
-        if session.expires_at <= Utc::now() {
-            let _ = self.store.delete_session(session_id).await;
+        if session.expires_at <= Utc::now()
+            || session
+                .absolute_expires_at
+                .is_some_and(|expiry| expiry <= Utc::now())
+        {
+            // Redis 的 TTL 负责过期清理，避免旧读取删除另一个请求刚续期的会话
             return Ok(None);
         }
         if let SessionSubject::Admin {
@@ -264,6 +275,37 @@ impl AuthService for DefaultAuthService {
             return Ok(None);
         }
         Ok(Some(session))
+    }
+
+    async fn renew_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<AuthSession>, AdminError> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let Some(session) = self.session(Some(session_id)).await? else {
+            return Ok(None);
+        };
+        // Key 与升级前的会话保留原有期限，不能凭续期获得新的最长登录窗口
+        let Some(absolute) = session
+            .absolute_expires_at
+            .filter(|_| matches!(session.subject, SessionSubject::Admin { .. }))
+        else {
+            return Ok(Some(session));
+        };
+        let now = Utc::now();
+        let expires_at = (now + self.admin_session_ttl).min(absolute);
+        let interval = (self.admin_session_ttl / 4).min(Duration::minutes(1));
+        if expires_at <= session.expires_at
+            || session.expires_at - now > self.admin_session_ttl - interval
+        {
+            return Ok(Some(session));
+        }
+        self.store
+            .renew_session(session_id, &session, expires_at)
+            .await
+            .map_err(|error| map_store_error(error, "authentication session renewal"))
     }
 
     async fn resolve_admin_user_id(
@@ -325,9 +367,13 @@ impl AuthService for DefaultAuthService {
             SessionSubject::Admin { .. } => self.admin_session_ttl,
             SessionSubject::Key { .. } => self.key_session_ttl,
         };
+        let now = Utc::now();
+        let absolute_expires_at = matches!(subject, SessionSubject::Admin { .. })
+            .then_some(now + self.admin_session_absolute_ttl);
         let session = AuthSession {
             subject,
-            expires_at: Utc::now() + ttl,
+            expires_at: (now + ttl).min(absolute_expires_at.unwrap_or(now + ttl)),
+            absolute_expires_at,
         };
         let session_id = random_session_token();
         self.store
@@ -344,7 +390,7 @@ impl AuthService for DefaultAuthService {
             let _ = self.store.delete_session(&session_id).await;
             return Err(LoginError::Unavailable);
         }
-        // 新身份验证成功后才撤销旧会话；撤销失败时不向浏览器提交新会话。
+        // 新身份验证成功后才撤销旧会话；撤销失败时不向浏览器提交新会话
         if let Some(previous) = previous_session_id.filter(|value| !value.is_empty())
             && self.logout(previous).await.is_err()
         {
@@ -425,7 +471,7 @@ fn valid_admin_api_key_shape(value: &str) -> bool {
         && value[6..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-// 指纹只绑定已加盐的密码哈希，不把密码或原始哈希复制到 Redis 会话。
+// 指纹只绑定已加盐的密码哈希，不把密码或原始哈希复制到 Redis 会话
 fn password_fingerprint(password_hash: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(password_hash.as_bytes()))
 }
