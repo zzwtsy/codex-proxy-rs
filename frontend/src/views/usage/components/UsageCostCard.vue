@@ -23,6 +23,7 @@ import {
   usageTooltipItem,
   usageValueAxis,
 } from '../utils/chart'
+
 type Cost = Awaited<ReturnType<typeof getUsageRecordInsightsOverview>>['cost']
 type Activity = Awaited<ReturnType<typeof getUsageRecordInsightsOverview>>['health']['points']
 type UsageChartPalette = ReturnType<typeof useChartPalette>['palette']['value']
