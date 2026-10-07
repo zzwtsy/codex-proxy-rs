@@ -20,7 +20,9 @@ use crate::coordination::resource_fingerprint;
 
 use super::value::{datetime_to_micros, duration_micros};
 
-const MAX_SESSION_STATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_SESSION_AFFINITY_TTL: Duration =
+    Duration::from_secs(gateway_core::account::MAX_SESSION_AFFINITY_TTL_HOURS as u64 * 60 * 60);
+const MAX_SESSION_EXCLUSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone)]
 pub struct SqliteProviderSessionAffinityRepository {
@@ -56,7 +58,7 @@ impl SqliteProviderSessionAffinityRepository {
     }
 
     fn ttl(ttl: Duration) -> Result<i64, ProviderStoreError> {
-        if ttl.is_zero() || ttl > MAX_SESSION_STATE_TTL {
+        if ttl.is_zero() || ttl > MAX_SESSION_AFFINITY_TTL {
             return Err(provider_invalid("validate provider session affinity TTL"));
         }
         duration_micros(ttl).map_err(|_| provider_invalid("validate provider session affinity TTL"))
@@ -302,7 +304,7 @@ impl SqliteProviderSessionExclusionRepository {
     }
 
     fn ttl(ttl: Duration) -> Result<i64, ProviderStoreError> {
-        if ttl.is_zero() || ttl > MAX_SESSION_STATE_TTL {
+        if ttl.is_zero() || ttl > MAX_SESSION_EXCLUSION_TTL {
             return Err(provider_invalid("validate provider session exclusion TTL"));
         }
         duration_micros(ttl)
