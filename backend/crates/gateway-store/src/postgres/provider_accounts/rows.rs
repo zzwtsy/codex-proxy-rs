@@ -446,12 +446,12 @@ pub(crate) fn account_record_from_row(
     let credentials = JsonObject::try_from_value(
         "provider_credentials_json",
         row.try_get("provider_credentials_json")
-            .map_err(|_| invalid("invalid credentials JSON"))?,
+            .map_err(|source| invalid("invalid credentials JSON").with_source(source))?,
         CREDENTIALS_MAX_BYTES,
     )?;
     let quota = row
         .try_get::<Option<serde_json::Value>, _>("provider_quota_json")
-        .map_err(|_| invalid("invalid quota JSON"))?
+        .map_err(|source| invalid("invalid quota JSON").with_source(source))?
         .map(|value| JsonObject::try_from_value("provider_quota_json", value, QUOTA_MAX_BYTES))
         .transpose()?;
     Ok(ProviderAccountRecord {
@@ -465,11 +465,11 @@ pub(crate) fn core_account_from_summary(
     summary: ProviderAccountSummary,
 ) -> Result<CoreProviderAccount, CoreStoreError> {
     let id = CoreProviderAccountId::new(summary.id)
-        .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
+        .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
     let provider = ProviderKind::new(summary.provider_kind)
-        .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
+        .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
     let revision = CoreCredentialRevision::new(summary.credential_revision.get())
-        .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
+        .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
     Ok(CoreProviderAccount::new(
         id,
         provider,
@@ -501,17 +501,6 @@ pub(crate) fn core_account_from_summary(
     ))
 }
 
-pub(crate) fn core_store_error(error: StoreError) -> CoreStoreError {
-    let kind = match error {
-        StoreError::Unavailable { .. } => CoreStoreErrorKind::Unavailable,
-        StoreError::Conflict { .. } => CoreStoreErrorKind::Conflict,
-        StoreError::NotFound { .. } | StoreError::InvalidData { .. } => {
-            CoreStoreErrorKind::InvalidData
-        }
-    };
-    CoreStoreError::new(kind)
-}
-
 pub(crate) fn require_core_update(updated: bool) -> Result<(), CoreStoreError> {
     if updated {
         Ok(())
@@ -525,21 +514,8 @@ pub(crate) fn account_summary_from_row(
 ) -> StoreResult<ProviderAccountSummary> {
     let revision = row
         .try_get::<i64, _>("credential_revision")
-        .map_err(|_| invalid("invalid credential revision"))?;
-    let credential_state = row
-        .try_get::<String, _>("credential_state")
-        .map_err(|_| invalid("invalid credential_state"))?;
-    let quota_access_state = parse_quota_access_state(&get::<String>(&row, "quota_access_state")?)?;
-    let quota_evidence = parse_quota_evidence(get(&row, "quota_evidence")?)?;
-    let quota_access_observed_at = get::<Option<DateTime<Utc>>>(&row, "quota_access_observed_at")?;
-    let quota_reset_at = get::<Option<DateTime<Utc>>>(&row, "quota_reset_at")?;
-    let quota = QuotaState::from_persisted(
-        quota_access_state,
-        quota_evidence,
-        quota_access_observed_at.map(Into::into),
-        quota_reset_at.map(Into::into),
-    )
-    .ok_or_else(|| invalid("invalid persisted quota fact"))?;
+        .map_err(|source| invalid("invalid credential revision").with_source(source))?;
+    let status = account_status_facts_from_row(&row)?;
     let concurrency_limit = get::<Option<i64>>(&row, "concurrency_limit")?
         .map(|value| {
             u32::try_from(value)
@@ -557,7 +533,7 @@ pub(crate) fn account_summary_from_row(
         outbound_proxy: get::<Option<String>>(&row, "outbound_proxy_url")?
             .map(|url| {
                 gateway_core::account::OutboundProxy::parse(&url)
-                    .map_err(|_| invalid("invalid outbound proxy"))
+                    .map_err(|source| invalid("invalid outbound proxy").with_source(source))
             })
             .transpose()?,
         id: get(&row, "id")?,
@@ -571,9 +547,9 @@ pub(crate) fn account_summary_from_row(
         authentication_kind: get(&row, "authentication_kind")?,
         credential_revision: Revision::new(to_u64(revision)?)?,
         has_refresh_token: get(&row, "has_refresh_token")?,
-        access_token_expires_at: get(&row, "access_token_expires_at")?,
+        access_token_expires_at: status.access_token_expires_at.map(Into::into),
         next_refresh_at: get(&row, "next_refresh_at")?,
-        enabled: get(&row, "enabled")?,
+        enabled: status.enabled,
         concurrency_limit,
         weight,
         model_access: get::<sqlx::types::Json<gateway_core::account::AccountModelAccess>>(
@@ -581,11 +557,11 @@ pub(crate) fn account_summary_from_row(
             "model_access_json",
         )?
         .0,
-        credential_state: parse_credential_state(&credential_state)?,
+        credential_state: status.credential_state,
         credential_observed_at: get(&row, "credential_observed_at")?,
-        quota,
-        last_error_reason: parse_error_reason(get(&row, "last_error_reason")?)?,
-        last_error_message: get(&row, "last_error_message")?,
+        quota: status.quota,
+        last_error_reason: status.last_error_reason,
+        last_error_message: status.last_error_message,
         created_at: get(&row, "created_at")?,
         updated_at: get(&row, "updated_at")?,
     })
@@ -595,7 +571,8 @@ pub(crate) fn get<'r, T>(row: &'r sqlx::postgres::PgRow, column: &'static str) -
 where
     T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
 {
-    row.try_get(column).map_err(|_| invalid(column))
+    row.try_get(column)
+        .map_err(|source| invalid(column).with_source(source))
 }
 
 pub(crate) fn validate_object_size(
@@ -605,8 +582,9 @@ pub(crate) fn validate_object_size(
 ) -> StoreResult<()> {
     let size = serde_json::to_vec(&object.as_value())
         .map_err(|error| StoreError::InvalidData {
+            source: Some(error.into()),
             entity: ENTITY,
-            message: error.to_string(),
+            message: "JSON encoding failed".to_owned(),
         })?
         .len();
     if size > max {
@@ -617,16 +595,46 @@ pub(crate) fn validate_object_size(
 }
 
 pub(crate) fn to_i64(value: u64) -> StoreResult<i64> {
-    i64::try_from(value).map_err(|_| invalid("revision is too large"))
+    i64::try_from(value).map_err(|source| invalid("revision is too large").with_source(source))
 }
 
 pub(crate) fn to_u64(value: i64) -> StoreResult<u64> {
-    u64::try_from(value).map_err(|_| invalid("revision must be positive"))
+    u64::try_from(value).map_err(|source| invalid("revision must be positive").with_source(source))
 }
 
 pub(crate) fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: ENTITY,
         message: message.to_owned(),
     }
+}
+
+pub(crate) fn account_status_facts_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> StoreResult<gateway_core::account::AccountStatusFacts> {
+    let credential_state = row
+        .try_get::<String, _>("credential_state")
+        .map_err(|source| invalid("invalid credential_state").with_source(source))?;
+    let quota_access_state = parse_quota_access_state(&get::<String>(row, "quota_access_state")?)?;
+    let quota_evidence = parse_quota_evidence(get(row, "quota_evidence")?)?;
+    let quota_access_observed_at = get::<Option<DateTime<Utc>>>(row, "quota_access_observed_at")?;
+    let quota_reset_at = get::<Option<DateTime<Utc>>>(row, "quota_reset_at")?;
+    let quota = QuotaState::from_persisted(
+        quota_access_state,
+        quota_evidence,
+        quota_access_observed_at.map(Into::into),
+        quota_reset_at.map(Into::into),
+    )
+    .ok_or_else(|| invalid("invalid persisted quota fact"))?;
+    Ok(gateway_core::account::AccountStatusFacts {
+        enabled: get(row, "enabled")?,
+        credential_state: parse_credential_state(&credential_state)?,
+        access_token_expires_at: get::<Option<DateTime<Utc>>>(row, "access_token_expires_at")?
+            .map(Into::into),
+        quota,
+        cooldown: None,
+        last_error_reason: parse_error_reason(get(row, "last_error_reason")?)?,
+        last_error_message: get(row, "last_error_message")?,
+    })
 }

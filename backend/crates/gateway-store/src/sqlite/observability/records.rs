@@ -1,7 +1,5 @@
 //! SQLite 用量列表、请求详情和运维错误查询。
 
-use std::str::FromStr;
-
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use serde_json::Value;
@@ -91,6 +89,7 @@ pub(crate) async fn usage_record_detail(
         .ok_or_else(|| StoreError::NotFound {
             entity: "model request",
             id: request_id.to_owned(),
+            source: None,
         })?;
     let request = usage_record_from_row(&row)?;
     let attempt_rows = sqlx::query(
@@ -164,7 +163,7 @@ pub(crate) async fn ops_errors(
     pool: &SqlitePool,
     query: OpsErrorQuery,
 ) -> StoreResult<OpsErrorPage> {
-    query.filter.validate()?;
+    crate::postgres::validate_ops_error_filter(&query.filter)?;
     // UNION ALL 外层的时间条件不会下推到两个分支，需绑定到各自的时间列。
     let mut rows = sqlx::query(OPS_ERROR_SELECT)
         .bind(query.range.start.timestamp_micros())
@@ -272,9 +271,19 @@ fn ops_error_matches(row: &SqliteRow, filter: &OpsErrorFilter) -> StoreResult<bo
 }
 
 fn usage_list_record_from_row(row: &SqliteRow) -> StoreResult<UsageListRecord> {
+    let cost_source: String = get(row, "cost_source")?;
+    let cost_amount = optional_amount(row, "cost_amount")?;
+    let cost_currency: Option<String> = get(row, "cost_currency")?;
+    let billing_snapshot = optional_json(row, "billing_snapshot_json")?;
+    let billing = crate::postgres::billing_from_values(
+        &cost_source,
+        cost_amount.as_ref(),
+        cost_currency.as_deref(),
+        billing_snapshot.as_ref(),
+    )?;
     Ok(UsageListRecord {
         client_api_key_name: get(row, "client_api_key_name")?,
-        billing_snapshot_json: optional_json(row, "billing_snapshot_json")?,
+        billing,
         id: get(row, "id")?,
         endpoint: get(row, "endpoint")?,
         client_transport: get(row, "client_transport")?,
@@ -285,6 +294,7 @@ fn usage_list_record_from_row(row: &SqliteRow) -> StoreResult<UsageListRecord> {
         provider_account_email: get(row, "provider_account_email_snapshot")?,
         provider_account_notes: get(row, "provider_account_notes")?,
         provider_account_plan_type: get(row, "provider_account_plan_type")?,
+        provider_account_plan_type_display: None,
         provider_account_authentication_kind: get(
             row,
             "provider_account_authentication_kind_snapshot",
@@ -301,9 +311,9 @@ fn usage_list_record_from_row(row: &SqliteRow) -> StoreResult<UsageListRecord> {
         image_input_tokens: optional_unsigned(row, "image_input_tokens")?,
         image_output_tokens: optional_unsigned(row, "image_output_tokens")?,
         total_tokens: optional_unsigned(row, "total_tokens")?,
-        cost_source: get(row, "cost_source")?,
-        cost_amount: optional_amount(row, "cost_amount")?,
-        cost_currency: get(row, "cost_currency")?,
+        cost_source,
+        cost_amount,
+        cost_currency,
         transport_decision_wait_ms: optional_unsigned(row, "transport_decision_wait_ms")?,
         connect_ms: optional_unsigned(row, "connect_ms")?,
         headers_ms: optional_unsigned(row, "headers_ms")?,
@@ -328,6 +338,16 @@ fn usage_list_record_from_row(row: &SqliteRow) -> StoreResult<UsageListRecord> {
 }
 
 fn usage_record_from_row(row: &SqliteRow) -> StoreResult<UsageRecord> {
+    let cost_source: String = get(row, "cost_source")?;
+    let cost_amount = optional_amount(row, "cost_amount")?;
+    let cost_currency: Option<String> = get(row, "cost_currency")?;
+    let billing_snapshot = optional_json(row, "billing_snapshot_json")?;
+    let billing = crate::postgres::billing_from_values(
+        &cost_source,
+        cost_amount.as_ref(),
+        cost_currency.as_deref(),
+        billing_snapshot.as_ref(),
+    )?;
     let response_id = |column: &'static str| -> StoreResult<Option<String>> {
         let value: Option<Vec<u8>> = get(row, column)?;
         value
@@ -336,7 +356,7 @@ fn usage_record_from_row(row: &SqliteRow) -> StoreResult<UsageRecord> {
             .map_err(|_| invalid("response ID is not UTF-8"))
     };
     Ok(UsageRecord {
-        billing_snapshot_json: optional_json(row, "billing_snapshot_json")?,
+        billing,
         id: get(row, "id")?,
         client_api_key_ref: get(row, "client_api_key_ref")?,
         config_revision: required_unsigned(row, "config_revision")?,
@@ -371,7 +391,7 @@ fn usage_record_from_row(row: &SqliteRow) -> StoreResult<UsageRecord> {
         attempt_count: required_u32(row, "attempt_count")?,
         upstream_send_state: get(row, "upstream_send_state")?,
         downstream_committed_at: optional_time(row, "downstream_committed_at_us")?,
-        outcome: get(row, "outcome")?,
+        outcome: crate::postgres::request_outcome(&get::<String>(row, "outcome")?)?,
         client_status_code: optional_status(row, "client_status_code")?,
         upstream_status_code: optional_status(row, "upstream_status_code")?,
         client_response_id: response_id("client_response_id")?,
@@ -389,9 +409,9 @@ fn usage_record_from_row(row: &SqliteRow) -> StoreResult<UsageRecord> {
         image_input_tokens: optional_unsigned(row, "image_input_tokens")?,
         image_output_tokens: optional_unsigned(row, "image_output_tokens")?,
         total_tokens: optional_unsigned(row, "total_tokens")?,
-        cost_source: get(row, "cost_source")?,
-        cost_amount: optional_amount(row, "cost_amount")?,
-        cost_currency: get(row, "cost_currency")?,
+        cost_source,
+        cost_amount,
+        cost_currency,
         transport_decision_wait_ms: optional_unsigned(row, "transport_decision_wait_ms")?,
         connect_ms: optional_unsigned(row, "connect_ms")?,
         headers_ms: optional_unsigned(row, "headers_ms")?,
@@ -436,7 +456,7 @@ fn intermediate_attempt_from_row(row: &SqliteRow) -> StoreResult<UsageAttemptObs
         upstream_model_id: get(row, "upstream_model_id")?,
         upstream_transport: None,
         upstream_send_state: None,
-        outcome: "failed".to_owned(),
+        outcome: crate::postgres::request_outcome("failed")?,
         downstream_committed: false,
         status_code: status,
         provider_error_code: get(row, "provider_error_code")?,
@@ -479,6 +499,7 @@ fn ops_error_from_row(row: &SqliteRow) -> StoreResult<OpsErrorRecord> {
         provider_account_name: get(row, "provider_account_name")?,
         provider_account_email: get(row, "provider_account_email")?,
         provider_account_plan_type: get(row, "provider_account_plan_type")?,
+        provider_account_plan_type_display: None,
         provider_account_authentication_kind: get(row, "provider_account_authentication_kind")?,
         upstream_model_id: get(row, "upstream_model_id")?,
         upstream_transport: get(row, "upstream_transport")?,
@@ -491,7 +512,7 @@ fn ops_error_from_row(row: &SqliteRow) -> StoreResult<OpsErrorRecord> {
         upstream_request_id: get(row, "upstream_request_id")?,
         latency_ms: optional_unsigned(row, "latency_ms")?,
         message: get(row, "message")?,
-        raw_upstream_error: get(row, "raw_upstream_error")?,
+        error_details: get(row, "error_details")?,
         client_ip: get(row, "client_ip")?,
         user_agent: get(row, "user_agent")?,
         reasoning_effort: get(row, "reasoning_effort")?,
@@ -539,7 +560,7 @@ const OPS_ERROR_SELECT: &str = "select * from (
         mr.upstream_model_id, mr.upstream_transport, mr.error_kind as failure_kind,
         mr.upstream_send_state, mr.client_status_code, mr.upstream_status_code,
         mr.provider_error_code, mr.client_response_id, mr.upstream_request_id, mr.latency_ms,
-        coalesce(mr.error_message, mr.error_kind) as message, mr.raw_upstream_error,
+        coalesce(mr.error_message, mr.error_kind) as message, mr.error_details,
         mr.client_ip, mr.user_agent, mr.reasoning_effort, mr.reasoning_preset,
         mr.request_kind, mr.subagent_kind, mr.compact,
         mr.continuation_affinity_hash, mr.continuation_previous_response_id_hash,
@@ -567,7 +588,7 @@ const OPS_ERROR_SELECT: &str = "select * from (
         oe.upstream_model_id, null as upstream_transport, oe.failure_kind,
         oe.upstream_send_state, null as client_status_code, oe.status_code as upstream_status_code,
         oe.provider_error_code, mr.client_response_id, oe.upstream_request_id, oe.latency_ms,
-        oe.message, oe.raw_upstream_error, mr.client_ip, mr.user_agent,
+        oe.message, oe.error_details, mr.client_ip, mr.user_agent,
         mr.reasoning_effort, mr.reasoning_preset, mr.request_kind, mr.subagent_kind, mr.compact,
         mr.continuation_affinity_hash, mr.continuation_previous_response_id_hash,
         null as continuation_unavailable_reason, null as upstream_connection_id,
@@ -656,7 +677,7 @@ fn optional_amount(row: &SqliteRow, column: &'static str) -> StoreResult<Option<
     value
         .map(|value| {
             let amount = decode_amount(&value)?;
-            DecimalAmount::from_str(&amount.canonical())
+            crate::postgres::parse_decimal_amount(&amount.canonical())
         })
         .transpose()
 }

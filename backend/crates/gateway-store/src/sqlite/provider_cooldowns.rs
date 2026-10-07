@@ -747,11 +747,13 @@ fn provider_store_error(error: ProviderStoreError) -> crate::StoreError {
         ProviderStoreErrorKind::InvalidData => crate::StoreError::InvalidData {
             entity: "SQLite provider runtime state",
             message: error.to_string(),
+            source: None,
         },
         ProviderStoreErrorKind::Conflict => crate::StoreError::Conflict {
             entity: "provider runtime state",
             id: "account".to_owned(),
             kind: crate::ConflictKind::InvalidTransition,
+            source: None,
         },
         ProviderStoreErrorKind::Unavailable => sqlite_store_unavailable("provider runtime state"),
     }
@@ -761,6 +763,7 @@ fn sqlite_store_unavailable(operation: &'static str) -> crate::StoreError {
     crate::StoreError::Unavailable {
         backend: crate::StoreBackend::Sqlite,
         message: operation.to_owned(),
+        source: None,
     }
 }
 
@@ -768,6 +771,7 @@ fn sqlite_store_invalid(message: &'static str) -> crate::StoreError {
     crate::StoreError::InvalidData {
         entity: "SQLite provider runtime state",
         message: message.to_owned(),
+        source: None,
     }
 }
 

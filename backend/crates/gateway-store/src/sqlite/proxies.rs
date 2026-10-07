@@ -871,6 +871,7 @@ fn invalid() -> StoreError {
     StoreError::InvalidData {
         entity: ENTITY,
         message: "invalid proxy record".to_owned(),
+        source: None,
     }
 }
 
@@ -883,6 +884,7 @@ fn conflict(id: &str) -> StoreError {
         entity: ENTITY,
         id: id.to_owned(),
         kind: ConflictKind::InvalidTransition,
+        source: None,
     }
 }
 
@@ -890,6 +892,7 @@ fn not_found(id: &str) -> StoreError {
     StoreError::NotFound {
         entity: ENTITY,
         id: id.to_owned(),
+        source: None,
     }
 }
 
@@ -911,6 +914,7 @@ fn not_found_admin(entity: &'static str, id: &str) -> AdminStoreError {
         StoreError::NotFound {
             entity,
             id: id.to_owned(),
+            source: None,
         },
     )
 }

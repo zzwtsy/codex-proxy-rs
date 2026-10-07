@@ -114,18 +114,25 @@ impl SqliteClientBudgetStore {
     }
 
     async fn settle_inner(&self, charge: &ClientBudgetCharge) -> Result<(), ClientBudgetError> {
-        let mut transaction = self.pool.begin().await.map_err(|_| ClientBudgetError)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| ClientBudgetError(Some(source.into())))?;
         acquire_write_lock(&mut transaction)
             .await
-            .map_err(|_| ClientBudgetError)?;
+            .map_err(|source| ClientBudgetError(Some(source.into())))?;
         let exists =
             sqlx::query_scalar::<_, String>("select id from client_api_keys where id = ?1")
                 .bind(charge.key_id.as_str())
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|_| ClientBudgetError)?;
+                .map_err(|source| ClientBudgetError(Some(source.into())))?;
         if exists.is_none() {
-            transaction.commit().await.map_err(|_| ClientBudgetError)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| ClientBudgetError(Some(source.into())))?;
             return Ok(());
         }
 
@@ -140,7 +147,7 @@ impl SqliteClientBudgetStore {
             self.timezone,
         )
         .await
-        .map_err(|_| ClientBudgetError)?;
+        .map_err(|source| ClientBudgetError(Some(source.into())))?;
         let inserted = sqlx::query(
             "insert into client_key_charge_events
                (request_id, client_api_key_id, amount_usd, completed_at_us)
@@ -152,13 +159,14 @@ impl SqliteClientBudgetStore {
         .bind(completed_at_us)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| ClientBudgetError)?
+        .map_err(|source| ClientBudgetError(Some(source.into())))?
         .rows_affected();
         if inserted == 1 {
             if completed_at_us >= window.daily_start && completed_at_us < window.daily_end {
-                let used = decode_amount(&window.daily_used).map_err(|_| ClientBudgetError)?;
-                let total =
-                    checked_amount_sum([used, charge.amount_usd]).map_err(|_| ClientBudgetError)?;
+                let used = decode_amount(&window.daily_used)
+                    .map_err(|source| ClientBudgetError(Some(source.into())))?;
+                let total = checked_amount_sum([used, charge.amount_usd])
+                    .map_err(|source| ClientBudgetError(Some(source.into())))?;
                 sqlx::query(
                     "update client_key_budget_windows set daily_used_usd = ?2 where client_api_key_id = ?1",
                 )
@@ -166,12 +174,13 @@ impl SqliteClientBudgetStore {
                 .bind(encode_amount(total))
                 .execute(&mut *transaction)
                 .await
-                .map_err(|_| ClientBudgetError)?;
+                .map_err(|source| ClientBudgetError(Some(source.into())))?;
             }
             if completed_at_us >= window.weekly_start && completed_at_us < window.weekly_end {
-                let used = decode_amount(&window.weekly_used).map_err(|_| ClientBudgetError)?;
-                let total =
-                    checked_amount_sum([used, charge.amount_usd]).map_err(|_| ClientBudgetError)?;
+                let used = decode_amount(&window.weekly_used)
+                    .map_err(|source| ClientBudgetError(Some(source.into())))?;
+                let total = checked_amount_sum([used, charge.amount_usd])
+                    .map_err(|source| ClientBudgetError(Some(source.into())))?;
                 sqlx::query(
                     "update client_key_budget_windows set weekly_used_usd = ?2 where client_api_key_id = ?1",
                 )
@@ -179,10 +188,13 @@ impl SqliteClientBudgetStore {
                 .bind(encode_amount(total))
                 .execute(&mut *transaction)
                 .await
-                .map_err(|_| ClientBudgetError)?;
+                .map_err(|source| ClientBudgetError(Some(source.into())))?;
             }
         }
-        transaction.commit().await.map_err(|_| ClientBudgetError)
+        transaction
+            .commit()
+            .await
+            .map_err(|source| ClientBudgetError(Some(source.into())))
     }
 }
 
@@ -194,7 +206,7 @@ impl ClientBudgetPort for SqliteClientBudgetStore {
     fn settle(&self, charge: ClientBudgetCharge) -> BoxFuture<'_, Result<(), ClientBudgetError>> {
         Box::pin(async move {
             let result = self.settle_inner(&charge).await;
-            let mut retry = self.retry.lock().map_err(|_| ClientBudgetError)?;
+            let mut retry = self.retry.lock().map_err(|_| ClientBudgetError(None))?;
             if result.is_err() {
                 retry.insert(charge.request_id.as_str().to_owned(), charge);
             } else {

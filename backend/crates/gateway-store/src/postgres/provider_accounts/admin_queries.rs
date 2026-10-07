@@ -22,7 +22,10 @@ pub(crate) async fn load_admin_account_page(
         .provider_kind
         .as_ref()
         .map(|provider| provider.as_str().to_owned());
-    let search_prefix = query.search.as_deref().map(literal_prefix_pattern);
+    let search_prefix = query
+        .search
+        .as_deref()
+        .map(crate::postgres::literal_prefix_pattern);
     let status = query.status.map(|status| status.as_str().to_owned());
     let (group_mode, group_id) = match query.group_filter.as_ref() {
         None => (0_i16, None),
@@ -160,7 +163,12 @@ pub(crate) async fn load_admin_account_page(
         .bind(offset)
         .fetch_all(pool)
         .await
-        .map_err(|_| admin_store_error(ENTITY, postgres_unavailable("load admin account page")))?;
+        .map_err(|source| {
+            admin_store_error(
+                ENTITY,
+                postgres_unavailable("load admin account page", source),
+            )
+        })?;
     let metadata = rows.first().ok_or_else(|| {
         AdminStoreError::new(
             AdminStoreErrorKind::Unavailable,
@@ -211,10 +219,10 @@ async fn validate_group_filter(
             .bind(group_id.as_str())
             .fetch_one(pool)
             .await
-            .map_err(|_| {
+            .map_err(|source| {
                 admin_store_error(
                     ENTITY,
-                    postgres_unavailable("validate admin account group filter"),
+                    postgres_unavailable("validate admin account group filter", source),
                 )
             })?;
     if exists {
@@ -223,6 +231,7 @@ async fn validate_group_filter(
         Err(admin_store_error(
             ENTITY,
             StoreError::NotFound {
+                source: None,
                 entity: "account group",
                 id: group_id.as_str().to_owned(),
             },
@@ -248,18 +257,6 @@ fn admin_account_order(sort: Option<AdminAccountSort>) -> String {
         AdminSortDirection::Asc => format!("{expression} asc nulls first, a.id asc"),
         AdminSortDirection::Desc => format!("{expression} desc nulls last, a.id desc"),
     }
-}
-
-fn literal_prefix_pattern(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len().saturating_add(1));
-    for character in value.to_lowercase().chars() {
-        if matches!(character, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped.push('%');
-    escaped
 }
 
 fn revision_from_row(row: &sqlx::postgres::PgRow) -> AdminStoreResult<AdminRevision> {

@@ -293,6 +293,12 @@ async fn sqlite_runtime_settings_update_atomically_and_fence_provider_profiles_b
     let repository = gateway_store::sqlite::SqliteRuntimeSettingsRepository::new(pool.clone());
     let defaults = repository.load_runtime_settings().await.unwrap();
     assert_eq!(defaults.config_revision.get(), 1);
+    assert_eq!(
+        defaults.openai_account_affinity,
+        gateway_core::account::AccountAffinity::Strict
+    );
+    assert_eq!(defaults.max_account_rotations, 3);
+    assert_eq!(defaults.openai_session_affinity_ttl_hours, 24);
     assert_eq!(defaults.account_auto_freeze_threshold, 12);
     assert_eq!(defaults.account_auto_freeze_window_seconds, 600);
     assert_eq!(defaults.account_auto_freeze_duration_seconds, 7_200);
@@ -317,6 +323,9 @@ async fn sqlite_runtime_settings_update_atomically_and_fence_provider_profiles_b
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
         openai_guardian_reserved_concurrency: 0,
+        openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
+        max_account_rotations: 3,
+        openai_session_affinity_ttl_hours: 24,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         smart_scheduling: SmartSchedulingConfig::default(),
         rotation_strategy: "smart".to_owned(),
@@ -824,6 +833,7 @@ async fn sqlite_session_affinity_cas_and_exclusions_are_visible_across_pools() {
     let alias_key = ProviderSessionAffinityKey::try_new("observed-request").unwrap();
     let alias = ProviderSessionAlias {
         session_key: key.clone(),
+        root_session_key: Some(ProviderSessionAffinityKey::try_new("root-session").unwrap()),
         follow_only: true,
     };
     assert!(
@@ -849,6 +859,7 @@ async fn sqlite_session_affinity_cas_and_exclusions_are_visible_across_pools() {
                 &alias_key,
                 &ProviderSessionAlias {
                     session_key: ProviderSessionAffinityKey::try_new("different-session").unwrap(),
+                    root_session_key: None,
                     follow_only: false,
                 },
                 ttl,

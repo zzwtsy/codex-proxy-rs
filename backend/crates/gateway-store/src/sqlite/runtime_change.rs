@@ -136,6 +136,7 @@ async fn current_revision(pool: &SqlitePool) -> StoreResult<Revision> {
             .ok_or_else(|| StoreError::NotFound {
                 entity: "runtime settings",
                 id: "1".to_owned(),
+                source: None,
             })?;
     Revision::new(u64::try_from(revision).map_err(|_| invalid("runtime revision is negative"))?)
 }
@@ -144,6 +145,7 @@ fn unavailable(operation: &'static str) -> StoreError {
     StoreError::Unavailable {
         backend: crate::StoreBackend::Sqlite,
         message: operation.to_owned(),
+        source: None,
     }
 }
 
@@ -151,5 +153,6 @@ fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: "runtime change",
         message: message.to_owned(),
+        source: None,
     }
 }

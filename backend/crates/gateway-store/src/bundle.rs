@@ -7,6 +7,7 @@ use super::*;
 
 /// 已完成连接、迁移与 hydration 的 Store 能力集合
 pub struct StoreBundle {
+    diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
     admin_ports: AdminStorePorts,
     core_ports: CoreStorePorts,
     provider_ports: ProviderStorePorts,
@@ -19,6 +20,11 @@ pub struct StoreBundle {
 }
 
 impl StoreBundle {
+    #[must_use]
+    pub fn diagnostics(&self) -> Arc<dyn gateway_core::diagnostics::OperationalDiagnostics> {
+        self.diagnostics.clone()
+    }
+
     #[must_use]
     pub fn admin_ports(&self) -> AdminStorePorts {
         self.admin_ports.clone()
@@ -129,7 +135,7 @@ async fn connect_sqlite(
     let credential_leases = sqlite::SqliteCredentialLeaseRepository::new(pool.clone());
     let admin_account_runtime = Arc::new(AccountRuntimeStoreAdapter::new(
         Arc::clone(&cooldowns) as Arc<dyn AccountRuntimeStateRepository>,
-        Arc::new(credential_leases.clone()) as Arc<dyn CredentialLeaseRepository>,
+        Arc::new(credential_leases.clone()) as Arc<dyn AccountRuntimeSignalRepository>,
     ));
     let provider_leases = Arc::new(sqlite::SqliteProviderLeaseCoordinator::new(
         credential_leases,
@@ -172,6 +178,7 @@ async fn connect_sqlite(
     let (execution, execution_writer) =
         postgres::BufferedExecutionStore::new(Arc::clone(&execution_repository));
     let execution = Arc::new(execution);
+    let diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics> = execution.clone();
     let (client_key_usage, client_key_usage_writer) =
         sqlite::SqliteClientApiKeyUsageSink::new(pool.clone());
     let retention = Arc::new(sqlite::SqliteRetentionRepository::new(pool.clone()));
@@ -191,6 +198,7 @@ async fn connect_sqlite(
         continuation,
         (snapshots, snapshot_changes),
         Arc::new(client_key_usage),
+        diagnostics.clone(),
     )
     .with_budget(Arc::new(sqlite::SqliteClientBudgetStore::new(
         pool.clone(),
@@ -211,6 +219,7 @@ async fn connect_sqlite(
         cooldowns,
         runtime_policy,
         oauth_pending,
+        diagnostics.clone(),
     );
     let worker_leader_lease = Arc::new(LocalWorkerLeaderLeasePort::default());
     let health_probes: Vec<Arc<dyn HealthProbe>> = vec![Arc::new(SqliteHealthProbe::new(
@@ -243,6 +252,7 @@ async fn connect_sqlite(
         }
     };
     Ok(StoreBundle {
+        diagnostics,
         admin_ports,
         core_ports,
         provider_ports,
@@ -273,12 +283,12 @@ async fn connect_postgres_redis(
         config.pool.observability_max_connections(),
         config.pool.acquire_timeout(),
     )?;
-    let redis_client =
-        ::redis::Client::open(redis_url).map_err(|_| redis_unavailable("create Redis client"))?;
+    let redis_client = ::redis::Client::open(redis_url)
+        .map_err(|source| redis_unavailable("create Redis client", source))?;
     let redis_connection = redis_client
         .get_connection_manager()
         .await
-        .map_err(|_| redis_unavailable("connect Redis manager"))?;
+        .map_err(|source| redis_unavailable("connect Redis manager", source))?;
 
     let provider_accounts = Arc::new(postgres::PgProviderAccountRepository::new(pool.clone()));
     let cooldowns = Arc::new(redis::RedisCredentialCooldownRepository::new(
@@ -344,7 +354,7 @@ async fn connect_postgres_redis(
         Arc::new(
             postgres::PgAdminObservabilityStore::new(
                 pool.clone(),
-                Some(Arc::new(credential_leases.clone()) as Arc<dyn CredentialLeaseRepository>),
+                Some(credential_leases.clone()),
                 Some(Arc::clone(&cooldowns) as Arc<dyn ProviderCooldownPort>),
                 observability_query_budget,
             )
@@ -363,6 +373,7 @@ async fn connect_postgres_redis(
     let (execution, execution_writer) =
         postgres::BufferedExecutionStore::new(Arc::clone(&execution_repository));
     let execution = Arc::new(execution);
+    let diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics> = execution.clone();
     let (client_key_usage, client_key_usage_writer) =
         postgres::PgClientApiKeyUsageSink::new(pool.clone());
     let retention = Arc::new(postgres::PgRetentionRepository::new(pool.clone()));
@@ -376,7 +387,7 @@ async fn connect_postgres_redis(
             REDIS_NAMESPACE,
         )?);
     let (admissions, admission_release_writer) =
-        redis::BufferedClientAdmissionPort::new(admissions);
+        redis::BufferedClientAdmissionPort::new(admissions, diagnostics.clone());
     let core_ports = CoreStorePorts::new(
         execution,
         (
@@ -394,6 +405,7 @@ async fn connect_postgres_redis(
             )?),
         ),
         Arc::new(client_key_usage),
+        diagnostics.clone(),
     )
     .with_budget(Arc::new(
         postgres::PgClientBudgetStore::new(pool.clone()).with_timezone(config.timezone),
@@ -414,6 +426,7 @@ async fn connect_postgres_redis(
         cooldowns,
         runtime_policy,
         oauth_pending,
+        diagnostics.clone(),
     );
     let worker_leader_lease = Arc::new(redis::worker_lease::RedisWorkerLeaderLeasePort::new(
         credential_leases,
@@ -453,6 +466,7 @@ async fn connect_postgres_redis(
         }
     };
     Ok(StoreBundle {
+        diagnostics,
         admin_ports,
         core_ports,
         provider_ports,

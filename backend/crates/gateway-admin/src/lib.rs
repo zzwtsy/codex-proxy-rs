@@ -20,7 +20,7 @@ pub mod backup;
 pub mod freeze_recovery;
 pub mod model;
 pub mod ports;
-pub mod service;
+pub mod public_service;
 mod use_case;
 pub use use_case::plugins::{PluginDistributionPorts, PluginManagementService, PluginsService};
 
@@ -205,7 +205,7 @@ pub enum AdminConfigError {
 #[derive(Clone)]
 pub struct AdminServices {
     timezone: gateway_core::time::DeploymentTimeZone,
-    public_services: Arc<service::Registry>,
+    public_services: Arc<public_service::Registry>,
     plugins: Arc<PluginsService>,
     plugin_management: Arc<PluginManagementService>,
     proxies: Arc<dyn ProxiesService>,
@@ -219,7 +219,8 @@ pub struct AdminServices {
     settings: Arc<dyn SettingsService>,
     system: Arc<dyn SystemService>,
     credentials: Arc<CredentialsService>,
-    plugin_accounts: Arc<dyn PluginAccountAccess>,
+    // Runtime 只持有 Weak，这个强引用保障账号端口与 Admin 服务同寿命
+    _plugin_accounts: Arc<dyn PluginAccountAccess>,
     backups: Arc<dyn BackupService>,
     import_tasks: Arc<dyn ImportTasksService>,
 }
@@ -230,7 +231,7 @@ impl AdminServices {
         self.timezone
     }
 
-    pub fn public_services(&self) -> Arc<service::Registry> {
+    pub fn public_services(&self) -> Arc<public_service::Registry> {
         self.public_services.clone()
     }
 
@@ -252,12 +253,6 @@ impl AdminServices {
     #[must_use]
     pub fn key_usage(&self) -> &dyn KeyUsageService {
         self.key_usage.as_ref()
-    }
-
-    /// 取得账号服务的共享句柄；后台编排（冻结恢复 worker）需要持有 Arc
-    #[must_use]
-    pub fn accounts_handle(&self) -> Arc<dyn AccountsService> {
-        Arc::clone(&self.accounts)
     }
 
     #[must_use]
@@ -309,12 +304,6 @@ impl AdminServices {
         self.credentials.as_ref()
     }
 
-    /// Runtime 只持有该窄端口的 Weak；AdminBundle 保持实际生命周期
-    #[must_use]
-    pub fn plugin_accounts_handle(&self) -> Arc<dyn PluginAccountAccess> {
-        Arc::clone(&self.plugin_accounts)
-    }
-
     #[must_use]
     pub fn backups(&self) -> &dyn BackupService {
         self.backups.as_ref()
@@ -342,7 +331,7 @@ impl AdminBundle {
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入
 pub struct AdminRuntimePorts {
     pub timezone: gateway_core::time::DeploymentTimeZone,
-    pub service_middleware: service::PlanSource,
+    pub service_middleware: public_service::PlanSource,
     pub plugin_preparation: Arc<dyn ports::plugins::PluginPreparation>,
     pub plugin_management: Arc<dyn ports::plugin_management::PluginManagement>,
     pub published_snapshot: gateway_core::runtime::RuntimeSnapshotHandle,
@@ -478,7 +467,7 @@ async fn initialize_inner(
         registry.clone(),
         pricing_source,
     );
-    let mut public_services = service::Registry::new(service_middleware);
+    let mut public_services = public_service::Registry::new(service_middleware);
     public_services.register_settings(&settings)?;
     let services = AdminServices {
         timezone,
@@ -527,7 +516,7 @@ async fn initialize_inner(
         settings,
         system,
         credentials,
-        plugin_accounts,
+        _plugin_accounts: plugin_accounts,
         import_tasks,
         backups,
     };

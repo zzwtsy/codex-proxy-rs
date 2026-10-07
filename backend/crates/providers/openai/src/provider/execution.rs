@@ -97,9 +97,12 @@ impl CodexProvider {
         }
         let follow_only = inferred
             .as_ref()
-            .is_some_and(CodexSessionAffinity::follow_only);
-        Ok(explicit
-            .or(inferred)
+            .is_some_and(CodexSessionAffinity::follow_only)
+            || explicit
+                .as_ref()
+                .is_some_and(CodexSessionAffinity::follow_only);
+        Ok(inferred
+            .or(explicit)
             .map(|affinity| affinity.with_follow_only(follow_only)))
     }
 
@@ -216,7 +219,12 @@ impl CodexProvider {
         };
         if !context.is_diagnostic_required_account() {
             self.selector
-                .validate_translated_selection(&mut lease, affinity.as_ref(), None)
+                .validate_translated_selection(
+                    &mut lease,
+                    affinity.as_ref(),
+                    None,
+                    context.account_selection_policy(),
+                )
                 .await
                 .map_err(map_selection_error)?;
         }
@@ -267,6 +275,21 @@ impl CodexProvider {
                 ));
             }
         }
+        if !context.is_diagnostic_required_account()
+            && let Some(affinity) = affinity.as_ref()
+            && let Some(turn) = affinity.turn_alias()
+        {
+            self.selector
+                .remember_turn(
+                    turn,
+                    affinity,
+                    context
+                        .account_selection_policy()
+                        .openai_session_affinity_ttl(),
+                )
+                .await
+                .map_err(map_selection_error)?;
+        }
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let provider_kind = ProviderKind::new(PROVIDER_NAME)
             .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
@@ -290,10 +313,8 @@ impl CodexProvider {
             client: self
                 .client_for_request(&context)?
                 .for_account(lease.account())
-                .map_err(|_| {
-                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-                })?
-                .with_authentication(lease.authentication())
+                .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?
+                .with_responses_api_base_url(lease.authentication().responses_api_base_url())
                 .with_middleware_headers(middleware_headers),
             response_origin: request.response_origin,
             endpoint_path: request.endpoint_path,
@@ -304,7 +325,6 @@ impl CodexProvider {
             selector: Arc::clone(&self.selector),
             quota: Arc::clone(&self.quota),
             lease: Arc::clone(&lease),
-            output_started_at: Instant::now(),
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {
@@ -339,7 +359,6 @@ pub(super) struct ColdResponse {
     pub(super) quota: Arc<CodexCredentialQuotaService>,
     pub(super) catalog: Arc<CodexCredentialCatalogService>,
     pub(super) lease: Arc<CodexCredentialLease>,
-    pub(super) output_started_at: Instant,
     pub(super) session_transport_key: Option<ProviderSessionAffinityKey>,
     pub(super) session_transport_key_hash: Option<String>,
     pub(super) session_transport_recovery: CodexSessionTransportRecovery,
@@ -359,7 +378,6 @@ pub(super) struct ColdJsonResponse {
     pub(super) selector: Arc<CodexCredentialSelector>,
     pub(super) quota: Arc<CodexCredentialQuotaService>,
     pub(super) lease: Arc<CodexCredentialLease>,
-    pub(super) output_started_at: Instant,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -618,7 +636,8 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
 
         let mut metrics = response.transport_metrics.clone();
         metrics.first_event_ms = Some(
-            i64::try_from(request.output_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+            i64::try_from(request.context.timing_started_at().elapsed().as_millis())
+                .unwrap_or(i64::MAX),
         );
         if let Some(observation) = codex_response_observation(
             CodexBackendTransport::HttpJson,
@@ -720,7 +739,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         quota,
         catalog,
         lease,
-        output_started_at,
         session_transport_key,
         session_transport_key_hash,
         session_transport_recovery,
@@ -1026,7 +1044,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 observation_state.merge_rate_limit_headers(&rate_limit_update_headers(&updates))
             };
             let first_event_changed =
-                observation_state.observe_stream_chunk(&chunk, output_started_at);
+                observation_state.observe_stream_chunk(&chunk, context.timing_started_at());
             let chunk_len = chunk.len();
             let (mut events, canonical_failure) = match decoder.push(&chunk) {
                 CodexCanonicalOutcome::Events(events) => (events, None),
@@ -1073,9 +1091,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 )
             });
             let timing_signals = decoder.take_timing_signals();
-            let timing_changed = first_event_changed
-                || observation_state
-                    .observe_timing_signals(timing_signals, output_started_at);
+            let output_timing_changed = observation_state
+                .observe_timing_signals(timing_signals, context.timing_started_at());
+            let timing_changed = first_event_changed || output_timing_changed;
             let completed = events
                 .iter()
                 .flat_map(ProviderEvent::canonical_facts)
@@ -1187,7 +1205,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let service_tier_changed = observation_state
             .observe_upstream_service_tier(decoder.response_service_tier());
         let timing_changed = observation_state
-            .observe_timing_signals(timing_signals, output_started_at);
+            .observe_timing_signals(timing_signals, context.timing_started_at());
         let updates = take_rate_limit_updates(rate_limit_updates.as_ref()).await;
         let rate_limits_changed = if updates.is_empty() {
             false

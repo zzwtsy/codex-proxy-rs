@@ -97,18 +97,18 @@ impl ClientAdmissionRecoveryPort for SqliteClientAdmissionRecoveryRepository {
         Box::pin(async move {
             self.load_client_admission_recovery(DateTime::<Utc>::from(since))
                 .await
-                .map_err(|_| ClientAdmissionError)?
+                .map_err(|source| ClientAdmissionError(Some(source.into())))?
                 .into_iter()
                 .map(|recovery| {
                     let client_api_key_id = ClientApiKeyId::new(recovery.client_api_key_ref)
-                        .map_err(|_| ClientAdmissionError)?;
+                        .map_err(|source| ClientAdmissionError(Some(source.into())))?;
                     let recent_requests = recovery
                         .recent_requests
                         .into_iter()
                         .map(|request| {
                             Ok(RecentAdmissionFact {
                                 model_request_id: ModelRequestId::new(request.model_request_id)
-                                    .map_err(|_| ClientAdmissionError)?,
+                                    .map_err(|source| ClientAdmissionError(Some(source.into())))?,
                                 started_at: request.started_at.into(),
                             })
                         })
@@ -119,7 +119,7 @@ impl ClientAdmissionRecoveryPort for SqliteClientAdmissionRecoveryRepository {
                         .map(|request| {
                             Ok(RunningAdmissionFact {
                                 model_request_id: ModelRequestId::new(request.model_request_id)
-                                    .map_err(|_| ClientAdmissionError)?,
+                                    .map_err(|source| ClientAdmissionError(Some(source.into())))?,
                                 expires_at: request.deadline_at.into(),
                             })
                         })
@@ -139,6 +139,7 @@ fn read_string(row: &sqlx::sqlite::SqliteRow, field: &'static str) -> StoreResul
     row.try_get(field).map_err(|_| StoreError::InvalidData {
         entity: "SQLite client admission recovery",
         message: "persisted text field is invalid".to_owned(),
+        source: None,
     })
 }
 
@@ -146,5 +147,6 @@ fn read_i64(row: &sqlx::sqlite::SqliteRow, field: &'static str) -> StoreResult<i
     row.try_get(field).map_err(|_| StoreError::InvalidData {
         entity: "SQLite client admission recovery",
         message: "persisted integer field is invalid".to_owned(),
+        source: None,
     })
 }

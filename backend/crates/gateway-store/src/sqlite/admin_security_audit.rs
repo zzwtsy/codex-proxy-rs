@@ -118,6 +118,7 @@ pub(crate) async fn append_admin_audit_event_in_transaction(
         serde_json::to_string(&event.changed_fields).map_err(|_| StoreError::InvalidData {
             entity: ENTITY,
             message: "changed fields could not be encoded".to_owned(),
+            source: None,
         })?;
     sqlx::query(
         "insert into admin_audit_events (

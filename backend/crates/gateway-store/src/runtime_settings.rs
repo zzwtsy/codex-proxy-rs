@@ -22,6 +22,9 @@ pub struct RuntimeSettings {
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
     pub openai_guardian_reserved_concurrency: u32,
+    pub openai_account_affinity: gateway_core::account::AccountAffinity,
+    pub max_account_rotations: u32,
+    pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
@@ -63,6 +66,12 @@ impl fmt::Debug for RuntimeSettings {
                 &self.max_concurrent_per_account,
             )
             .field("request_interval_ms", &self.request_interval_ms)
+            .field("openai_account_affinity", &self.openai_account_affinity)
+            .field("max_account_rotations", &self.max_account_rotations)
+            .field(
+                "openai_session_affinity_ttl_hours",
+                &self.openai_session_affinity_ttl_hours,
+            )
             .field("rotation_strategy", &self.rotation_strategy)
             .field("request_location_enabled", &self.request_location_enabled)
             .field("request_location", &self.request_location)
@@ -125,6 +134,9 @@ pub struct RuntimeSettingsUpdate {
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
     pub openai_guardian_reserved_concurrency: u32,
+    pub openai_account_affinity: gateway_core::account::AccountAffinity,
+    pub max_account_rotations: u32,
+    pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
@@ -170,6 +182,9 @@ impl RuntimeSettingsUpdate {
             || self.max_waiting_per_key > 1_000
             || self.max_waiting_per_account > 1_000
             || !(1..=120).contains(&self.concurrency_wait_timeout_seconds)
+            || self.max_account_rotations > gateway_core::account::MAX_ACCOUNT_ROTATIONS
+            || !(1..=gateway_core::account::MAX_SESSION_AFFINITY_TTL_HOURS)
+                .contains(&self.openai_session_affinity_ttl_hours)
             || self.usage_retention_days < 31
             || self.ops_event_retention_days == 0
             || self.audit_retention_days == 0
@@ -197,6 +212,7 @@ impl RuntimeSettingsUpdate {
                 })
         {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "runtime settings",
                 message: "settings violate the frozen runtime constraints".to_owned(),
             });

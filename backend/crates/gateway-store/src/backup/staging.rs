@@ -57,15 +57,16 @@ impl StagingArea {
         backend: crate::StoreBackend,
     ) -> StoreResult<Self> {
         std::fs::create_dir_all(&base_dir)
-            .map_err(|_| unavailable(backend, "create staging directory"))?;
+            .map_err(|source| unavailable(backend, "create staging directory", source))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| unavailable(backend, "set staging directory permissions"))?;
+            std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+                |source| unavailable(backend, "set staging directory permissions", source),
+            )?;
         }
         let metadata = std::fs::metadata(&base_dir)
-            .map_err(|_| unavailable(backend, "read staging directory metadata"))?;
+            .map_err(|source| unavailable(backend, "read staging directory metadata", source))?;
         if !metadata.is_dir() {
             return Err(invalid("staging path is not a directory"));
         }
@@ -123,9 +124,10 @@ impl StagingArea {
     /// 剩余空间不足或读取失败时返回 [`crate::StoreError`]
     pub fn ensure_capacity(&self) -> StoreResult<()> {
         let free = fs2::available_space(&self.base_dir)
-            .map_err(|_| unavailable(self.backend, "read staging free space"))?;
+            .map_err(|source| unavailable(self.backend, "read staging free space", source))?;
         if free < MIN_STAGING_FREE_BYTES {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "backup staging",
                 message: "staging disk space is below 1 GiB".to_owned(),
             });
@@ -134,9 +136,16 @@ impl StagingArea {
     }
 
     /// 清理该备份在暂存区的全部文件；不存在视为成功
-    pub fn cleanup(&self, backup_id: &str) {
-        let _ = std::fs::remove_file(self.partial_path(backup_id));
-        let _ = std::fs::remove_file(self.final_path(backup_id));
+    ///
+    /// # Errors
+    ///
+    /// 文件删除失败时返回错误，仍尝试清理另一条路径
+    pub fn cleanup(&self, backup_id: &str) -> StoreResult<()> {
+        let partial = remove_if_exists(&self.partial_path(backup_id));
+        let complete = remove_if_exists(&self.final_path(backup_id));
+        partial
+            .and(complete)
+            .map_err(|source| unavailable(self.backend, "remove staged archive", source))
     }
 
     /// 校验一个已完成归档的暂存路径归属本暂存区
@@ -146,16 +155,29 @@ impl StagingArea {
     }
 }
 
-fn unavailable(backend: crate::StoreBackend, operation: &'static str) -> StoreError {
+fn unavailable(
+    backend: crate::StoreBackend,
+    operation: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> StoreError {
     StoreError::Unavailable {
         backend,
         message: operation.to_owned(),
+        source: Some(gateway_core::error::ErrorSource::new(source)),
     }
 }
 
 fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "backup staging",
         message: message.to_owned(),
+    }
+}
+
+pub(super) fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }

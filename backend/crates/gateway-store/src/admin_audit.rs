@@ -103,5 +103,6 @@ fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: ENTITY,
         message: message.to_owned(),
+        source: None,
     }
 }

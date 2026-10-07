@@ -6,12 +6,13 @@ use gateway_core::error::ProviderDiagnostic;
 pub(super) fn is_invalid_encrypted_content_failure(error: &GrokInferenceTransportError) -> bool {
     error.kind() == GrokInferenceTransportErrorKind::InvalidRequest
         && error.status() == Some(400)
-        && error.upstream_code().is_some_and(|code| {
-            matches!(
-                code.as_str(),
-                REASONING_DECODE_FAILED_CODE | "invalid_encrypted_content"
-            )
-        })
+        && (error.diagnostic().and_then(ProviderDiagnostic::code)
+            == Some(REASONING_DECODE_FAILED_CODE)
+            || error.upstream_code().is_some_and(|code| {
+                [REASONING_DECODE_FAILED_CODE, "invalid_encrypted_content"]
+                    .iter()
+                    .any(|known| code.as_str().trim().eq_ignore_ascii_case(known))
+            }))
 }
 
 pub(super) enum InferenceBoundary {
@@ -279,15 +280,20 @@ pub(super) fn transport_error_contains_any(
     let code = error
         .upstream_code()
         .map(|code| code.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let classification = error
+        .diagnostic()
+        .and_then(ProviderDiagnostic::code)
         .unwrap_or_default();
     let message = error
         .client_visible_upstream_error()
         .map(ClientVisibleUpstreamError::message)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    signals
-        .iter()
-        .any(|signal| code.contains(signal) || message.contains(signal))
+    signals.iter().any(|signal| {
+        classification.contains(signal) || code.contains(signal) || message.contains(signal)
+    })
 }
 
 pub(super) async fn map_and_record_stream_transport_failure(
@@ -313,15 +319,21 @@ pub(super) fn map_continuation_failure(
     let is_reasoning_decode_failure = context.continuation_attempt() == ContinuationAttempt::Native
         && error.kind() == ProviderErrorKind::InvalidRequest
         && error.upstream_status() == Some(400)
-        && error
-            .upstream_code()
-            .is_some_and(|code| code.as_str() == REASONING_DECODE_FAILED_CODE);
+        && (error.diagnostic().and_then(ProviderDiagnostic::code)
+            == Some(REASONING_DECODE_FAILED_CODE)
+            || error.upstream_code().is_some_and(|code| {
+                code.as_str()
+                    .trim()
+                    .eq_ignore_ascii_case(REASONING_DECODE_FAILED_CODE)
+            }));
     let is_missing_native_response = context.continuation_attempt() == ContinuationAttempt::Native
         && error.kind() == ProviderErrorKind::InvalidRequest
         && error.upstream_status() == Some(404)
-        && error
-            .upstream_code()
-            .is_some_and(|code| code.as_str() == RESPONSE_NOT_FOUND_CODE);
+        && error.upstream_code().is_some_and(|code| {
+            code.as_str()
+                .trim()
+                .eq_ignore_ascii_case(RESPONSE_NOT_FOUND_CODE)
+        });
     if is_reasoning_decode_failure || is_missing_native_response {
         error
             .with_continuation_failure(ContinuationFailure::HistoryUnavailable)
@@ -371,37 +383,54 @@ pub(super) fn map_request_error(error: GrokRequestEncodeError) -> ProviderError 
         GrokRequestEncodeError::InvalidProtocolPayload
         | GrokRequestEncodeError::InvalidRequestNormalization
         | GrokRequestEncodeError::InvalidRequestField { .. } => ProviderErrorKind::InvalidRequest,
+        GrokRequestEncodeError::UnsupportedPrewarm => ProviderErrorKind::Unsupported,
         GrokRequestEncodeError::Serialization => ProviderErrorKind::Protocol,
     };
     let provider_error = provider_error(kind, UpstreamSendState::NotSent);
-    if kind != ProviderErrorKind::InvalidRequest {
+    if !matches!(
+        kind,
+        ProviderErrorKind::InvalidRequest | ProviderErrorKind::Unsupported
+    ) {
         return provider_error;
     }
+    let code = match error {
+        GrokRequestEncodeError::UnsupportedPrewarm => "unsupported_prewarm",
+        _ => "invalid_request_normalization",
+    };
     provider_error.with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
         error.to_string(),
-        Some("invalid_request_normalization".to_owned()),
+        Some(code.to_owned()),
         Some("invalid_request_error".to_owned()),
     ))
 }
 
 /// 将选择阶段失败映射为带结构化 code 与 retry_after 的 Provider 错误
 pub(super) fn map_selection_error(error: GrokSessionSelectorError) -> ProviderError {
+    let mapped = selection_failure(&error);
+    if std::error::Error::source(&error).is_some() {
+        mapped.with_source(error)
+    } else {
+        mapped
+    }
+}
+
+fn selection_failure(error: &GrokSessionSelectorError) -> ProviderError {
     let (retry_after, message, code) = match error {
         GrokSessionSelectorError::QueueRejected(error) => {
             return provider_error(error.provider_kind(), UpstreamSendState::NotSent);
         }
         GrokSessionSelectorError::AccountCoolingDown { retry_after } => (
-            retry_after,
-            cooling_down_message(retry_after),
+            *retry_after,
+            cooling_down_message(*retry_after),
             "account_cooling_down",
         ),
         GrokSessionSelectorError::ModelCoolingDown { retry_after } => (
-            retry_after,
-            model_cooling_down_message(retry_after),
+            *retry_after,
+            model_cooling_down_message(*retry_after),
             "model_cooling_down",
         ),
         GrokSessionSelectorError::CapacityUnavailable { retry_after } => (
-            retry_after,
+            *retry_after,
             "account is at its concurrency or request-interval limit".to_owned(),
             "account_capacity_busy",
         ),
@@ -410,7 +439,7 @@ pub(super) fn map_selection_error(error: GrokSessionSelectorError) -> ProviderEr
             "no account is eligible for the requested model".to_owned(),
             "no_eligible_account",
         ),
-        GrokSessionSelectorError::Unavailable => (
+        GrokSessionSelectorError::Unavailable(_) => (
             None,
             "account scheduling state is temporarily unreadable".to_owned(),
             "account_selector_unavailable",
@@ -424,7 +453,7 @@ pub(super) fn map_selection_error(error: GrokSessionSelectorError) -> ProviderEr
         GrokSessionSelectorError::PolicyUnavailable => {
             return provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent);
         }
-        GrokSessionSelectorError::InvalidSession => {
+        GrokSessionSelectorError::InvalidSession(_) => {
             return provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent);
         }
     };
@@ -519,6 +548,9 @@ pub(super) fn map_transport_error_with_state(
     if let Some(code) = error.upstream_code().cloned() {
         mapped = mapped.with_upstream_code(code);
     }
+    if let Some(raw) = error.raw_upstream_error().cloned() {
+        mapped = mapped.with_raw_upstream_error(raw);
+    }
     if let Some(detail) = error.client_visible_upstream_error().cloned() {
         mapped = mapped.with_client_visible_upstream_error(detail);
     }
@@ -538,6 +570,9 @@ pub(super) fn map_transport_error_with_state(
     }
     if error.sensitive_context_was_redacted() {
         mapped = mapped.redact_sensitive_context("upstream transport context");
+    }
+    if std::error::Error::source(&error).is_some() {
+        mapped = mapped.with_source(error);
     }
     mapped
 }

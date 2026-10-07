@@ -27,18 +27,27 @@ pub(crate) trait AccountRuntimeStateRepository: Send + Sync {
     ) -> StoreResult<bool>;
 }
 
+/// Admin 账号容量只读取在途数，不依赖 Provider 租约的写入合同。
+#[async_trait::async_trait]
+pub(crate) trait AccountRuntimeSignalRepository: Send + Sync {
+    async fn credential_runtime_signals(
+        &self,
+        account_ids: &[String],
+    ) -> StoreResult<Vec<(String, u32)>>;
+}
+
 /// 将账号 cooldown 状态与凭据租约信号组合为 Admin 运行态端口。
 #[derive(Clone)]
 pub(crate) struct AccountRuntimeStoreAdapter {
     state: Arc<dyn AccountRuntimeStateRepository>,
-    leases: Arc<dyn CredentialLeaseRepository>,
+    leases: Arc<dyn AccountRuntimeSignalRepository>,
 }
 
 impl AccountRuntimeStoreAdapter {
     #[must_use]
     pub(crate) fn new(
         state: Arc<dyn AccountRuntimeStateRepository>,
-        leases: Arc<dyn CredentialLeaseRepository>,
+        leases: Arc<dyn AccountRuntimeSignalRepository>,
     ) -> Self {
         Self { state, leases }
     }
@@ -70,7 +79,7 @@ impl AccountRuntimeStore for AccountRuntimeStoreAdapter {
             .map(|signals| {
                 signals
                     .into_iter()
-                    .map(|signal| (signal.resource_id, u64::from(signal.in_flight)))
+                    .map(|(resource_id, in_flight)| (resource_id, u64::from(in_flight)))
                     .collect()
             });
         Ok(AccountRuntimeSnapshot {
@@ -111,11 +120,51 @@ impl AccountRuntimeStore for AccountRuntimeStoreAdapter {
     }
 }
 
+#[async_trait::async_trait]
+impl AccountRuntimeSignalRepository for sqlite::SqliteCredentialLeaseRepository {
+    async fn credential_runtime_signals(
+        &self,
+        account_ids: &[String],
+    ) -> StoreResult<Vec<(String, u32)>> {
+        CredentialLeaseRepository::credential_runtime_signals(self, account_ids)
+            .await
+            .map(|signals| {
+                signals
+                    .into_iter()
+                    .map(|signal| (signal.resource_id, signal.in_flight))
+                    .collect()
+            })
+    }
+}
+
 pub(crate) struct AuthStoreAdapter {
     pub(crate) security: Arc<dyn AdminSecurityAuditRepository>,
-    pub(crate) settings: Arc<dyn RuntimeSettingsRepository>,
+    pub(crate) settings: Arc<dyn AdminApiKeyRepository>,
     pub(crate) state: Arc<dyn AuthStateRepository>,
     pub(crate) keys: Arc<dyn ClientKeyEnabledRepository>,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait AdminApiKeyRepository: Send + Sync {
+    async fn load_admin_api_key(&self) -> StoreResult<Option<String>>;
+}
+
+#[async_trait::async_trait]
+impl AdminApiKeyRepository for sqlite::SqliteRuntimeSettingsRepository {
+    async fn load_admin_api_key(&self) -> StoreResult<Option<String>> {
+        RuntimeSettingsRepository::load_runtime_settings(self)
+            .await
+            .map(|settings| settings.admin_api_key)
+    }
+}
+
+#[async_trait::async_trait]
+impl AdminApiKeyRepository for postgres::PgRuntimeSettingsRepository {
+    async fn load_admin_api_key(&self) -> StoreResult<Option<String>> {
+        postgres::RuntimeSettingsRepository::load_runtime_settings(self)
+            .await
+            .map(|settings| settings.admin_api_key)
+    }
 }
 
 /// AuthStore 只需查询 Key 是否启用，不依赖完整管理端 Key 仓储。
@@ -137,7 +186,8 @@ impl ClientKeyEnabledRepository for postgres::PgAdminClientKeyStore {
 
 #[async_trait::async_trait]
 pub(crate) trait AdminSettingsRepository: Send + Sync {
-    async fn load_runtime_settings(&self) -> StoreResult<crate::runtime_settings::RuntimeSettings>;
+    async fn load_runtime_settings(&self) -> AdminStoreResult<AdminRuntimeSettings>;
+    async fn admin_api_key_exists(&self) -> AdminStoreResult<bool>;
     async fn load_pricing(&self) -> StoreResult<gateway_admin::model::pricing::StoredPricing>;
     async fn sync_pricing(
         &self,
@@ -154,7 +204,7 @@ pub(crate) trait AdminSettingsRepository: Send + Sync {
         expected_revision: Revision,
         settings: RuntimeSettingsUpdate,
         audit: AdminAuditEvent,
-    ) -> StoreResult<crate::runtime_settings::RuntimeSettings>;
+    ) -> AdminStoreResult<AdminRuntimeSettings>;
     async fn replace_admin_api_key(
         &self,
         admin_api_key: Option<String>,
@@ -164,8 +214,18 @@ pub(crate) trait AdminSettingsRepository: Send + Sync {
 
 #[async_trait::async_trait]
 impl AdminSettingsRepository for sqlite::SqliteAdminSettingsRepository {
-    async fn load_runtime_settings(&self) -> StoreResult<crate::runtime_settings::RuntimeSettings> {
-        sqlite::SqliteAdminSettingsRepository::load_runtime_settings(self).await
+    async fn load_runtime_settings(&self) -> AdminStoreResult<AdminRuntimeSettings> {
+        let settings = sqlite::SqliteAdminSettingsRepository::load_runtime_settings(self)
+            .await
+            .map_err(|error| admin_store_error("runtime settings", error))?;
+        admin_runtime_settings(settings)
+    }
+
+    async fn admin_api_key_exists(&self) -> AdminStoreResult<bool> {
+        sqlite::SqliteAdminSettingsRepository::load_runtime_settings(self)
+            .await
+            .map(|settings| settings.admin_api_key.is_some())
+            .map_err(|error| admin_store_error("admin API key", error))
     }
 
     async fn load_pricing(&self) -> StoreResult<gateway_admin::model::pricing::StoredPricing> {
@@ -193,14 +253,16 @@ impl AdminSettingsRepository for sqlite::SqliteAdminSettingsRepository {
         expected_revision: Revision,
         settings: RuntimeSettingsUpdate,
         audit: AdminAuditEvent,
-    ) -> StoreResult<crate::runtime_settings::RuntimeSettings> {
-        sqlite::SqliteAdminSettingsRepository::replace_runtime_settings(
+    ) -> AdminStoreResult<AdminRuntimeSettings> {
+        let settings = sqlite::SqliteAdminSettingsRepository::replace_runtime_settings(
             self,
             expected_revision,
             settings,
             audit,
         )
         .await
+        .map_err(|error| admin_store_error("runtime settings", error))?;
+        admin_runtime_settings(settings)
     }
 
     async fn replace_admin_api_key(
@@ -215,10 +277,19 @@ impl AdminSettingsRepository for sqlite::SqliteAdminSettingsRepository {
 
 #[async_trait::async_trait]
 impl AdminSettingsRepository for postgres::PgControlPlaneRepository {
-    async fn load_runtime_settings(&self) -> StoreResult<crate::runtime_settings::RuntimeSettings> {
+    async fn load_runtime_settings(&self) -> AdminStoreResult<AdminRuntimeSettings> {
+        let settings = postgres::ControlPlaneRepository::load_control_plane(self)
+            .await
+            .map_err(|error| admin_store_error("runtime settings", error))?
+            .settings;
+        admin_runtime_settings_from_postgres(settings)
+    }
+
+    async fn admin_api_key_exists(&self) -> AdminStoreResult<bool> {
         postgres::ControlPlaneRepository::load_control_plane(self)
             .await
-            .map(|snapshot| snapshot.settings)
+            .map(|snapshot| snapshot.settings.admin_api_key.is_some())
+            .map_err(|error| admin_store_error("admin API key", error))
     }
 
     async fn load_pricing(&self) -> StoreResult<gateway_admin::model::pricing::StoredPricing> {
@@ -246,17 +317,18 @@ impl AdminSettingsRepository for postgres::PgControlPlaneRepository {
         expected_revision: Revision,
         settings: RuntimeSettingsUpdate,
         audit: AdminAuditEvent,
-    ) -> StoreResult<crate::runtime_settings::RuntimeSettings> {
-        postgres::ControlPlaneRepository::replace_control_plane(
+    ) -> AdminStoreResult<AdminRuntimeSettings> {
+        let snapshot = postgres::ControlPlaneRepository::replace_control_plane(
             self,
             postgres::ControlPlaneReplacement {
                 expected_revision,
-                settings,
+                settings: postgres_runtime_settings_update(settings),
                 audit,
             },
         )
         .await
-        .map(|snapshot| snapshot.settings)
+        .map_err(|error| admin_store_error("runtime settings", error))?;
+        admin_runtime_settings_from_postgres(snapshot.settings)
     }
 
     async fn replace_admin_api_key(
@@ -320,20 +392,11 @@ impl SettingsStore for AdminSettingsStoreAdapter {
     }
 
     async fn load_runtime_settings(&self) -> AdminStoreResult<AdminRuntimeSettings> {
-        let settings = self
-            .control_plane
-            .load_runtime_settings()
-            .await
-            .map_err(|error| admin_store_error("runtime settings", error))?;
-        admin_runtime_settings(settings)
+        self.control_plane.load_runtime_settings().await
     }
 
     async fn admin_api_key_exists(&self) -> AdminStoreResult<bool> {
-        self.control_plane
-            .load_runtime_settings()
-            .await
-            .map(|settings| settings.admin_api_key.is_some())
-            .map_err(|error| admin_store_error("admin API key", error))
+        self.control_plane.admin_api_key_exists().await
     }
 
     async fn replace_runtime_settings(
@@ -342,39 +405,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
         context: &MutationContext,
     ) -> AdminStoreResult<AdminRuntimeSettings> {
         let expected_revision = store_revision(command.expected_revision)?;
-        let settings = RuntimeSettingsUpdate {
-            request_profile_updates: command.request_profile_updates,
-            refresh_margin_seconds: command.refresh_margin_seconds,
-            refresh_concurrency: command.refresh_concurrency,
-            max_concurrent_per_account: command.max_concurrent_per_account,
-            request_location_enabled: command.request_location_enabled,
-            request_location: command.request_location,
-            request_interval_ms: command.request_interval_ms,
-            max_waiting_per_key: command.max_waiting_per_key,
-            max_waiting_per_account: command.max_waiting_per_account,
-            concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
-            openai_guardian_reserved_concurrency: command.openai_guardian_reserved_concurrency,
-            responses_max_decompressed_body_bytes: command.responses_max_decompressed_body_bytes,
-            smart_scheduling: command.smart_scheduling,
-            rotation_strategy: command.rotation_strategy.as_str().to_owned(),
-            model_mappings: store_model_mappings(command.model_mappings),
-            min_codex_desktop_version: command.min_codex_desktop_version,
-            min_codex_cli_version: command.min_codex_cli_version,
-            usage_retention_days: command.usage_retention_days,
-            ops_event_retention_days: command.ops_event_retention_days,
-            audit_retention_days: command.audit_retention_days,
-            account_auto_freeze_enabled: command.account_auto_freeze_enabled,
-            account_auto_freeze_threshold: command.account_auto_freeze_threshold,
-            account_auto_freeze_window_seconds: command.account_auto_freeze_window_seconds,
-            account_auto_freeze_duration_seconds: command.account_auto_freeze_duration_seconds,
-            account_auto_freeze_probe_enabled: command.account_auto_freeze_probe_enabled,
-            account_auto_freeze_probe_model: command.account_auto_freeze_probe_model,
-            account_auto_freeze_adaptive_concurrency: command
-                .account_auto_freeze_adaptive_concurrency,
-            account_warmup_enabled: command.account_warmup_enabled,
-            account_warmup_schedule_time: command.account_warmup_schedule_time,
-            account_warmup_model: command.account_warmup_model,
-        };
+        let settings = store_runtime_settings_update(command);
         let audit = mutation_audit(
             context,
             MutationAuditOperation::RuntimeSettingsReplace,
@@ -392,6 +423,9 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 "max_waiting_per_account".to_owned(),
                 "concurrency_wait_timeout_seconds".to_owned(),
                 "openai_guardian_reserved_concurrency".to_owned(),
+                "openai_account_affinity".to_owned(),
+                "max_account_rotations".to_owned(),
+                "openai_session_affinity_ttl_hours".to_owned(),
                 "responses_max_decompressed_body_bytes".to_owned(),
                 "rotation_strategy".to_owned(),
                 "smart_scheduling_json".to_owned(),
@@ -404,9 +438,8 @@ impl SettingsStore for AdminSettingsStoreAdapter {
         let settings = self
             .control_plane
             .replace_runtime_settings(expected_revision, settings, audit)
-            .await
-            .map_err(|error| admin_store_error("runtime settings", error))?;
-        admin_runtime_settings(settings)
+            .await?;
+        Ok(settings)
     }
 
     async fn replace_admin_api_key(
@@ -456,16 +489,78 @@ impl AdminSettingsStoreAdapter {
 pub(crate) fn admin_runtime_settings(
     settings: crate::runtime_settings::RuntimeSettings,
 ) -> AdminStoreResult<AdminRuntimeSettings> {
-    let rotation_strategy = AdminRotationStrategy::parse(settings.rotation_strategy.as_str())
-        .ok_or_else(|| {
+    let values = gateway_admin::model::settings::RuntimeSettingsValues {
+        request_location_enabled: settings.request_location_enabled,
+        request_location: settings.request_location,
+        refresh_margin_seconds: settings.refresh_margin_seconds,
+        refresh_concurrency: settings.refresh_concurrency,
+        max_concurrent_per_account: settings.max_concurrent_per_account,
+        request_interval_ms: settings.request_interval_ms,
+        max_waiting_per_key: settings.max_waiting_per_key,
+        max_waiting_per_account: settings.max_waiting_per_account,
+        concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
+        openai_guardian_reserved_concurrency: settings.openai_guardian_reserved_concurrency,
+        openai_account_affinity: settings.openai_account_affinity,
+        max_account_rotations: settings.max_account_rotations,
+        openai_session_affinity_ttl_hours: settings.openai_session_affinity_ttl_hours,
+        responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
+        smart_scheduling: settings.smart_scheduling,
+        min_codex_desktop_version: settings.min_codex_desktop_version,
+        min_codex_cli_version: settings.min_codex_cli_version,
+        usage_retention_days: settings.usage_retention_days,
+        ops_event_retention_days: settings.ops_event_retention_days,
+        audit_retention_days: settings.audit_retention_days,
+        account_auto_freeze_enabled: settings.account_auto_freeze_enabled,
+        account_auto_freeze_threshold: settings.account_auto_freeze_threshold,
+        account_auto_freeze_window_seconds: settings.account_auto_freeze_window_seconds,
+        account_auto_freeze_duration_seconds: settings.account_auto_freeze_duration_seconds,
+        account_auto_freeze_probe_enabled: settings.account_auto_freeze_probe_enabled,
+        account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
+        account_auto_freeze_adaptive_concurrency: settings.account_auto_freeze_adaptive_concurrency,
+        account_warmup_enabled: settings.account_warmup_enabled,
+        account_warmup_schedule_time: settings.account_warmup_schedule_time,
+        account_warmup_model: settings.account_warmup_model,
+    };
+    admin_runtime_settings_parts(
+        settings.request_profiles,
+        settings.config_revision,
+        settings.model_mappings,
+        settings.rotation_strategy,
+        settings.updated_at,
+        values,
+    )
+}
+
+fn admin_runtime_settings_from_postgres(
+    settings: postgres::RuntimeSettings,
+) -> AdminStoreResult<AdminRuntimeSettings> {
+    admin_runtime_settings_parts(
+        settings.request_profiles,
+        settings.config_revision,
+        settings.model_mappings,
+        settings.rotation_strategy,
+        settings.updated_at,
+        settings.values,
+    )
+}
+
+fn admin_runtime_settings_parts(
+    request_profiles: gateway_admin::model::settings::ProviderRequestProfiles,
+    config_revision: Revision,
+    model_mappings: std::collections::BTreeMap<String, String>,
+    rotation_strategy: String,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    values: gateway_admin::model::settings::RuntimeSettingsValues,
+) -> AdminStoreResult<AdminRuntimeSettings> {
+    let rotation_strategy =
+        AdminRotationStrategy::parse(rotation_strategy.as_str()).ok_or_else(|| {
             AdminStoreError::new(
                 AdminStoreErrorKind::Invalid,
                 "runtime settings",
                 "rotation strategy is invalid",
             )
         })?;
-    let model_mappings = settings
-        .model_mappings
+    let model_mappings = model_mappings
         .into_iter()
         .map(|(public, upstream)| {
             let public = gateway_core::routing::PublicModelId::new(public).map_err(|_| {
@@ -486,39 +581,95 @@ pub(crate) fn admin_runtime_settings(
         })
         .collect::<AdminStoreResult<ModelMappings>>()?;
     Ok(AdminRuntimeSettings {
-        request_profiles: settings.request_profiles,
-        config_revision: admin_revision(settings.config_revision)?,
-        request_location_enabled: settings.request_location_enabled,
-        request_location: settings.request_location,
+        request_profiles,
+        config_revision: admin_revision(config_revision)?,
         model_mappings,
-        refresh_margin_seconds: settings.refresh_margin_seconds,
-        refresh_concurrency: settings.refresh_concurrency,
-        max_concurrent_per_account: settings.max_concurrent_per_account,
-        request_interval_ms: settings.request_interval_ms,
-        max_waiting_per_key: settings.max_waiting_per_key,
-        max_waiting_per_account: settings.max_waiting_per_account,
-        concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
-        openai_guardian_reserved_concurrency: settings.openai_guardian_reserved_concurrency,
-        responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
-        smart_scheduling: settings.smart_scheduling,
         rotation_strategy,
-        min_codex_desktop_version: settings.min_codex_desktop_version,
-        min_codex_cli_version: settings.min_codex_cli_version,
-        usage_retention_days: settings.usage_retention_days,
-        ops_event_retention_days: settings.ops_event_retention_days,
-        audit_retention_days: settings.audit_retention_days,
-        account_auto_freeze_enabled: settings.account_auto_freeze_enabled,
-        account_auto_freeze_threshold: settings.account_auto_freeze_threshold,
-        account_auto_freeze_window_seconds: settings.account_auto_freeze_window_seconds,
-        account_auto_freeze_duration_seconds: settings.account_auto_freeze_duration_seconds,
-        account_auto_freeze_probe_enabled: settings.account_auto_freeze_probe_enabled,
-        account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
-        account_auto_freeze_adaptive_concurrency: settings.account_auto_freeze_adaptive_concurrency,
-        account_warmup_enabled: settings.account_warmup_enabled,
-        account_warmup_schedule_time: settings.account_warmup_schedule_time,
-        account_warmup_model: settings.account_warmup_model,
-        updated_at: settings.updated_at,
+        updated_at,
+        values,
     })
+}
+
+fn store_runtime_settings_update(command: ReplaceRuntimeSettings) -> RuntimeSettingsUpdate {
+    let values = command.values;
+    RuntimeSettingsUpdate {
+        request_profile_updates: command.request_profile_updates,
+        request_location_enabled: values.request_location_enabled,
+        request_location: values.request_location,
+        refresh_margin_seconds: values.refresh_margin_seconds,
+        refresh_concurrency: values.refresh_concurrency,
+        max_concurrent_per_account: values.max_concurrent_per_account,
+        request_interval_ms: values.request_interval_ms,
+        max_waiting_per_key: values.max_waiting_per_key,
+        max_waiting_per_account: values.max_waiting_per_account,
+        concurrency_wait_timeout_seconds: values.concurrency_wait_timeout_seconds,
+        openai_guardian_reserved_concurrency: values.openai_guardian_reserved_concurrency,
+        openai_account_affinity: values.openai_account_affinity,
+        max_account_rotations: values.max_account_rotations,
+        openai_session_affinity_ttl_hours: values.openai_session_affinity_ttl_hours,
+        responses_max_decompressed_body_bytes: values.responses_max_decompressed_body_bytes,
+        smart_scheduling: values.smart_scheduling,
+        rotation_strategy: command.rotation_strategy.as_str().to_owned(),
+        model_mappings: store_model_mappings(command.model_mappings),
+        min_codex_desktop_version: values.min_codex_desktop_version,
+        min_codex_cli_version: values.min_codex_cli_version,
+        usage_retention_days: values.usage_retention_days,
+        ops_event_retention_days: values.ops_event_retention_days,
+        audit_retention_days: values.audit_retention_days,
+        account_auto_freeze_enabled: values.account_auto_freeze_enabled,
+        account_auto_freeze_threshold: values.account_auto_freeze_threshold,
+        account_auto_freeze_window_seconds: values.account_auto_freeze_window_seconds,
+        account_auto_freeze_duration_seconds: values.account_auto_freeze_duration_seconds,
+        account_auto_freeze_probe_enabled: values.account_auto_freeze_probe_enabled,
+        account_auto_freeze_probe_model: values.account_auto_freeze_probe_model,
+        account_auto_freeze_adaptive_concurrency: values.account_auto_freeze_adaptive_concurrency,
+        account_warmup_enabled: values.account_warmup_enabled,
+        account_warmup_schedule_time: values.account_warmup_schedule_time,
+        account_warmup_model: values.account_warmup_model,
+    }
+}
+
+fn postgres_runtime_settings_update(
+    settings: RuntimeSettingsUpdate,
+) -> postgres::RuntimeSettingsUpdate {
+    postgres::RuntimeSettingsUpdate {
+        request_profile_updates: settings.request_profile_updates,
+        rotation_strategy: settings.rotation_strategy,
+        model_mappings: settings.model_mappings,
+        values: gateway_admin::model::settings::RuntimeSettingsValues {
+            request_location_enabled: settings.request_location_enabled,
+            request_location: settings.request_location,
+            refresh_margin_seconds: settings.refresh_margin_seconds,
+            refresh_concurrency: settings.refresh_concurrency,
+            max_concurrent_per_account: settings.max_concurrent_per_account,
+            request_interval_ms: settings.request_interval_ms,
+            max_waiting_per_key: settings.max_waiting_per_key,
+            max_waiting_per_account: settings.max_waiting_per_account,
+            concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
+            openai_guardian_reserved_concurrency: settings.openai_guardian_reserved_concurrency,
+            openai_account_affinity: settings.openai_account_affinity,
+            max_account_rotations: settings.max_account_rotations,
+            openai_session_affinity_ttl_hours: settings.openai_session_affinity_ttl_hours,
+            responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
+            smart_scheduling: settings.smart_scheduling,
+            min_codex_desktop_version: settings.min_codex_desktop_version,
+            min_codex_cli_version: settings.min_codex_cli_version,
+            usage_retention_days: settings.usage_retention_days,
+            ops_event_retention_days: settings.ops_event_retention_days,
+            audit_retention_days: settings.audit_retention_days,
+            account_auto_freeze_enabled: settings.account_auto_freeze_enabled,
+            account_auto_freeze_threshold: settings.account_auto_freeze_threshold,
+            account_auto_freeze_window_seconds: settings.account_auto_freeze_window_seconds,
+            account_auto_freeze_duration_seconds: settings.account_auto_freeze_duration_seconds,
+            account_auto_freeze_probe_enabled: settings.account_auto_freeze_probe_enabled,
+            account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
+            account_auto_freeze_adaptive_concurrency: settings
+                .account_auto_freeze_adaptive_concurrency,
+            account_warmup_enabled: settings.account_warmup_enabled,
+            account_warmup_schedule_time: settings.account_warmup_schedule_time,
+            account_warmup_model: settings.account_warmup_model,
+        },
+    }
 }
 
 pub(crate) fn store_model_mappings(
@@ -570,9 +721,9 @@ impl AuthStore for AuthStoreAdapter {
 
     async fn load_admin_api_key(&self) -> AdminStoreResult<Option<AdminApiKey>> {
         self.settings
-            .load_runtime_settings()
+            .load_admin_api_key()
             .await
-            .map(|settings| settings.admin_api_key.map(AdminApiKey::new))
+            .map(|key| key.map(AdminApiKey::new))
             .map_err(|error| admin_store_error("admin API key", error))
     }
 

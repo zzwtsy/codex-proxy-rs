@@ -28,7 +28,7 @@ use crate::{
 
 impl From<BackupError> for WorkerTaskError {
     fn from(error: BackupError) -> Self {
-        WorkerTaskError::safe(error.message())
+        WorkerTaskError::safe(error.message()).with_source(error)
     }
 }
 
@@ -125,8 +125,9 @@ impl BackupTask {
         if cron.is_empty() {
             return Ok(());
         }
-        let schedule = BackupSchedule::parse(cron, self.timezone)
-            .map_err(|_| WorkerTaskError::safe("backup schedule is invalid"))?;
+        let schedule = BackupSchedule::parse(cron, self.timezone).map_err(|source| {
+            WorkerTaskError::safe("backup schedule is invalid").with_source(source)
+        })?;
 
         if settings.schedule_timezone.as_deref() != Some(timezone) {
             // 时区切换只初始化未来游标，不把旧时区计划当作应补跑任务
@@ -281,7 +282,6 @@ impl BackupTask {
                 .await?;
             }
             None => {
-                let _ = self.dump.cleanup_staging(&record.id).await;
                 self.fail_task(record, code::PG_DUMP_FAILED, "导出进程中断，暂存归档不完整")
                     .await?;
             }
@@ -307,7 +307,8 @@ impl BackupTask {
             && record.sha256.as_deref() == Some(remote.sha256.as_str())
         {
             let now = Utc::now();
-            self.repository
+            if self
+                .repository
                 .transition_status(
                     &record.id,
                     status_transition(BackupStatus::Uploading, BackupStatus::Completed)?,
@@ -315,7 +316,11 @@ impl BackupTask {
                     now,
                 )
                 .await
-                .map_err(repo_error)?;
+                .map_err(repo_error)?
+                .is_some()
+            {
+                self.cleanup_staging(&record.id).await;
+            }
             return Ok(());
         }
         match self.dump.inspect_staging(&record.id).await? {
@@ -455,9 +460,7 @@ impl BackupTask {
             now,
             cancellation,
         )
-        .await?;
-        let _ = self.dump.cleanup_staging(&record.id).await;
-        Ok(())
+        .await
     }
 
     /// 上传 + 远端校验，内部完成终态迁移
@@ -518,6 +521,7 @@ impl BackupTask {
                         size_bytes,
                         "备份完成"
                     );
+                    self.cleanup_staging(&record.id).await;
                 }
             }
             Ok(Some(remote)) => {
@@ -596,8 +600,14 @@ impl BackupTask {
             )
             .await
             .map_err(repo_error)?;
-        let _ = self.dump.cleanup_staging(&record.id).await;
+        self.cleanup_staging(&record.id).await;
         Ok(())
+    }
+
+    async fn cleanup_staging(&self, backup_id: &str) {
+        if let Err(error) = self.dump.cleanup_staging(backup_id).await {
+            warn!(backup_id, error = %error, "清理备份暂存失败");
+        }
     }
 
     /// 执行一小批到期保留清理：先处理 `expires_at` 已到期的记录，再按天数/份数清理计划备份
@@ -686,9 +696,9 @@ fn status_transition(
 }
 
 fn repo_error(error: crate::ports::store::AdminStoreError) -> WorkerTaskError {
-    WorkerTaskError::safe(format!("backup store failed: {error}"))
+    WorkerTaskError::safe("backup store failed").with_source(error)
 }
 
 fn infra_error(error: BackupError) -> WorkerTaskError {
-    WorkerTaskError::safe(error.message())
+    WorkerTaskError::safe(error.message()).with_source(error)
 }

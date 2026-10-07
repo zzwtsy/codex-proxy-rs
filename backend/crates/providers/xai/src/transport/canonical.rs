@@ -290,7 +290,6 @@ pub struct GrokCanonicalDecoder {
     content: BTreeMap<u32, ContentKind>,
     tool_arguments_seen: BTreeSet<u32>,
     usage_emitted: bool,
-    output_start_seen: bool,
     response_service_tier: Option<String>,
     response_model: ResponseModelObservation,
     requires_provider_cost: bool,
@@ -368,7 +367,6 @@ impl GrokCanonicalDecoder {
             content: BTreeMap::new(),
             tool_arguments_seen: BTreeSet::new(),
             usage_emitted: false,
-            output_start_seen: false,
             response_service_tier: None,
             response_model: ResponseModelObservation::default(),
             requires_provider_cost: false,
@@ -459,11 +457,6 @@ impl GrokCanonicalDecoder {
         self.decode(events).map(|batch| batch.projected_events)
     }
 
-    /// 取走本批解码帧里是否已出现首个非前导输出事件（结构帧也算），用于首字计时
-    pub fn take_output_start(&mut self) -> bool {
-        std::mem::take(&mut self.output_start_seen)
-    }
-
     fn decode(&mut self, events: Vec<SseEvent>) -> Result<GrokDecodedResponseBatch, ProviderError> {
         let mut source_events = Vec::new();
         let mut projected_events = Vec::new();
@@ -550,11 +543,6 @@ impl GrokCanonicalDecoder {
             let mut source_canonical = Vec::new();
             for projected in projected {
                 let transformed_type = projected.event_type;
-                // 首个非前导、非失败事件（结构帧也算）开启首字计时
-                self.output_start_seen |= !matches!(
-                    transformed_type.as_str(),
-                    "response.created" | "response.in_progress" | "response.failed" | "error"
-                );
                 let value = projected.wire.data();
                 let mut canonical = Vec::new();
                 // 终态事件（completed/incomplete）fail-closed：用量/计费校验失败即断流
@@ -1053,7 +1041,10 @@ fn provider_reported_cost(response: &Value) -> Result<Option<ProviderReportedCos
         return Ok(None);
     };
     let ticks = value.as_u64().ok_or_else(protocol_error_marker)?;
-    // 明确返回的零费用也是上游账单事实，不能当作缺失而改用本地估算
+    // 官方 Grok REST 层会把未报告费用回填为 0，只有正数才是已报告账单
+    if ticks == 0 {
+        return Ok(None);
+    }
     ProviderReportedCost::from_usd_ticks(u128::from(ticks))
         .map(Some)
         .map_err(protocol_error)
@@ -1119,21 +1110,12 @@ fn calculated_cost(
 }
 
 const PRICING_RULES: &[(&[&str], ModelPricing)] = &[
-    (&["grok-4.6", "grok-4.6-latest"], GROK_46_PRICING),
-    (
-        &[
-            "grok-4.5",
-            "grok-4.5-latest",
-            "grok-4.5-build-free",
-            "grok-build-latest",
-        ],
-        GROK_45_PRICING,
-    ),
+    (&["grok-4.6"], GROK_46_PRICING),
+    (&["grok-4.5", "grok-4.5-build-free"], GROK_45_PRICING),
     (
         &[
             "grok-build-0.1",
             "grok-code-fast-1",
-            "grok-code-fast",
             "grok-code-fast-1-0825",
         ],
         GROK_BUILD_PRICING,
@@ -1141,40 +1123,22 @@ const PRICING_RULES: &[(&[&str], ModelPricing)] = &[
     (
         &[
             "grok-4.3",
-            "grok-4.3-latest",
-            "grok-latest",
             "grok-4.20-multi-agent-0309",
             "grok-4.20-multi-agent",
-            "grok-4.20-multi-agent-latest",
-            "grok-4.20-multi-agent-beta-latest",
             "grok-4.20-multi-agent-experimental-beta-0304",
-            "grok-4.20-multi-agent-experimental-beta-latest",
             "grok-4.20-multi-agent-beta-0309",
             "grok-4.20-0309-reasoning",
-            "grok-4.20-reasoning-latest",
             "grok-4.20",
             "grok-4.20-reasoning",
             "grok-4.20-0309",
             "grok-4.20-beta-0309-reasoning",
-            "grok-4.20-beta",
             "grok-4.20-beta-0309",
-            "grok-4.20-beta-latest",
-            "grok-4.20-beta-latest-reasoning",
-            "grok-4.20-beta-reasoning",
             "grok-4.20-experimental-beta-0304-reasoning",
             "grok-4.20-experimental-beta-0304",
-            "grok-4.20-experimental-beta-reasoning-latest",
-            "grok-4.20-experimental-beta-latest",
-            "grok-4.20-reasoning-gv2",
             "grok-4.20-0309-non-reasoning",
             "grok-4.20-non-reasoning",
-            "grok-4.20-non-reasoning-latest",
-            "grok-4.20-beta-non-reasoning",
-            "grok-4.20-beta-latest-non-reasoning",
             "grok-4.20-experimental-beta-0304-non-reasoning",
-            "grok-4.20-experimental-beta-non-reasoning-latest",
             "grok-4.20-beta-0309-non-reasoning",
-            "grok-4.20-non-reasoning-gv2",
         ],
         GROK_43_PRICING,
     ),
@@ -1236,7 +1200,9 @@ fn incomplete_finish_reason(response: &Value) -> FinishReason {
         .pointer("/incomplete_details/reason")
         .and_then(Value::as_str)
     {
-        Some("max_output_tokens" | "max_tokens") => FinishReason::Length,
+        Some("max_output_tokens" | "max_tokens" | "max_prompt_tokens" | "max_time_limit") => {
+            FinishReason::Length
+        }
         Some("content_filter") => FinishReason::ContentFilter,
         _ => FinishReason::Other,
     }
@@ -1258,8 +1224,9 @@ fn upstream_event_error(value: &Value) -> ProviderError {
             _ => ProviderErrorKind::Unavailable,
         }
     };
-    let mut error = ProviderError::new(kind, UpstreamSendState::Sent)
-        .redact_sensitive_context("upstream event");
+    let mut error = ProviderError::new(kind, UpstreamSendState::Sent).with_raw_upstream_error(
+        gateway_core::error::RawUpstreamError::new(value.to_string()),
+    );
     if let Some(code) = code {
         error = error.with_upstream_code(OpaqueUpstreamValue::new(code.to_owned()));
     }
@@ -1283,8 +1250,8 @@ fn upstream_error_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-fn protocol_error(_error: impl std::fmt::Debug) -> ProviderError {
-    protocol_error_marker()
+fn protocol_error(error: impl std::error::Error + Send + Sync + 'static) -> ProviderError {
+    protocol_error_marker().with_source(error)
 }
 
 fn protocol_error_marker() -> ProviderError {

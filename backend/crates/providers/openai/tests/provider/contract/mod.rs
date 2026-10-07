@@ -2,9 +2,11 @@
 
 mod account_isolation;
 mod capacity;
+mod error_details;
 mod precommit;
 mod response_interrupt;
 mod session_binding;
+mod timing;
 mod upstream_adapter;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,12 +49,12 @@ use gateway_core::operation::{
 };
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::ProviderLeasePort;
+use gateway_core::routing::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
 use gateway_core::routing::{
     ClientRoutingScope, ConfigRevision, FrozenAccountScope, ModelCapabilities, ModelServiceTier,
     ProviderKind, ProviderModel, PublicModelId, RoutingContext, RuntimeAccount,
     RuntimeAccountDirectory, RuntimeSnapshot, UpstreamModelId,
 };
-use gateway_core::runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
 use gateway_core::settings::SettingsValues;
 use gateway_core::upstream::UpstreamSendState;
 use provider_openai::config::DEFAULT_STREAM_MAX_RETRIES;
@@ -81,6 +83,88 @@ use crate::support::{
     TestLeaseCoordinator, account_policy, catalog_cache, profile, secret,
 };
 use crate::transport::accept_codex_test_websocket;
+
+#[tokio::test]
+async fn account_client_preparation_keeps_ca_read_cause_without_exposing_path() {
+    const CHILD: &str = "CPR_TEST_CA_PREPARATION_FAILURE";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = tempfile::tempdir().unwrap();
+        // 环境变量只影响隔离子进程，不能改变并发 TLS 测试的配置
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap()])
+            .env(CHILD, "1")
+            .env(
+                provider_openai::transport::tls::CODEX_CA_CERT_ENV,
+                directory.path().join("PRIVATE_MISSING_CA.pem"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    store.set_egress(
+        "acct_provider_contract",
+        Some(gateway_core::account::OutboundProxy::parse("http://127.0.0.1:9").unwrap()),
+        None,
+    );
+    let error = provider_with_base_url(&store, "http://127.0.0.1:9".to_owned())
+        .execute(
+            planned_request("openai", generate_operation()),
+            fallback_transport_context("req_ca_prepare"),
+        )
+        .await
+        .err()
+        .expect("CA failure must occur before returning a stream");
+    assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    let snapshot = error.stable_snapshot();
+    let diagnostic = snapshot.diagnostic().unwrap();
+    assert_eq!(diagnostic.stage(), Some("prepare"));
+    assert_eq!(diagnostic.code(), Some("io_not_found"));
+    assert!(diagnostic.as_str().contains("CODEX_CA_CERTIFICATE"));
+    assert!(diagnostic.as_str().contains("OS cause:"));
+    assert!(!diagnostic.as_str().contains("PRIVATE_"));
+    let gateway = gateway_core::error::GatewayError::from_provider(&snapshot);
+    assert_eq!(gateway.safe_message(), "upstream service is unavailable");
+    assert_eq!(gateway.diagnostic(), Some(diagnostic));
+}
+
+#[tokio::test]
+async fn invalid_request_profile_preserves_diagnostic_before_any_upstream_send() {
+    let store = Arc::new(MemoryAccountStore::default());
+    let provider = provider_with_base_url(&store, "http://127.0.0.1:1".to_owned());
+    let configuration = OpaqueProviderData::new(
+        json!({
+            "mode": "custom", "userAgent": "PRIVATE_USER_AGENT\n",
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let error = provider
+        .resolve_request_profile(&configuration)
+        .unwrap_err();
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    let snapshot = error.stable_snapshot();
+    let diagnostic = snapshot.diagnostic().unwrap();
+    assert_eq!(diagnostic.stage(), Some("prepare"));
+    assert_eq!(
+        diagnostic.code(),
+        Some("request_profile_user_agent_invalid")
+    );
+    assert!(!diagnostic.as_str().contains("PRIVATE_"));
+    let gateway = gateway_core::error::GatewayError::from_provider(&snapshot);
+    assert_eq!(gateway.diagnostic(), Some(diagnostic));
+}
 
 #[tokio::test]
 async fn native_openai_translates_a_non_native_source_before_encoding() {
@@ -3592,6 +3676,22 @@ async fn selection_infrastructure_errors_have_a_distinct_classification() {
             UpstreamSendState::NotSent,
         )
     );
+    let diagnostic = error.diagnostic().unwrap();
+    assert_eq!(diagnostic.stage(), Some("account_selection"));
+    assert_eq!(diagnostic.code(), Some("account_store_unavailable"));
+    assert_eq!(diagnostic.as_str(), "Codex account store is unavailable");
+    use std::error::Error as _;
+    let snapshot = error.stable_snapshot();
+    let mut cause = snapshot.source().expect("selection source");
+    while let Some(source) = cause.source() {
+        cause = source;
+    }
+    let original = cause
+        .downcast_ref::<std::io::Error>()
+        .expect("original database cause");
+    assert_eq!(original.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert_eq!(original.to_string(), "PRIVATE_DATABASE_CAUSE");
+    assert!(!format!("{error:?} {error}").contains("PRIVATE_DATABASE_CAUSE"));
 }
 
 #[tokio::test]
@@ -3746,10 +3846,11 @@ async fn repeated_message_too_big_closes_keep_session_on_websocket() {
         assert_eq!(detail.message(), "message too big");
         assert_eq!(detail.code(), Some("message_too_big"));
         assert_eq!(detail.error_type(), Some("invalid_request_error"));
-        assert_eq!(
-            error.upstream_code().map(|code| code.as_str()),
-            Some("websocket_close_1009")
-        );
+        assert!(error.upstream_code().is_none());
+        let close: Value =
+            serde_json::from_str(error.raw_upstream_error().unwrap().as_str()).unwrap();
+        assert_eq!(close["type"], "websocket.close");
+        assert_eq!(close["code"], 1009);
     }
 
     let second_operation = Operation::Generate(generate_with_persisted_session_context(
@@ -4553,10 +4654,10 @@ async fn ambiguous_websocket_close_reconnects_and_retains_native_continuation() 
     assert!(saw_websocket_observation);
     assert_eq!(error.send_state(), UpstreamSendState::Ambiguous);
     assert_eq!(error.pre_delivery_retry(), None);
-    assert_eq!(
-        error.upstream_code().map(|code| code.as_str()),
-        Some("websocket_close_1000")
-    );
+    assert!(error.upstream_code().is_none());
+    let close: Value = serde_json::from_str(error.raw_upstream_error().unwrap().as_str()).unwrap();
+    assert_eq!(close["type"], "websocket.close");
+    assert_eq!(close["code"], 1000);
     assert_eq!(
         error.diagnostic().and_then(|diagnostic| diagnostic.code()),
         Some("upstream_close")
@@ -5856,10 +5957,10 @@ async fn websocket_turn_state_metadata_close_does_not_authorize_replay() {
     assert_eq!(error.send_state(), UpstreamSendState::Ambiguous);
     assert!(!error.replay_is_safe());
     assert_eq!(error.pre_delivery_retry(), None);
-    assert_eq!(
-        error.upstream_code().map(|code| code.as_str()),
-        Some("websocket_close_1000")
-    );
+    assert!(error.upstream_code().is_none());
+    let close: Value = serde_json::from_str(error.raw_upstream_error().unwrap().as_str()).unwrap();
+    assert_eq!(close["type"], "websocket.close");
+    assert_eq!(close["code"], 1000);
     assert_eq!(
         error.diagnostic().map(|diagnostic| diagnostic.as_str()),
         Some(

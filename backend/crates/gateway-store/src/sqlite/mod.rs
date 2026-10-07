@@ -112,7 +112,7 @@ pub fn account_runtime_store(
 ) -> std::sync::Arc<dyn gateway_admin::ports::store::AccountRuntimeStore> {
     let state: std::sync::Arc<dyn crate::AccountRuntimeStateRepository> =
         std::sync::Arc::new(SqliteProviderCooldownRepository::new(pool.clone()));
-    let leases: std::sync::Arc<dyn crate::CredentialLeaseRepository> =
+    let leases: std::sync::Arc<dyn crate::AccountRuntimeSignalRepository> =
         std::sync::Arc::new(SqliteCredentialLeaseRepository::new(pool));
     std::sync::Arc::new(crate::AccountRuntimeStoreAdapter::new(state, leases))
 }
@@ -151,6 +151,7 @@ pub async fn connect_and_migrate(
                 .map_err(|error| StoreError::Unavailable {
                     backend: StoreBackend::Sqlite,
                     message: format!("apply SQLite migrations before name-key backfill: {error}"),
+                    source: None,
                 })?;
             name_key_migration::backfill(&pool).await?;
         }
@@ -160,6 +161,7 @@ pub async fn connect_and_migrate(
             .map_err(|error| StoreError::Unavailable {
                 backend: StoreBackend::Sqlite,
                 message: format!("apply SQLite migrations: {error}"),
+                source: None,
             })?;
         Ok::<(), StoreError>(())
     }
@@ -193,6 +195,7 @@ async fn connect_pool(
         return Err(StoreError::InvalidData {
             entity: "SQLite pool config",
             message: "connection limits and timeouts must be positive".to_owned(),
+            source: None,
         });
     }
     let options = SqliteConnectOptions::new()
@@ -230,6 +233,7 @@ pub(crate) fn sqlite_unavailable(operation: &'static str) -> StoreError {
     StoreError::Unavailable {
         backend: StoreBackend::Sqlite,
         message: operation.to_owned(),
+        source: None,
     }
 }
 
@@ -252,11 +256,13 @@ pub(crate) async fn bump_config_revision(
     .ok_or_else(|| StoreError::InvalidData {
         entity: "runtime settings",
         message: "config revision is missing or cannot be advanced".to_owned(),
+        source: None,
     })?;
     crate::Revision::new(
         u64::try_from(revision).map_err(|_| StoreError::InvalidData {
             entity: "runtime settings",
             message: "config revision is outside the supported range".to_owned(),
+            source: None,
         })?,
     )
 }

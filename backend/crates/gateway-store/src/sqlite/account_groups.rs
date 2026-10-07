@@ -495,11 +495,13 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
                             entity: ENTITY,
                             id: command.id.as_str().to_owned(),
                             kind: ConflictKind::InvalidTransition,
+                            source: None,
                         })
                     } else {
                         Err(StoreError::NotFound {
                             entity: ENTITY,
                             id: command.id.as_str().to_owned(),
+                            source: None,
                         })
                     }
                 })
@@ -754,6 +756,7 @@ fn require_one(rows: u64, id: &str) -> StoreResult<()> {
         Err(StoreError::NotFound {
             entity: ENTITY,
             id: id.to_owned(),
+            source: None,
         })
     }
 }
@@ -767,6 +770,7 @@ pub(super) fn map_write_error(error: sqlx::Error) -> StoreError {
             entity: ENTITY,
             id: "duplicate".to_owned(),
             kind: ConflictKind::DuplicateName,
+            source: None,
         }
     } else {
         unavailable("write account group")
@@ -824,6 +828,7 @@ fn not_found_admin(entity: &'static str, id: &str) -> AdminStoreError {
         StoreError::NotFound {
             entity,
             id: id.to_owned(),
+            source: None,
         },
     )
 }
@@ -832,6 +837,7 @@ fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: ENTITY,
         message: message.to_owned(),
+        source: None,
     }
 }
 

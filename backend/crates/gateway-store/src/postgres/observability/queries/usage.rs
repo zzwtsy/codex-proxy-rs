@@ -212,7 +212,7 @@ pub(crate) async fn list_usage_record_items(
         .build()
         .fetch_all(pool)
         .await
-        .map_err(|_| postgres_unavailable("list usage records"))?;
+        .map_err(|source| postgres_unavailable("list usage records", source))?;
     let items = rows
         .iter()
         .map(usage_list_record_from_row)
@@ -237,7 +237,7 @@ pub(crate) async fn count_usage_records(
         .build_query_scalar::<i64>()
         .fetch_one(pool)
         .await
-        .map_err(|_| postgres_unavailable("count usage records"))?;
+        .map_err(|source| postgres_unavailable("count usage records", source))?;
     to_u64(total)
 }
 
@@ -254,8 +254,9 @@ pub(crate) async fn usage_record_detail(
         .build()
         .fetch_optional(pool)
         .await
-        .map_err(|_| postgres_unavailable("load usage record detail"))?
+        .map_err(|source| postgres_unavailable("load usage record detail", source))?
         .ok_or_else(|| StoreError::NotFound {
+            source: None,
             entity: "model request",
             id: request_id.to_owned(),
         })?;
@@ -276,7 +277,7 @@ pub(crate) async fn usage_record_detail(
     .bind(request_id)
     .fetch_all(pool)
     .await
-    .map_err(|_| postgres_unavailable("load usage attempt observations"))?;
+    .map_err(|source| postgres_unavailable("load usage attempt observations", source))?;
     let mut attempts = rows
         .iter()
         .map(intermediate_attempt_from_row)
@@ -286,7 +287,7 @@ pub(crate) async fn usage_record_detail(
     }
     let trace: Option<Value> = row
         .try_get("diagnostic_trace_json")
-        .map_err(|_| postgres_unavailable("decode request trace"))?;
+        .map_err(|source| postgres_unavailable("decode request trace", source))?;
     let related_requests = sqlx::query_scalar::<_, Value>(
         "select jsonb_build_object('requestId', related.id, 'outcome', related.outcome,
              'relation', case when related.id = current.recovery_request_id then 'recovered_by' else 'recovers' end,
@@ -295,7 +296,7 @@ pub(crate) async fn usage_record_detail(
            on related.id = current.recovery_request_id or related.recovery_request_id = current.id
          where current.id = $1 order by related.started_at limit 20"
     ).bind(request_id).fetch_all(pool).await
-        .map_err(|_| postgres_unavailable("load related recovery requests"))?;
+        .map_err(|source| postgres_unavailable("load related recovery requests", source))?;
     Ok(UsageRecordDetail {
         request,
         attempts,
@@ -321,7 +322,7 @@ pub(crate) fn intermediate_attempt_from_row(
         upstream_model_id: get(row, "upstream_model_id")?,
         upstream_transport: None,
         upstream_send_state: None,
-        outcome: "failed".to_owned(),
+        outcome: admin_observability::RequestOutcome::Failed,
         downstream_committed: false,
         status_code: optional_status(row, "status_code")?,
         provider_error_code: get(row, "provider_error_code")?,
@@ -385,8 +386,12 @@ pub(crate) async fn usage_diagnostics(
     range: ObservabilityRange,
     filter: &UsageRecordFilter,
     dimension: DiagnosticDimension,
+    limit: u16,
 ) -> StoreResult<DiagnosticsObservation> {
     filter.validate()?;
+    let limit = ObservabilityPageSize::new(limit)
+        .map_err(|_| invalid("invalid diagnostic limit"))?
+        .get();
     let dimension_sql = diagnostic_dimension_sql(dimension);
     let completed_usage = completed_usage_fact_predicate("mr");
     let mut statement = QueryBuilder::<Postgres>::new("with matched as (select ");
@@ -456,7 +461,7 @@ pub(crate) async fn usage_diagnostics(
         DiagnosticDimension::Account | DiagnosticDimension::AccountApiKey
     ) {
         statement.push(" order by request_count desc, dimension_name limit ");
-        statement.push_bind(DIAGNOSTIC_LIMIT);
+        statement.push_bind(i64::from(limit));
     }
     statement.push(
         ")
@@ -473,7 +478,7 @@ pub(crate) async fn usage_diagnostics(
         .build()
         .fetch_all(pool)
         .await
-        .map_err(|_| postgres_unavailable("load usage diagnostics"))?;
+        .map_err(|source| postgres_unavailable("load usage diagnostics", source))?;
     let total_request_count = rows
         .first()
         .map(|row| unsigned(row, "total_request_count"))
@@ -485,7 +490,7 @@ pub(crate) async fn usage_diagnostics(
     ) {
         rows.len()
     } else {
-        DIAGNOSTIC_LIMIT as usize
+        usize::from(limit)
     };
     let mut observations = Vec::with_capacity(capacity);
     let mut costs = HashMap::<String, Vec<CurrencyCostTotal>>::new();
@@ -528,7 +533,13 @@ pub(crate) async fn usage_diagnostics(
                     .push(cost_from_row(row)?);
             }
             0 => {}
-            _ => return Err(postgres_unavailable("decode usage diagnostic grouping")),
+            _ => {
+                return Err(crate::StoreError::Unavailable {
+                    backend: crate::StoreBackend::PostgreSql,
+                    message: "decode usage diagnostic grouping".to_owned(),
+                    source: None,
+                });
+            }
         }
     }
     let mut display_names = match dimension {
@@ -646,7 +657,7 @@ pub(crate) async fn diagnostic_account_display_names(
     .bind(account_ids)
     .fetch_all(pool)
     .await
-    .map_err(|_| postgres_unavailable("load diagnostic account display names"))?;
+    .map_err(|source| postgres_unavailable("load diagnostic account display names", source))?;
     let mut display_names = HashMap::with_capacity(rows.len());
     for row in rows {
         display_names.insert(
@@ -668,7 +679,7 @@ pub(crate) async fn diagnostic_api_key_display_names(
         .bind(key_ids)
         .fetch_all(pool)
         .await
-        .map_err(|_| postgres_unavailable("load diagnostic api key display names"))?;
+        .map_err(|source| postgres_unavailable("load diagnostic api key display names", source))?;
     let mut display_names = HashMap::with_capacity(rows.len());
     for row in rows {
         display_names.insert(get(&row, "id")?, get(&row, "name")?);
@@ -703,7 +714,7 @@ fn account_key_refs(
         return Ok((None, None));
     }
     let [account_id, client_api_key_id]: [String; 2] = serde_json::from_str(dimension_name)
-        .map_err(|_| postgres_unavailable("decode account-key diagnostic identity"))?;
+        .map_err(|source| postgres_unavailable("decode account-key diagnostic identity", source))?;
     Ok((Some(account_id), Some(client_api_key_id)))
 }
 
@@ -715,9 +726,9 @@ fn diagnostic_observation_key(
         return Ok(dimension_name.to_owned());
     }
     let [account_id, client_api_key_id]: [String; 2] = serde_json::from_str(dimension_name)
-        .map_err(|_| postgres_unavailable("decode account-key diagnostic identity"))?;
+        .map_err(|source| postgres_unavailable("decode account-key diagnostic identity", source))?;
     serde_json::to_string(&[account_id, client_api_key_id])
-        .map_err(|_| postgres_unavailable("encode account-key diagnostic identity"))
+        .map_err(|source| postgres_unavailable("encode account-key diagnostic identity", source))
 }
 
 pub(crate) fn push_diagnostic_dimension_filter(

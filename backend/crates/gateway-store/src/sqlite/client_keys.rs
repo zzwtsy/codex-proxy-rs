@@ -113,7 +113,14 @@ pub struct SqliteClientApiKeyUsageWriter {
 impl SqliteClientApiKeyUsageSink {
     #[must_use]
     pub fn new(pool: SqlitePool) -> (Self, SqliteClientApiKeyUsageWriter) {
-        Self::with_flush_delay(pool, Duration::from_secs(1))
+        let repository: std::sync::Arc<dyn ClientApiKeyLastUsedRepository> =
+            std::sync::Arc::new(SqliteClientApiKeyRepository::new(pool));
+        let (inner, writer) =
+            crate::client_key_usage::BufferedClientApiKeyUsageSink::new(repository);
+        (
+            Self { inner },
+            SqliteClientApiKeyUsageWriter { inner: writer },
+        )
     }
 
     #[must_use]

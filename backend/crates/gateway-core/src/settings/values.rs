@@ -17,6 +17,9 @@ pub struct SettingsValues {
     pub(crate) max_waiting_per_account: u32,
     pub(crate) concurrency_wait_timeout_seconds: u32,
     pub(crate) openai_guardian_reserved_concurrency: u32,
+    pub(crate) openai_account_affinity: crate::account::AccountAffinity,
+    pub(crate) max_account_rotations: u32,
+    pub(crate) openai_session_affinity_ttl_hours: u32,
     pub(crate) responses_max_decompressed_body_bytes: u64,
     pub(crate) request_interval_ms: u64,
     pub(crate) smart_scheduling: crate::account::SmartSchedulingConfig,
@@ -27,6 +30,27 @@ pub struct SettingsValues {
 }
 
 impl SettingsValues {
+    #[must_use]
+    pub const fn with_openai_session_affinity_ttl_hours(mut self, hours: u32) -> Self {
+        self.openai_session_affinity_ttl_hours = hours;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_openai_account_affinity(
+        mut self,
+        affinity: crate::account::AccountAffinity,
+    ) -> Self {
+        self.openai_account_affinity = affinity;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_account_rotations(mut self, rotations: u32) -> Self {
+        self.max_account_rotations = rotations;
+        self
+    }
+
     #[must_use]
     pub const fn with_openai_guardian_reserved_concurrency(mut self, reserved: u32) -> Self {
         self.openai_guardian_reserved_concurrency = reserved;
@@ -114,6 +138,9 @@ impl SettingsValues {
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
             openai_guardian_reserved_concurrency: 0,
+            openai_account_affinity: crate::account::AccountAffinity::default(),
+            max_account_rotations: 3,
+            openai_session_affinity_ttl_hours: 24,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             request_interval_ms,
             smart_scheduling: crate::account::SmartSchedulingConfig::default(),
@@ -139,4 +166,61 @@ impl SettingsValues {
         self.min_codex_cli_version = versions.cli().map(ToString::to_string);
         self
     }
+}
+
+/// 请求排队与账号选择的数值约束；返回不合法的设置字段
+pub fn validate_request_limits(
+    max_waiting_per_key: u32,
+    max_waiting_per_account: u32,
+    timeout_seconds: u32,
+    max_account_rotations: u32,
+    affinity_ttl_hours: u32,
+) -> Result<(), &'static str> {
+    for (valid, field) in [
+        (max_waiting_per_key <= 1_000, "max_waiting_per_key"),
+        (max_waiting_per_account <= 1_000, "max_waiting_per_account"),
+        (
+            (1..=120).contains(&timeout_seconds),
+            "concurrency_wait_timeout_seconds",
+        ),
+        (
+            max_account_rotations <= crate::account::MAX_ACCOUNT_ROTATIONS,
+            "max_account_rotations",
+        ),
+        (
+            (1..=crate::account::MAX_SESSION_AFFINITY_TTL_HOURS).contains(&affinity_ttl_hours),
+            "openai_session_affinity_ttl_hours",
+        ),
+    ] {
+        if !valid {
+            return Err(field);
+        }
+    }
+    Ok(())
+}
+
+/// 解压上限必须能作为非零缓冲区长度使用
+pub fn response_body_limit(bytes: u64) -> Result<std::num::NonZeroUsize, &'static str> {
+    isize::try_from(bytes)
+        .ok()
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .and_then(std::num::NonZeroUsize::new)
+        .ok_or("responses_max_decompressed_body_bytes")
+}
+
+/// 管理写入与请求覆盖共用客户端最低版本解析
+pub fn client_min_versions(
+    desktop: Option<&str>,
+    cli: Option<&str>,
+) -> Result<crate::policy::CodexClientMinVersions, &'static str> {
+    use crate::policy::{CodexClientMinVersions, CodexClientVersion};
+    Ok(CodexClientMinVersions::new(
+        desktop
+            .map(CodexClientVersion::parse)
+            .transpose()
+            .map_err(|_| "min_codex_desktop_version")?,
+        cli.map(CodexClientVersion::parse)
+            .transpose()
+            .map_err(|_| "min_codex_cli_version")?,
+    ))
 }

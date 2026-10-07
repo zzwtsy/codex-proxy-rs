@@ -60,6 +60,7 @@ impl SqliteAdminSettingsRepository {
         .ok_or_else(|| StoreError::NotFound {
             entity: "runtime settings",
             id: "1".to_owned(),
+            source: None,
         })?;
         let overrides: PricingOverrides = decode_json(&row, "pricing_overrides_json")?;
         let synced: PricingOverrides = decode_json(&row, "pricing_synced_json")?;
@@ -100,6 +101,7 @@ impl SqliteAdminSettingsRepository {
                 .ok_or_else(|| StoreError::NotFound {
                     entity: "runtime settings",
                     id: "1".to_owned(),
+                    source: None,
                 })
                 .and_then(|encoded: String| {
                     serde_json::from_str(&encoded).map_err(|_| invalid_pricing())
@@ -160,6 +162,7 @@ impl SqliteAdminSettingsRepository {
             .ok_or_else(|| StoreError::NotFound {
                 entity: "runtime settings",
                 id: "1".to_owned(),
+                source: None,
             })?;
             (
                 decode_json(&row, "pricing_overrides_json")?,
@@ -241,6 +244,7 @@ impl SqliteAdminSettingsRepository {
             return Err(StoreError::NotFound {
                 entity: "runtime settings",
                 id: "1".to_owned(),
+                source: None,
             });
         }
         let revision = bump_config_revision(&mut transaction, now).await?;
@@ -266,6 +270,7 @@ fn revision_to_i64(revision: Revision) -> StoreResult<i64> {
     i64::try_from(revision.get()).map_err(|_| StoreError::InvalidData {
         entity: "config revision",
         message: "revision exceeds SQLite INTEGER range".to_owned(),
+        source: None,
     })
 }
 
@@ -273,5 +278,6 @@ fn invalid_pricing() -> StoreError {
     StoreError::InvalidData {
         entity: "model pricing",
         message: "persisted model pricing is invalid".to_owned(),
+        source: None,
     }
 }

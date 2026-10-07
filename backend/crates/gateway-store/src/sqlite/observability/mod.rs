@@ -151,6 +151,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> StoreError {
     StoreError::InvalidData {
         entity: "SQLite observability",
         message: message.into(),
+        source: None,
     }
 }
 
@@ -158,6 +159,7 @@ pub(crate) fn unavailable() -> StoreError {
     StoreError::Unavailable {
         backend: crate::StoreBackend::Sqlite,
         message: "SQLite observability query failed".to_owned(),
+        source: None,
     }
 }
 

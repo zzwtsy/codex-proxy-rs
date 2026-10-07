@@ -778,5 +778,6 @@ fn invalid(field: &'static str) -> StoreError {
     StoreError::InvalidData {
         entity: "provider account",
         message: format!("invalid {field}"),
+        source: None,
     }
 }

@@ -75,6 +75,9 @@ pub struct SnapshotRuntimeSettings {
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
     pub openai_guardian_reserved_concurrency: u32,
+    pub openai_account_affinity: gateway_core::account::AccountAffinity,
+    pub max_account_rotations: u32,
+    pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
     pub rotation_strategy: String,
@@ -131,6 +134,9 @@ pub(crate) fn snapshot_data_into_facts(
     )
     .with_responses_max_decompressed_body_bytes(data.settings.responses_max_decompressed_body_bytes)
     .with_openai_guardian_reserved_concurrency(data.settings.openai_guardian_reserved_concurrency)
+    .with_openai_account_affinity(data.settings.openai_account_affinity)
+    .with_max_account_rotations(data.settings.max_account_rotations)
+    .with_openai_session_affinity_ttl_hours(data.settings.openai_session_affinity_ttl_hours)
     .with_smart_scheduling(data.settings.smart_scheduling)
     .with_request_profiles(data.settings.request_profiles)
     .with_pricing(data.settings.pricing)
@@ -230,5 +236,6 @@ fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: "runtime snapshot",
         message: message.to_owned(),
+        source: None,
     }
 }

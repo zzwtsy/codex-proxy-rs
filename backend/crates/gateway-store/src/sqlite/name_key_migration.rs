@@ -182,5 +182,6 @@ fn conflict_error(conflicts: Vec<String>) -> StoreError {
             "Unicode-normalized names conflict; no names were changed. Rename these records and retry: {}",
             conflicts.join("; ")
         ),
+        source: None,
     }
 }

@@ -102,7 +102,7 @@ impl SqliteExecutionStore {
                provider_kind, provider_account_id, provider_account_ref,
                provider_account_name_snapshot, provider_account_email_snapshot,
                provider_account_authentication_kind_snapshot, upstream_model_id,
-               failure_kind, upstream_send_state, raw_upstream_error, status_code,
+               failure_kind, upstream_send_state, error_details, status_code,
                provider_error_code, retry_after_ms, upstream_request_id, latency_ms,
                message, created_at_us
              ) select
@@ -124,18 +124,56 @@ impl SqliteExecutionStore {
         .bind(event.upstream_model_id)
         .bind(event.failure_kind)
         .bind(event.upstream_send_state)
-        .bind(event.raw_upstream_error)
+        .bind(event.error_details)
         .bind(event.status_code.map(i64::from))
         .bind(event.provider_error_code)
         .bind(event.retry_after_ms.map(to_i64).transpose()?)
         .bind(event.upstream_request_id)
         .bind(event.latency_ms.map(to_i64).transpose()?)
         .bind(event.message)
-        .bind(Utc::now().timestamp_micros())
+        .bind(event.created_at.timestamp_micros())
         .execute(&self.pool)
         .await
         .map_err(|_| core_unavailable())?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl gateway_core::diagnostics::OperationalDiagnostics for SqliteExecutionStore {
+    async fn record_failure(
+        &self,
+        failure: gateway_core::diagnostics::OperationalFailure,
+    ) -> Result<(), CoreStoreError> {
+        let account_id = failure.account_id.map(|id| id.as_str().to_owned());
+        self.record_ops_event(OpsEvent {
+            id: uuid::Uuid::now_v7().to_string(),
+            model_request_id: None,
+            attempt_index: None,
+            level: "warning".to_owned(),
+            component: failure.component.to_owned(),
+            operation: failure.operation.to_owned(),
+            provider_kind: failure.provider_kind.map(|kind| kind.as_str().to_owned()),
+            provider_account_id: account_id,
+            upstream_model_id: None,
+            failure_kind: failure.kind.to_owned(),
+            upstream_send_state: None,
+            error_details: failure
+                .details
+                .map(gateway_core::error::ErrorDetails::into_string),
+            status_code: failure.upstream_status,
+            provider_error_code: failure.upstream_code.map(|code| code.as_str().to_owned()),
+            retry_after_ms: None,
+            upstream_request_id: None,
+            latency_ms: None,
+            created_at: failure.occurred_at.into(),
+            message: json!({
+                "correlationId": failure.correlation_id,
+                "message": failure.message,
+            })
+            .to_string(),
+        })
+        .await
     }
 }
 
@@ -160,6 +198,7 @@ impl ExecutionStore for SqliteExecutionStore {
                         crate::StoreError::InvalidData {
                             entity: "model request",
                             message: "lease TTL is invalid".to_owned(),
+                            source: None,
                         }
                     })?;
                     let now = Utc::now().timestamp_micros();
@@ -167,6 +206,7 @@ impl ExecutionStore for SqliteExecutionStore {
                         crate::StoreError::InvalidData {
                             entity: "model request",
                             message: "lease expiry is outside SQLite timestamp range".to_owned(),
+                            source: None,
                         }
                     })?;
                     let updated = sqlx::query(
@@ -297,9 +337,7 @@ impl ExecutionStore for SqliteExecutionStore {
                 .map(|model| model.as_str().to_owned()),
             failure_kind: error.kind().as_str().to_owned(),
             upstream_send_state: Some(error.send_state().as_str().to_owned()),
-            raw_upstream_error: error
-                .raw_upstream_error()
-                .map(|raw| raw.as_str().to_owned()),
+            error_details: error.error_details(),
             status_code: error.upstream_status().or(failure.upstream_status_code),
             provider_error_code: error.upstream_code().map(|code| code.as_str().to_owned()),
             retry_after_ms: duration_ms(error.retry_after())?,
@@ -308,6 +346,7 @@ impl ExecutionStore for SqliteExecutionStore {
                 .map(|id| id.as_str().to_owned())
                 .or(failure.upstream_request_id),
             latency_ms: Some(duration_ms(Some(failure.latency))?.ok_or_else(core_invalid)?),
+            created_at: Utc::now(),
             message: error.diagnostic().map_or_else(
                 || "intermediate upstream failure".to_owned(),
                 |diagnostic| diagnostic.as_str().to_owned(),
@@ -333,12 +372,13 @@ impl ExecutionStore for SqliteExecutionStore {
             upstream_model_id: None,
             failure_kind: error.kind().as_str().to_owned(),
             upstream_send_state: None,
-            raw_upstream_error: None,
+            error_details: None,
             status_code: None,
             provider_error_code: error.client_error_code().map(str::to_owned),
             retry_after_ms: duration_ms(error.retry_after())?,
             upstream_request_id: None,
             latency_ms: duration_ms(Some(rejection.latency))?,
+            created_at: Utc::now(),
             message: json!({
                 "requestId": rejection.request_id.as_str(),
                 "clientKeyId": rejection.client_key_id.as_str(),
@@ -363,14 +403,13 @@ impl ExecutionStore for SqliteExecutionStore {
             upstream_model_id: Some(failure.upstream_model_id.as_str().to_owned()),
             failure_kind: error.kind().as_str().to_owned(),
             upstream_send_state: Some(error.send_state().as_str().to_owned()),
-            raw_upstream_error: error
-                .raw_upstream_error()
-                .map(|raw| raw.as_str().to_owned()),
+            error_details: error.error_details(),
             status_code: error.upstream_status(),
             provider_error_code: error.upstream_code().map(|code| code.as_str().to_owned()),
             retry_after_ms: duration_ms(error.retry_after())?,
             upstream_request_id: error.upstream_request_id().map(|id| id.as_str().to_owned()),
             latency_ms: Some(duration_ms(Some(failure.latency))?.ok_or_else(core_invalid)?),
+            created_at: Utc::now(),
             message: error.diagnostic().map_or_else(
                 || "account connection test failed".to_owned(),
                 |diagnostic| diagnostic.as_str().to_owned(),
@@ -467,7 +506,7 @@ impl ExecutionStore for SqliteExecutionStore {
                  upstream_transport = coalesce(?37, upstream_transport),
                  http_version = coalesce(?38, http_version), websocket_pool = ?39,
                  service_tier = ?40, provider_observation_json = ?41,
-                 raw_upstream_error = ?42,
+                 error_details = ?42,
                  continuation_unavailable_reason = ?43,
                  upstream_connection_id = ?44,
                  upstream_connection_exit_reason = ?45,
@@ -526,7 +565,7 @@ impl ExecutionStore for SqliteExecutionStore {
         .bind(&finalization.websocket_pool)
         .bind(&finalization.service_tier)
         .bind(provider_metadata.map(|value| value.to_string()))
-        .bind(&finalization.raw_upstream_error)
+        .bind(&finalization.error_details)
         .bind(&continuation_reason)
         .bind(connection.map(|observation| observation.connection_id()))
         .bind(connection.map(|observation| observation.exit_reason()))
@@ -759,12 +798,13 @@ struct OpsEvent {
     upstream_model_id: Option<String>,
     failure_kind: String,
     upstream_send_state: Option<String>,
-    raw_upstream_error: Option<String>,
+    error_details: Option<String>,
     status_code: Option<u16>,
     provider_error_code: Option<String>,
     retry_after_ms: Option<u64>,
     upstream_request_id: Option<String>,
     latency_ms: Option<u64>,
+    created_at: DateTime<Utc>,
     message: String,
 }
 

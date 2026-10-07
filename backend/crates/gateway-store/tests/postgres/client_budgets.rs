@@ -77,6 +77,41 @@ fn context() -> MutationContext {
 }
 
 #[tokio::test]
+async fn unopened_future_budget_windows_do_not_report_usage_or_reset_times() {
+    let Some(database) = TestDatabase::create("budget_unopened_future").await else {
+        return;
+    };
+    seed(&database, "key", "10", "20").await;
+    PgClientBudgetStore::new(database.pool.clone())
+        .settle(charge("key", "before", "3"))
+        .await
+        .unwrap();
+    // 起止相等表示窗口未开启；未来边界确定性覆盖应用时钟领先数据库的场景
+    sqlx::query(
+        "update client_key_budget_windows set
+        daily_start = now() + interval '1 hour', daily_end = now() + interval '1 hour',
+        weekly_start = now() + interval '1 hour', weekly_end = now() + interval '1 hour'
+        where client_api_key_id = $1",
+    )
+    .bind("key")
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let budget = status(&database, "key").await;
+    assert_eq!(
+        (
+            budget.daily_used_usd.canonical(),
+            budget.weekly_used_usd.canonical(),
+            budget.daily_resets_at,
+            budget.weekly_resets_at,
+        ),
+        ("0".to_owned(), "0".to_owned(), None, None)
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn manual_reset_clears_selected_windows_and_preserves_policy_and_history() {
     let Some(database) = TestDatabase::create("budget_manual_reset").await else {
         return;
@@ -1206,6 +1241,48 @@ async fn timezone_cutover_preserves_open_windows_and_resumes_without_overlap() {
     assert_eq!(
         status(&database, "key").await.daily_used_usd.canonical(),
         "3"
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn failed_settlement_retains_native_database_code_through_the_next_admission() {
+    let Some(database) = TestDatabase::create("budget_native_failure").await else {
+        return;
+    };
+    sqlx::query("alter table client_api_keys rename to hidden_test_keys")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let budgets = PgClientBudgetStore::new(database.pool.clone());
+    let error = budgets
+        .settle(charge("missing-key", "native-error", "1"))
+        .await
+        .unwrap_err();
+    fn assert_native_code(error: &(dyn std::error::Error + 'static)) {
+        let mut source = Some(error);
+        while let Some(error) = source {
+            if let Some(sqlx::Error::Database(error)) = error.downcast_ref::<sqlx::Error>() {
+                assert_eq!(error.code().as_deref(), Some("42P01"));
+                return;
+            }
+            source = error.source();
+        }
+        panic!("native database failure was lost");
+    }
+    assert_native_code(&error);
+    let retried = budgets.admit(key_id("missing-key")).await.unwrap_err();
+    assert_eq!(
+        retried.kind(),
+        GatewayErrorKind::ProviderInfrastructureUnavailable
+    );
+    assert_native_code(&retried);
+    assert!(
+        retried
+            .error_details()
+            .unwrap()
+            .as_str()
+            .contains("client_api_keys")
     );
     database.close().await;
 }

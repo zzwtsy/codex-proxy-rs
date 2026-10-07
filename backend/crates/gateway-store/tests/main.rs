@@ -8,3 +8,16 @@ mod postgres;
 mod redis;
 mod sqlite;
 mod support;
+
+#[derive(Default)]
+struct RecordingDiagnostics(std::sync::Mutex<Vec<gateway_core::diagnostics::OperationalFailure>>);
+#[async_trait::async_trait]
+impl gateway_core::diagnostics::OperationalDiagnostics for RecordingDiagnostics {
+    async fn record_failure(
+        &self,
+        failure: gateway_core::diagnostics::OperationalFailure,
+    ) -> Result<(), gateway_core::error::StoreError> {
+        self.0.lock().unwrap().push(failure);
+        Ok(())
+    }
+}

@@ -48,6 +48,8 @@ impl RuntimeSnapshotRepository for SqliteRuntimeSnapshotRepository {
                     smart_scheduling_json, model_mappings_json, min_codex_desktop_version,
                     min_codex_cli_version, max_waiting_per_key, max_waiting_per_account,
                     concurrency_wait_timeout_seconds, openai_guardian_reserved_concurrency,
+                    openai_account_affinity, max_account_rotations,
+                    openai_session_affinity_ttl_hours,
                     request_location_json, request_location_enabled,
                     responses_max_decompressed_body_bytes, provider_request_profiles_json,
                     pricing_overrides_json, pricing_synced_json
@@ -59,6 +61,7 @@ impl RuntimeSnapshotRepository for SqliteRuntimeSnapshotRepository {
         .ok_or_else(|| StoreError::NotFound {
             entity: "runtime settings",
             id: "1".to_owned(),
+            source: None,
         })?;
 
         let revision = revision_from_i64(read_i64(&settings_row, "config_revision")?)?;
@@ -98,6 +101,16 @@ impl RuntimeSnapshotRepository for SqliteRuntimeSnapshotRepository {
             openai_guardian_reserved_concurrency: to_u32(read_i64(
                 &settings_row,
                 "openai_guardian_reserved_concurrency",
+            )?)?,
+            openai_account_affinity: gateway_core::account::AccountAffinity::parse(&read_string(
+                &settings_row,
+                "openai_account_affinity",
+            )?)
+            .ok_or_else(|| invalid("persisted account affinity is invalid"))?,
+            max_account_rotations: to_u32(read_i64(&settings_row, "max_account_rotations")?)?,
+            openai_session_affinity_ttl_hours: to_u32(read_i64(
+                &settings_row,
+                "openai_session_affinity_ttl_hours",
             )?)?,
             responses_max_decompressed_body_bytes: to_u64(read_i64(
                 &settings_row,
@@ -240,6 +253,7 @@ impl RuntimeSnapshotRepository for SqliteRuntimeSnapshotRepository {
         .ok_or_else(|| StoreError::NotFound {
             entity: "runtime settings",
             id: "1".to_owned(),
+            source: None,
         })?;
         revision_from_i64(revision)
     }
@@ -300,5 +314,6 @@ fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: "SQLite runtime snapshot",
         message: message.to_owned(),
+        source: None,
     }
 }

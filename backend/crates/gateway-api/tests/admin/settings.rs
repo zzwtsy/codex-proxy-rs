@@ -53,6 +53,9 @@ fn update_body() -> Value {
         "maxWaitingPerKey": 0,
         "maxWaitingPerAccount": 0,
         "openaiGuardianReservedConcurrency": 0,
+        "openaiAccountAffinity": "relaxed",
+        "maxAccountRotations": 3,
+        "openaiSessionAffinityTtlHours": 24,
         "concurrencyWaitTimeoutSeconds": 30,
         "responsesMaxDecompressedBodyBytes": 67108864,
         "rotationStrategy": "round_robin",
@@ -203,8 +206,6 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
 
     let settings = RuntimeSettings {
         request_profiles: Default::default(),
-        request_location_enabled: false,
-        request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
         model_mappings: BTreeMap::from_iter([
             (
@@ -216,36 +217,43 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
                 UpstreamModelId::new("grok-4.5").expect("upstream model"),
             ),
         ]),
-        refresh_margin_seconds: 1800,
-        refresh_concurrency: 4,
-        max_concurrent_per_account: 5,
-        request_interval_ms: 25,
-        max_waiting_per_key: 0,
-        max_waiting_per_account: 0,
-        concurrency_wait_timeout_seconds: 30,
-        openai_guardian_reserved_concurrency: 0,
-        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
-        smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
         rotation_strategy: RotationStrategy::RoundRobin,
-        min_codex_desktop_version: Some("26.825.6671".to_owned()),
-        min_codex_cli_version: Some("0.40.0".to_owned()),
-        usage_retention_days: 32,
-        ops_event_retention_days: 31,
-        audit_retention_days: 91,
-        account_auto_freeze_enabled: true,
-        account_auto_freeze_threshold: 12,
-        account_auto_freeze_window_seconds: 600,
-        account_auto_freeze_duration_seconds: 7_200,
-        account_auto_freeze_probe_enabled: true,
-        account_auto_freeze_probe_model: None,
-        account_auto_freeze_adaptive_concurrency: true,
-        account_warmup_enabled: false,
-        account_warmup_schedule_time: "08:00".to_owned(),
-        account_warmup_model: None,
         updated_at: Utc
             .with_ymd_and_hms(2026, 8, 2, 10, 30, 0)
             .single()
             .expect("timestamp"),
+        values: gateway_admin::model::settings::RuntimeSettingsValues {
+            request_location_enabled: false,
+            request_location: Default::default(),
+            refresh_margin_seconds: 1800,
+            refresh_concurrency: 4,
+            max_concurrent_per_account: 5,
+            request_interval_ms: 25,
+            max_waiting_per_key: 0,
+            max_waiting_per_account: 0,
+            concurrency_wait_timeout_seconds: 30,
+            openai_guardian_reserved_concurrency: 0,
+            openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
+            max_account_rotations: 3,
+            openai_session_affinity_ttl_hours: 24,
+            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+            smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+            min_codex_desktop_version: Some("26.825.6671".to_owned()),
+            min_codex_cli_version: Some("0.40.0".to_owned()),
+            usage_retention_days: 32,
+            ops_event_retention_days: 31,
+            audit_retention_days: 91,
+            account_auto_freeze_enabled: true,
+            account_auto_freeze_threshold: 12,
+            account_auto_freeze_window_seconds: 600,
+            account_auto_freeze_duration_seconds: 7_200,
+            account_auto_freeze_probe_enabled: true,
+            account_auto_freeze_probe_model: None,
+            account_auto_freeze_adaptive_concurrency: true,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
+        },
     };
 
     let value = serde_json::to_value(RuntimeSettingsView::from((
@@ -273,6 +281,9 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "maxWaitingPerKey": 0,
             "maxWaitingPerAccount": 0,
             "openaiGuardianReservedConcurrency": 0,
+            "openaiAccountAffinity": "relaxed",
+            "maxAccountRotations": 3,
+            "openaiSessionAffinityTtlHours": 24,
             "concurrencyWaitTimeoutSeconds": 30,
             "responsesMaxDecompressedBodyBytes": 67108864,
             "rotationStrategy": "round_robin",
@@ -321,8 +332,6 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         .collect();
     let settings = RuntimeSettings {
         request_profiles: Default::default(),
-        request_location_enabled: false,
-        request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
         model_mappings: request
             .model_mappings
@@ -335,34 +344,43 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
             })
             .collect::<Result<BTreeMap<_, _>, gateway_core::error::IdentifierError>>()
             .expect("valid model mappings"),
-        refresh_margin_seconds: request.refresh_margin_seconds,
-        refresh_concurrency: u32::try_from(request.refresh_concurrency).expect("u32"),
-        max_concurrent_per_account: u32::try_from(request.max_concurrent_per_account).expect("u32"),
-        request_interval_ms: request.request_interval_ms,
-        max_waiting_per_key: 0,
-        max_waiting_per_account: 0,
-        concurrency_wait_timeout_seconds: 30,
-        openai_guardian_reserved_concurrency: 0,
-        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
-        smart_scheduling: request.smart_scheduling,
         rotation_strategy: RotationStrategy::parse(&request.rotation_strategy)
             .expect("fixture rotation strategy"),
-        min_codex_desktop_version: request.min_codex_desktop_version,
-        min_codex_cli_version: request.min_codex_cli_version,
-        usage_retention_days: u32::try_from(request.usage_retention_days).expect("u32"),
-        ops_event_retention_days: u32::try_from(request.ops_event_retention_days).expect("u32"),
-        audit_retention_days: u32::try_from(request.audit_retention_days).expect("u32"),
-        account_auto_freeze_enabled: true,
-        account_auto_freeze_threshold: 12,
-        account_auto_freeze_window_seconds: 600,
-        account_auto_freeze_duration_seconds: 7_200,
-        account_auto_freeze_probe_enabled: true,
-        account_auto_freeze_probe_model: None,
-        account_auto_freeze_adaptive_concurrency: true,
-        account_warmup_enabled: false,
-        account_warmup_schedule_time: "08:00".to_owned(),
-        account_warmup_model: None,
         updated_at: chrono::Utc::now(),
+        values: gateway_admin::model::settings::RuntimeSettingsValues {
+            request_location_enabled: false,
+            request_location: Default::default(),
+            refresh_margin_seconds: request.values.refresh_margin_seconds,
+            refresh_concurrency: u32::try_from(request.values.refresh_concurrency).expect("u32"),
+            max_concurrent_per_account: u32::try_from(request.values.max_concurrent_per_account)
+                .expect("u32"),
+            request_interval_ms: request.values.request_interval_ms,
+            max_waiting_per_key: 0,
+            max_waiting_per_account: 0,
+            concurrency_wait_timeout_seconds: 30,
+            openai_guardian_reserved_concurrency: 0,
+            openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
+            max_account_rotations: 3,
+            openai_session_affinity_ttl_hours: 24,
+            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+            smart_scheduling: request.values.smart_scheduling,
+            min_codex_desktop_version: request.values.min_codex_desktop_version,
+            min_codex_cli_version: request.values.min_codex_cli_version,
+            usage_retention_days: u32::try_from(request.values.usage_retention_days).expect("u32"),
+            ops_event_retention_days: u32::try_from(request.values.ops_event_retention_days)
+                .expect("u32"),
+            audit_retention_days: u32::try_from(request.values.audit_retention_days).expect("u32"),
+            account_auto_freeze_enabled: true,
+            account_auto_freeze_threshold: 12,
+            account_auto_freeze_window_seconds: 600,
+            account_auto_freeze_duration_seconds: 7_200,
+            account_auto_freeze_probe_enabled: true,
+            account_auto_freeze_probe_model: None,
+            account_auto_freeze_adaptive_concurrency: true,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
+        },
     };
 
     let response_fields: BTreeSet<String> = serde_json::to_value(RuntimeSettingsView::from((
@@ -384,6 +402,48 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
     expected_fields.insert("smartSchedulingDefaults".to_owned());
 
     assert_eq!(response_fields, expected_fields);
+}
+
+#[test]
+fn settings_request_accepts_json_bytes_with_flattened_fields() {
+    serde_json::from_slice::<UpdateRuntimeSettingsRequest>(
+        &serde_json::to_vec(&update_body()).unwrap(),
+    )
+    .expect("settings JSON bytes must decode like the HTTP request body");
+}
+
+#[test]
+fn settings_service_contract_stays_flat_and_rejects_unknown_fields() {
+    use gateway_admin::model::settings::{ReplaceRuntimeSettings, RuntimeSettings};
+
+    let current = super::test_runtime_settings();
+    assert_eq!(
+        serde_json::from_slice::<RuntimeSettings>(&serde_json::to_vec(&current).unwrap()).unwrap(),
+        current
+    );
+    let mut record = serde_json::to_value(&current).unwrap();
+    assert!(record.get("values").is_none());
+    assert_eq!(
+        serde_json::from_value::<RuntimeSettings>(record.clone()).unwrap(),
+        current
+    );
+    record["unexpected_setting"] = json!(true);
+    assert!(serde_json::from_value::<RuntimeSettings>(record).is_err());
+
+    let command = ReplaceRuntimeSettings::from(current);
+    assert_eq!(
+        serde_json::from_slice::<ReplaceRuntimeSettings>(&serde_json::to_vec(&command).unwrap())
+            .unwrap(),
+        command
+    );
+    let mut wire = serde_json::to_value(&command).unwrap();
+    assert!(wire.get("values").is_none());
+    assert_eq!(
+        serde_json::from_value::<ReplaceRuntimeSettings>(wire.clone()).unwrap(),
+        command
+    );
+    wire["unexpected_setting"] = json!(true);
+    assert!(serde_json::from_value::<ReplaceRuntimeSettings>(wire).is_err());
 }
 
 #[test]
@@ -1328,4 +1388,77 @@ async fn guardian_reservation_round_trips_and_rejects_invalid_values() {
         .unwrap()
         .remove("openaiGuardianReservedConcurrency");
     assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(omitted).is_err());
+}
+
+#[tokio::test]
+async fn account_affinity_and_rotation_budget_round_trip_and_reject_invalid_values() {
+    for (mode, rotations, ttl) in [("relaxed", 0, 1), ("preferred", 3, 24), ("strict", 31, 720)] {
+        let fixture = AdminTestFixture::new().await;
+        fixture.auth.insert_session("valid-session");
+        let mut body = update_body();
+        body["openaiAccountAffinity"] = json!(mode);
+        body["maxAccountRotations"] = json!(rotations);
+        body["openaiSessionAffinityTtlHours"] = json!(ttl);
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["data"]["openaiAccountAffinity"], mode);
+        assert_eq!(response["data"]["maxAccountRotations"], rotations);
+        assert_eq!(response["data"]["openaiSessionAffinityTtlHours"], ttl);
+    }
+    // 类型错误沿用 AdminJson 的 422，合法类型越界由字段校验返回 400
+    for (field, value, expected_status) in [
+        (
+            "openaiAccountAffinity",
+            json!("unknown"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "maxAccountRotations",
+            json!(-1),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        ("maxAccountRotations", json!(32), StatusCode::BAD_REQUEST),
+        (
+            "maxAccountRotations",
+            json!(1.5),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "openaiSessionAffinityTtlHours",
+            json!(0),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "openaiSessionAffinityTtlHours",
+            json!(721),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "openaiSessionAffinityTtlHours",
+            json!(1.5),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let fixture = AdminTestFixture::new().await;
+        fixture.auth.insert_session("valid-session");
+        let mut body = update_body();
+        body[field] = value;
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status, "{field}");
+    }
 }

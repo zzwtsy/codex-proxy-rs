@@ -5,8 +5,7 @@ use std::time::{Duration as StdDuration, SystemTime};
 use chrono::{DateTime, Duration, Utc};
 use futures::TryStreamExt as _;
 use gateway_admin::{
-    model::{PageSize, observability as admin_observability},
-    ports::store::ObservabilityStore as _,
+    model::observability as admin_observability, ports::store::ObservabilityStore as _,
 };
 use gateway_core::diagnostics::TraceContext;
 use gateway_core::engine::{
@@ -24,19 +23,13 @@ use gateway_core::routing::{AccountRoutingSnapshot, ConfigRevision, PublicModelI
 use gateway_core::upstream::UpstreamSendState;
 use gateway_store::postgres::{
     AttemptMetrics, ModelRequestAttemptStart, ModelRequestRepository, NewModelRequest,
-    ObservabilityPageSize, ObservabilityRange, ObservabilityRepository, OpsErrorFilter,
-    OpsErrorQuery, PgExecutionStore, UsageRecordFilter, UsageRecordQuery,
+    ObservabilityPageSize, ObservabilityRange, OpsErrorFilter, OpsErrorQuery, PgExecutionStore,
+    UsageRecordFilter, UsageRecordQuery,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use super::{TestDatabase, admin_observability_store, observability_repository};
-
-#[test]
-fn postgres_execution_adapter_implements_core_port() {
-    fn assert_port<T: ExecutionStore>() {}
-    assert_port::<PgExecutionStore>();
-}
 
 #[test]
 fn model_request_rejects_mismatched_client_key_live_id() {
@@ -677,7 +670,7 @@ fn successful_core_finalization(id: &str) -> CoreModelRequestFinalization {
         provider_metadata_json: None,
         error: None,
         provider_error_code: None,
-        raw_upstream_error: None,
+        error_details: None,
         failure_observation: Default::default(),
         retry_after_ms: None,
         usage: Usage::new(),
@@ -829,8 +822,8 @@ async fn core_adapter_persists_opaque_response_ids_as_bytes() {
 }
 
 #[tokio::test]
-async fn core_adapter_persists_raw_upstream_error_verbatim() {
-    let Some(database) = TestDatabase::create("execution_raw_upstream_error").await else {
+async fn core_adapter_persists_native_causes_and_verbatim_upstream_details() {
+    let Some(database) = TestDatabase::create("execution_error_details").await else {
         return;
     };
     seed_running_request(&database.pool, "req_raw_upstream_error")
@@ -838,6 +831,12 @@ async fn core_adapter_persists_raw_upstream_error_verbatim() {
         .expect("seed model request");
     let store = PgExecutionStore::new(database.pool.clone());
     let raw = r#"{"error":{"message":"raw upstream body","opaque":"\u0000"}}"#;
+    let provider_error = gateway_core::error::ProviderError::new(
+        gateway_core::error::ProviderErrorKind::Unavailable,
+        UpstreamSendState::Sent,
+    )
+    .with_source(std::io::Error::other("original local cause"))
+    .with_raw_upstream_error(gateway_core::error::RawUpstreamError::new(raw));
     let mut finalization = successful_core_finalization("req_raw_upstream_error");
     finalization.outcome = ExecutionOutcome::Failed;
     finalization.client_status_code = Some(502);
@@ -846,19 +845,25 @@ async fn core_adapter_persists_raw_upstream_error_verbatim() {
         GatewayErrorKind::UpstreamUnavailable,
         "upstream service is unavailable",
     ));
-    finalization.raw_upstream_error = Some(raw.to_owned());
+    finalization.error_details = provider_error.error_details();
 
     ExecutionStore::finalize_model_request(&store, finalization)
         .await
-        .expect("persist raw upstream error");
+        .expect("persist restricted error details");
 
     let persisted: Option<String> = sqlx::query_scalar(
-        "select raw_upstream_error from model_requests where id = 'req_raw_upstream_error'",
+        "select error_details from model_requests where id = 'req_raw_upstream_error'",
     )
     .fetch_one(&database.pool)
     .await
-    .expect("load raw upstream error");
-    assert_eq!(persisted.as_deref(), Some(raw));
+    .expect("load restricted error details");
+    let persisted: Value = serde_json::from_str(persisted.as_deref().unwrap()).unwrap();
+    assert_eq!(persisted["upstream"], raw);
+    assert_eq!(
+        persisted["causes"]["messages"],
+        json!(["original local cause"])
+    );
+    assert_eq!(persisted["causes"]["truncated"], false);
 
     database.close().await;
 }
@@ -1527,7 +1532,7 @@ pub(super) fn early_failure(request: &CoreNewModelRequest) -> CoreModelRequestFi
             "no available provider",
         )),
         provider_error_code: None,
-        raw_upstream_error: None,
+        error_details: None,
         failure_observation: Default::default(),
         retry_after_ms: None,
         usage: Usage::new(),
@@ -1585,7 +1590,7 @@ async fn zero_attempt_failure_is_queryable_without_fabricating_upstream_facts() 
         .usage_record_detail(request.id.as_str())
         .await
         .expect("load failed request detail");
-    assert_eq!(detail.request.outcome, "failed");
+    assert_eq!(detail.request.outcome.as_str(), "failed");
     assert_eq!(detail.request.attempt_count, 0);
     assert_eq!(detail.request.upstream_send_state, "not_sent");
     assert_eq!(detail.request.client_api_key_ref, "key_zero_attempt");
@@ -1622,7 +1627,7 @@ async fn zero_attempt_failure_is_queryable_without_fabricating_upstream_facts() 
         "downstream_committed_at",
         "service_tier",
         "provider_observation_json",
-        "raw_upstream_error",
+        "error_details",
         "input_tokens",
         "output_tokens",
         "total_tokens",
@@ -1675,7 +1680,7 @@ async fn zero_attempt_failure_is_queryable_without_fabricating_upstream_facts() 
     assert_eq!(error.upstream_transport, None);
     assert_eq!(error.upstream_status_code, None);
     assert_eq!(error.upstream_request_id, None);
-    assert_eq!(error.raw_upstream_error, None);
+    assert_eq!(error.error_details, None);
 
     // 路由入口不等于已选择 Provider；没有平台事实时不能被平台/attempt 筛选命中
     for filter in [
@@ -1715,7 +1720,7 @@ async fn zero_attempt_failure_is_queryable_without_fabricating_upstream_facts() 
                 ..Default::default()
             },
             current_page: 1,
-            page_size: PageSize::new(10).expect("page size"),
+            page_size: ObservabilityPageSize::new(10).expect("page size"),
         })
         .await
         .expect("admin ops errors without provider facts");
@@ -1907,7 +1912,7 @@ async fn zero_attempt_recovery_respects_deadline_and_does_not_invent_a_trace() {
         .usage_record_detail(request.id.as_str())
         .await
         .expect("recovered detail");
-    assert_eq!(detail.request.outcome, "incomplete");
+    assert_eq!(detail.request.outcome.as_str(), "incomplete");
     assert_eq!(
         detail.request.error_kind.as_deref(),
         Some("process_interrupted")
@@ -1938,7 +1943,8 @@ async fn zero_attempt_recovery_respects_deadline_and_does_not_invent_a_trace() {
             .await
             .expect("active detail")
             .request
-            .outcome,
+            .outcome
+            .as_str(),
         "running"
     );
     database.close().await;
@@ -1997,7 +2003,10 @@ async fn zero_attempt_failure_does_not_enter_successful_usage_or_cost_aggregates
     );
     assert_eq!(after.requests.success_count, before.requests.success_count);
     assert_eq!(after.requests.total_tokens, before.requests.total_tokens);
-    assert_eq!(after.requests.latency_sum, before.requests.latency_sum);
+    assert_eq!(
+        after.requests.latency_sum_ms,
+        before.requests.latency_sum_ms
+    );
     assert_eq!(after.requests.latency_count, before.requests.latency_count);
     assert_eq!(after.attempts, before.attempts);
     let successes = repository
@@ -2036,7 +2045,11 @@ async fn zero_attempt_failure_does_not_enter_successful_usage_or_cost_aggregates
     assert_eq!(page.total, 0);
     assert!(page.items.is_empty());
     let billing: Vec<_> = repository
-        .usage_calculated_billing_facts(zero_attempt_range(&request), filter)
+        .usage_calculated_billing_facts(
+            zero_attempt_range(&request),
+            filter,
+            admin_observability::Granularity::FifteenMinutes,
+        )
         .try_collect()
         .await
         .expect("billing facts");
@@ -2079,5 +2092,76 @@ async fn entry_rejection_is_visible_without_a_fictitious_model_execution() {
         .await
         .unwrap();
     assert_eq!(count, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn shared_core_usage_and_timings_preserve_fields_and_reject_invalid_phases() {
+    let Some(database) = TestDatabase::create("shared_execution_facts").await else {
+        return;
+    };
+    let id = "req_shared_facts";
+    seed_running_request(&database.pool, id).await.unwrap();
+    let store = PgExecutionStore::new(database.pool.clone());
+    let mut finalization = successful_core_finalization(id);
+    finalization.usage = Usage {
+        input_tokens: Some(101),
+        output_tokens: Some(22),
+        cached_tokens: Some(33),
+        cache_write_tokens: Some(44),
+        reasoning_tokens: Some(5),
+        image_input_tokens: Some(6),
+        image_output_tokens: Some(7),
+        total_tokens: Some(123),
+    };
+    finalization.timings = CoreModelRequestTimings {
+        transport_decision_wait_ms: Some(1),
+        connect_ms: Some(2),
+        headers_ms: Some(3),
+        first_event_ms: Some(4),
+        first_reasoning_ms: Some(5),
+        first_text_ms: Some(6),
+        first_token_ms: Some(7),
+        provider_processing_ms: Some(8),
+        latency_ms: Some(9),
+    };
+    ExecutionStore::finalize_model_request(&store, finalization)
+        .await
+        .unwrap();
+    let persisted = stored_row(&database.pool, id).await;
+    for (field, expected) in [
+        ("input_tokens", 101),
+        ("output_tokens", 22),
+        ("cached_tokens", 33),
+        ("cache_write_tokens", 44),
+        ("reasoning_tokens", 5),
+        ("image_input_tokens", 6),
+        ("image_output_tokens", 7),
+        ("total_tokens", 123),
+        ("transport_decision_wait_ms", 1),
+        ("connect_ms", 2),
+        ("headers_ms", 3),
+        ("first_event_ms", 4),
+        ("first_reasoning_ms", 5),
+        ("first_text_ms", 6),
+        ("first_token_ms", 7),
+        ("provider_processing_ms", 8),
+        ("latency_ms", 9),
+    ] {
+        assert_eq!(persisted[field], json!(expected), "{field}");
+    }
+    let invalid_id = "req_invalid_phase";
+    seed_running_request(&database.pool, invalid_id)
+        .await
+        .unwrap();
+    let before = stored_row(&database.pool, invalid_id).await;
+    let mut invalid = successful_core_finalization(invalid_id);
+    invalid.timings.latency_ms = Some(10);
+    invalid.timings.first_token_ms = Some(11);
+    let error = ExecutionStore::finalize_model_request(&store, invalid)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StoreErrorKind::InvalidData);
+    assert_eq!(stored_row(&database.pool, invalid_id).await, before);
     database.close().await;
 }

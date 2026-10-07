@@ -28,7 +28,7 @@ impl AdminSecurityAuditRepository for PgAdminSecurityAuditRepository {
             .bind(admin_user_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|_| postgres_unavailable("read admin password hash"))
+            .map_err(|source| postgres_unavailable("read admin password hash", source))
     }
 
     async fn change_password(
@@ -44,7 +44,7 @@ impl AdminSecurityAuditRepository for PgAdminSecurityAuditRepository {
             .pool
             .begin()
             .await
-            .map_err(|_| postgres_unavailable("begin password change"))?;
+            .map_err(|source| postgres_unavailable("begin password change", source))?;
         let changed = sqlx::query(
             "update admin_users set password_hash = $3, updated_at = now()
              where id = $1 and password_hash = $2",
@@ -54,7 +54,7 @@ impl AdminSecurityAuditRepository for PgAdminSecurityAuditRepository {
         .bind(password_hash)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| postgres_unavailable("change admin password"))?
+        .map_err(|source| postgres_unavailable("change admin password", source))?
         .rows_affected()
             == 1;
         if !changed {
@@ -64,7 +64,7 @@ impl AdminSecurityAuditRepository for PgAdminSecurityAuditRepository {
         transaction
             .commit()
             .await
-            .map_err(|_| postgres_unavailable("commit password change"))?;
+            .map_err(|source| postgres_unavailable("commit password change", source))?;
         Ok(true)
     }
 
@@ -84,7 +84,7 @@ impl AdminSecurityAuditRepository for PgAdminSecurityAuditRepository {
         .bind(password_hash)
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("create admin password hash"))?;
+        .map_err(|source| postgres_unavailable("create admin password hash", source))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -109,7 +109,7 @@ impl AdminSecurityAuditRepository for PgAdminSecurityAuditRepository {
         .bind(event.created_at)
         .execute(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("append admin audit event"))?;
+        .map_err(|source| postgres_unavailable("append admin audit event", source))?;
         Ok(())
     }
 }
@@ -122,8 +122,9 @@ pub(crate) async fn append_admin_audit_event_in_transaction(
     event.config_revision = revision
         .into()
         .map(|revision| {
-            i64::try_from(revision.get())
-                .map_err(|_| invalid("config revision exceeds PostgreSQL bigint"))
+            i64::try_from(revision.get()).map_err(|source| {
+                invalid("config revision exceeds PostgreSQL bigint").with_source(source)
+            })
         })
         .transpose()?;
     event.validate()?;
@@ -146,12 +147,13 @@ pub(crate) async fn append_admin_audit_event_in_transaction(
     .bind(event.created_at)
     .execute(&mut **transaction)
     .await
-    .map_err(|_| postgres_unavailable("append admin audit event in transaction"))?;
+    .map_err(|source| postgres_unavailable("append admin audit event in transaction", source))?;
     Ok(())
 }
 
 fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: ENTITY,
         message: message.to_owned(),
     }

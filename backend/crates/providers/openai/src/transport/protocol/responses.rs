@@ -44,7 +44,7 @@ pub struct CodexResponsesRequest {
     pub client_session_id: Option<String>,
     /// 官方元数据中的逻辑会话身份，独立于缓存路由键
     pub client_account_session_id: Option<String>,
-    /// 后代线程只跟随会话账号，不自行迁移绑定
+    /// 后代线程身份，用于严格模式下只跟随会话账号
     pub client_account_follow_only: bool,
     /// 客户端 thread ID，仅保留在受控本地上下文
     pub client_thread_id: Option<String>,
@@ -212,9 +212,8 @@ pub fn transport_requirement(request: &CodexResponsesRequest) -> TransportRequir
 
 /// 单个 Responses 事件对计时系统提供的稳定语义信号
 ///
-/// `protocol_progress` 只说明上游仍在工作，不能替代首字；`output_start` 标记首个会
-/// 开启客户端输出的非前导事件（结构帧也算）；其余字段分别标记客户端可消费的
-/// 输出、reasoning 输出与正文输出
+/// `output_start` 用于首字观测，包含非前导结构事件；`semantic_output` 仍要求
+/// 实际内容，供重试与交付边界使用，不能与首字观测互换
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResponseEventSignals {
     pub protocol_progress: bool,
@@ -226,23 +225,24 @@ pub struct ResponseEventSignals {
 
 /// 从已解析的 Responses 事件提取计时语义
 ///
-/// `output_start` 在任意非前导、非失败事件上置位（含结构帧
-/// `response.output_item.added`/`content_part.added`），用于开启首字计时；前导帧
-/// （`response.created`/`response.in_progress`）与失败帧不置位
-/// 语义输出仍要求
-/// 实际携带文本、工具参数、推理或图片结果，`response.output_item.done` 与终态帧
-/// 只有携带语义内容才算
+/// 首字采用首个非前导、非心跳、非失败事件，包含结构事件
+/// 语义输出仍要求文本、推理、工具参数、图片结果或工具执行
 pub fn response_event_signals(event_type: Option<&str>, value: &Value) -> ResponseEventSignals {
     let mut signals = ResponseEventSignals {
         protocol_progress: !matches!(event_type, Some("response.failed" | "error")),
+        output_start: event_type.is_some_and(|event_type| {
+            !matches!(
+                event_type,
+                "response.created"
+                    | "response.in_progress"
+                    | "keepalive"
+                    | "codex.rate_limits"
+                    | "response.failed"
+                    | "error"
+            )
+        }),
         ..ResponseEventSignals::default()
     };
-    signals.output_start = event_type.is_some_and(|event_type| {
-        !matches!(
-            event_type,
-            "response.created" | "response.in_progress" | "response.failed" | "error"
-        )
-    });
     match event_type {
         Some("response.output_text.delta") => {
             signals.text_output = non_empty_string(value.get("delta"));

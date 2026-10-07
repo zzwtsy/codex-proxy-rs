@@ -7,9 +7,9 @@ use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
 use gateway_admin::{
     model::observability::{
-        DashboardObservation, DashboardRuntimeSlots, DiagnosticDimension, DiagnosticsObservation,
-        OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange, UsageDetail, UsageFilter,
-        UsageOverview, UsagePage, UsageQuery,
+        DashboardObservation, DashboardQuery, DashboardRuntimeSlots, DiagnosticDimension,
+        DiagnosticsObservation, Granularity, OpsErrorPage, OpsErrorQuery, RequestMetricPoint,
+        TimeRange, UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
     },
     ports::store::{
         AdminStoreError, AdminStoreErrorKind, AdminStoreResult, ObservabilityStore,
@@ -30,9 +30,8 @@ use crate::{
     postgres::{
         DashboardObservation as StoreDashboardObservation, ProviderAccountMetrics,
         UsageRecordFilter, UsageRecordQuery, admin_calculated_usage_billing_fact,
-        admin_dashboard_observation, admin_diagnostics_observation, admin_ops_error_page,
-        admin_request_metric_point, admin_usage_detail, admin_usage_overview, admin_usage_page,
-        observability_error, store_diagnostic_dimension, store_ops_error_query, store_range,
+        admin_dashboard_observation, admin_diagnostics_observation, admin_request_metric_point,
+        admin_usage_overview, observability_error, store_ops_error_query, store_range,
         store_usage_filter, store_usage_query,
     },
     sqlite::{self, observability},
@@ -119,62 +118,11 @@ impl SqliteAdminObservabilityStore {
         }
         Ok((metrics, normal))
     }
-}
-
-#[async_trait]
-impl ObservabilityStore for SqliteAdminObservabilityStore {
-    async fn dashboard_summary(
-        &self,
-        range: TimeRange,
-        observed_at: DateTime<Utc>,
-    ) -> AdminStoreResult<DashboardObservation> {
-        let range = store_range(range)?;
-        let (provider_accounts, _) = self.account_status_snapshot(observed_at).await?;
-        let totals = observability::dashboard_totals(&self.pool)
-            .await
-            .map_err(observability_error)?;
-        let trend = observability::metric_series(
-            &self.pool,
-            range,
-            &UsageRecordFilter::default(),
-            self.timezone,
-            false,
-        )
-        .await
-        .map_err(observability_error)?;
-        let recent_range_query = UsageRecordQuery {
-            range,
-            filter: UsageRecordFilter {
-                outcome: Some("succeeded".to_owned()),
-                ..UsageRecordFilter::default()
-            },
-            current_page: 1,
-            page_size: crate::postgres::ObservabilityPageSize::new(10)
-                .map_err(observability_error)?,
-        };
-        let recent_requests = observability::list_usage_records(&self.pool, recent_range_query)
-            .await
-            .map_err(observability_error)?
-            .items;
-        let account_usage = observability::dashboard_account_usage(&self.pool, range)
-            .await
-            .map_err(observability_error)?;
-        let observation = StoreDashboardObservation {
-            range,
-            totals,
-            provider_accounts,
-            trend,
-            account_usage,
-            recent_requests,
-        };
-        admin_dashboard_observation(observation)
-    }
 
     async fn dashboard_runtime_slots(
         &self,
-        observed_at: DateTime<Utc>,
-    ) -> AdminStoreResult<Option<DashboardRuntimeSlots>> {
-        let (_, normal_accounts) = self.account_status_snapshot(observed_at).await?;
+        normal_accounts: &[ProviderAccount],
+    ) -> AdminStoreResult<DashboardRuntimeSlots> {
         let inherited_accounts = u64::try_from(
             normal_accounts
                 .iter()
@@ -190,11 +138,11 @@ impl ObservabilityStore for SqliteAdminObservabilityStore {
             )
         });
         if normal_accounts.is_empty() {
-            return Ok(Some(DashboardRuntimeSlots {
+            return Ok(DashboardRuntimeSlots {
                 inherited_accounts,
                 overridden_slots,
                 used_slots: Some(0),
-            }));
+            });
         }
         let ids = normal_accounts
             .iter()
@@ -204,41 +152,99 @@ impl ObservabilityStore for SqliteAdminObservabilityStore {
         let signals = match leases.credential_runtime_signals(&ids).await {
             Ok(signals) => signals,
             Err(_) => {
-                return Ok(Some(DashboardRuntimeSlots {
+                return Ok(DashboardRuntimeSlots {
                     inherited_accounts,
                     overridden_slots,
                     used_slots: None,
-                }));
+                });
             }
         };
         let used_slots = signals.into_iter().fold(0_u64, |total, signal| {
             total.saturating_add(u64::from(signal.in_flight))
         });
-        Ok(Some(DashboardRuntimeSlots {
+        Ok(DashboardRuntimeSlots {
             inherited_accounts,
             overridden_slots,
             used_slots: Some(used_slots),
-        }))
+        })
+    }
+}
+
+#[async_trait]
+impl ObservabilityStore for SqliteAdminObservabilityStore {
+    async fn dashboard_summary(
+        &self,
+        query: DashboardQuery,
+        observed_at: DateTime<Utc>,
+    ) -> AdminStoreResult<DashboardObservation> {
+        let range = store_range(query.range).map_err(observability_error)?;
+        let (provider_accounts, normal_accounts) =
+            self.account_status_snapshot(observed_at).await?;
+        let runtime_slots = self.dashboard_runtime_slots(&normal_accounts).await?;
+        let totals = observability::dashboard_totals(&self.pool)
+            .await
+            .map_err(observability_error)?;
+        let trend = observability::metric_series(
+            &self.pool,
+            range,
+            &UsageRecordFilter::default(),
+            query.granularity,
+            self.timezone,
+            false,
+        )
+        .await
+        .map_err(observability_error)?;
+        let recent_range_query = UsageRecordQuery {
+            range,
+            filter: store_usage_filter(query.recent_request_filter),
+            current_page: 1,
+            page_size: crate::postgres::ObservabilityPageSize::new(query.recent_request_limit)
+                .map_err(|_| invalid_admin("invalid dashboard recent request limit"))?,
+        };
+        let recent_requests = observability::list_usage_records(&self.pool, recent_range_query)
+            .await
+            .map_err(observability_error)?
+            .items;
+        let mut account_usage = observability::dashboard_account_usage(&self.pool, range)
+            .await
+            .map_err(observability_error)?;
+        account_usage.truncate(usize::from(query.account_limit));
+        let observation = StoreDashboardObservation {
+            range,
+            totals,
+            provider_accounts,
+            runtime_slots,
+            trend,
+            account_usage,
+            recent_requests,
+        };
+        Ok(admin_dashboard_observation(observation))
     }
 
-    async fn dashboard_trend(&self, range: TimeRange) -> AdminStoreResult<Vec<RequestMetricPoint>> {
-        metric_points(self, range, UsageFilter::default(), false).await
+    async fn dashboard_trend(
+        &self,
+        range: TimeRange,
+        granularity: Granularity,
+    ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
+        metric_points(self, range, UsageFilter::default(), granularity, false).await
     }
 
     async fn usage_trend(
         &self,
         range: TimeRange,
         filter: UsageFilter,
+        granularity: Granularity,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
-        metric_points(self, range, filter, true).await
+        metric_points(self, range, filter, granularity, true).await
     }
 
     fn usage_calculated_billing_facts(
         &self,
         range: TimeRange,
         filter: UsageFilter,
+        granularity: Granularity,
     ) -> UsageCalculatedBillingStream<'_> {
-        let range = match store_range(range) {
+        let range = match store_range(range).map_err(observability_error) {
             Ok(range) => range,
             Err(error) => return Box::pin(futures::stream::once(async { Err(error) })),
         };
@@ -246,26 +252,27 @@ impl ObservabilityStore for SqliteAdminObservabilityStore {
             &self.pool,
             range,
             store_usage_filter(filter),
+            granularity,
             self.timezone,
         )
         .map_err(observability_error)
-        .and_then(|fact| futures::future::ready(admin_calculated_usage_billing_fact(fact)))
+        .map_ok(admin_calculated_usage_billing_fact)
         .boxed()
     }
 
     async fn list_usage_records(&self, query: UsageQuery) -> AdminStoreResult<UsagePage> {
         let query = store_usage_query(query)?;
-        observability::list_usage_records(&self.pool, query)
+        let page = observability::list_usage_records(&self.pool, query)
             .await
-            .map_err(observability_error)
-            .and_then(admin_usage_page)
+            .map_err(observability_error)?;
+        Ok(page)
     }
 
     async fn usage_record_detail(&self, request_id: &str) -> AdminStoreResult<UsageDetail> {
-        observability::usage_record_detail(&self.pool, request_id)
+        let detail = observability::usage_record_detail(&self.pool, request_id)
             .await
-            .map_err(observability_error)
-            .and_then(admin_usage_detail)
+            .map_err(observability_error)?;
+        Ok(detail)
     }
 
     async fn usage_summary(
@@ -273,12 +280,12 @@ impl ObservabilityStore for SqliteAdminObservabilityStore {
         range: TimeRange,
         filter: UsageFilter,
     ) -> AdminStoreResult<UsageOverview> {
-        let range = store_range(range)?;
+        let range = store_range(range).map_err(observability_error)?;
         let filter = store_usage_filter(filter);
         let overview = observability::usage_overview(&self.pool, range, &filter)
             .await
             .map_err(observability_error)?;
-        admin_usage_overview(overview)
+        Ok(admin_usage_overview(overview))
     }
 
     async fn usage_diagnostics(
@@ -286,22 +293,22 @@ impl ObservabilityStore for SqliteAdminObservabilityStore {
         range: TimeRange,
         filter: UsageFilter,
         dimension: DiagnosticDimension,
+        limit: u16,
     ) -> AdminStoreResult<DiagnosticsObservation> {
-        let range = store_range(range)?;
+        let range = store_range(range).map_err(observability_error)?;
         let filter = store_usage_filter(filter);
-        let dimension = store_diagnostic_dimension(dimension);
-        observability::usage_diagnostics(&self.pool, range, &filter, dimension)
+        observability::usage_diagnostics(&self.pool, range, &filter, dimension, limit)
             .await
             .map_err(observability_error)
-            .and_then(admin_diagnostics_observation)
+            .map(admin_diagnostics_observation)
     }
 
     async fn list_ops_errors(&self, query: OpsErrorQuery) -> AdminStoreResult<OpsErrorPage> {
         let query = store_ops_error_query(query)?;
-        observability::ops_errors(&self.pool, query)
+        let page = observability::ops_errors(&self.pool, query)
             .await
-            .map_err(observability_error)
-            .and_then(admin_ops_error_page)
+            .map_err(observability_error)?;
+        Ok(page)
     }
 }
 
@@ -309,12 +316,14 @@ async fn metric_points(
     store: &SqliteAdminObservabilityStore,
     range: TimeRange,
     filter: UsageFilter,
+    granularity: Granularity,
     include_costs: bool,
 ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
-    observability::metric_series(
+    let points = observability::metric_series(
         &store.pool,
-        store_range(range)?,
+        store_range(range).map_err(observability_error)?,
         &store_usage_filter(filter),
+        granularity,
         store.timezone,
         include_costs,
     )
@@ -322,7 +331,8 @@ async fn metric_points(
     .map_err(observability_error)?
     .into_iter()
     .map(admin_request_metric_point)
-    .collect()
+    .collect::<Vec<_>>();
+    Ok(points)
 }
 
 fn invalid_admin(message: &'static str) -> AdminStoreError {

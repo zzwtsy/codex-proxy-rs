@@ -357,6 +357,7 @@ impl ClientKeyStore for SqliteAdminClientKeyStore {
                     .ok_or_else(|| StoreError::NotFound {
                         entity: ENTITY,
                         id: mutation_id.as_str().to_owned(),
+                        source: None,
                     })?;
                     let mut profiles: BTreeMap<String, Map<String, Value>> =
                         serde_json::from_str(&existing)
@@ -404,6 +405,7 @@ impl ClientKeyStore for SqliteAdminClientKeyStore {
                         return Err(StoreError::NotFound {
                             entity: ENTITY,
                             id: mutation_id.as_str().to_owned(),
+                            source: None,
                         });
                     }
                     sqlx::query("delete from client_api_key_groups where client_api_key_id = ?1")
@@ -446,7 +448,7 @@ impl ClientKeyStore for SqliteAdminClientKeyStore {
                     .await
                     .map_err(|_| sqlite_unavailable("set SQLite Client API Key enabled state"))?;
                     if result.rows_affected() == 0 {
-                        return Err(StoreError::NotFound { entity: ENTITY, id: mutation_id.as_str().to_owned() });
+                        return Err(StoreError::NotFound { entity: ENTITY, id: mutation_id.as_str().to_owned(), source: None, });
                     }
                     Ok(())
                 })
@@ -479,6 +481,7 @@ impl ClientKeyStore for SqliteAdminClientKeyStore {
                         return Err(StoreError::NotFound {
                             entity: ENTITY,
                             id: id.as_str().to_owned(),
+                            source: None,
                         });
                     }
                     Ok(())
@@ -518,6 +521,7 @@ impl ClientKeyStore for SqliteAdminClientKeyStore {
             .ok_or_else(|| StoreError::NotFound {
                 entity: ENTITY,
                 id: command.id.as_str().to_owned(),
+                source: None,
             })?;
             let daily_encoded: String = row
                 .try_get("daily_limit_usd")
@@ -615,6 +619,7 @@ impl ClientKeyStore for SqliteAdminClientKeyStore {
                 return Err(StoreError::NotFound {
                     entity: ENTITY,
                     id: command.id.as_str().to_owned(),
+                    source: None,
                 });
             }
             let daily = matches!(
@@ -1143,6 +1148,7 @@ async fn ensure_key_name_available(
             entity: ENTITY,
             id: id.to_owned(),
             kind: ConflictKind::DuplicateName,
+            source: None,
         });
     }
     Ok(())
@@ -1169,6 +1175,7 @@ async fn ensure_group_ids(
         return Err(StoreError::NotFound {
             entity: "account group",
             id: "Client API Key group selection".to_owned(),
+            source: None,
         });
     }
     Ok(())
@@ -1203,6 +1210,7 @@ pub(super) async fn verify_plugin_owner(
         entity: "plugin mutation",
         id: owner.instance_id.clone(),
         kind: ConflictKind::StaleRevision,
+        source: None,
     })?;
     let allowed = sqlx::query_scalar::<_, i64>(
         "select exists(
@@ -1223,6 +1231,7 @@ pub(super) async fn verify_plugin_owner(
             entity: "plugin mutation",
             id: owner.instance_id.clone(),
             kind: ConflictKind::StaleRevision,
+            source: None,
         });
     }
     Ok(())
@@ -1242,6 +1251,7 @@ fn not_found(resource: &'static str, id: &str) -> AdminStoreError {
         StoreError::NotFound {
             entity: resource,
             id: id.to_owned(),
+            source: None,
         },
     )
 }
@@ -1250,5 +1260,6 @@ fn invalid_store(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: ENTITY,
         message: message.to_owned(),
+        source: None,
     }
 }

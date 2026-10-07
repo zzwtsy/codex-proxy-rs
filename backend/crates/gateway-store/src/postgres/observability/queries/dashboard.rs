@@ -67,19 +67,19 @@ pub(crate) async fn request_metrics(
                   as account_selection_wait_p99_ms,
                 round((percentile_cont(0.10) within group (
                   order by output_tokens::double precision * 1000.0
-                    / greatest(latency_ms - first_token_ms, 1)
+                    / nullif(latency_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > first_token_ms)))::bigint as output_throughput_p10,
+                          and latency_ms > 0)))::bigint as output_throughput_p10,
                 round((percentile_cont(0.50) within group (
                   order by output_tokens::double precision * 1000.0
-                    / greatest(latency_ms - first_token_ms, 1)
+                    / nullif(latency_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > first_token_ms)))::bigint as output_throughput_p50,
+                          and latency_ms > 0)))::bigint as output_throughput_p50,
                 round((percentile_cont(0.90) within group (
                   order by output_tokens::double precision * 1000.0
-                    / greatest(latency_ms - first_token_ms, 1)
+                    / nullif(latency_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > first_token_ms)))::bigint as output_throughput_p90,
+                          and latency_ms > 0)))::bigint as output_throughput_p90,
                 count(capacity_total_slots)::bigint as capacity_sample_count,
                 round(avg(capacity_used_slots::double precision
                           / nullif(capacity_total_slots, 0)) * 10000)::bigint
@@ -99,7 +99,7 @@ pub(crate) async fn request_metrics(
         .build()
         .fetch_one(pool)
         .await
-        .map_err(|_| postgres_unavailable("load request metrics"))?;
+        .map_err(|source| postgres_unavailable("load request metrics", source))?;
     request_metrics_from_row(&row)
 }
 
@@ -121,7 +121,7 @@ pub(crate) async fn dashboard_totals(pool: &PgPool) -> StoreResult<DashboardTota
         .build()
         .fetch_one(pool)
         .await
-        .map_err(|_| postgres_unavailable("load dashboard totals"))?;
+        .map_err(|source| postgres_unavailable("load dashboard totals", source))?;
     Ok(DashboardTotals {
         request_count: unsigned(&row, "request_count")?,
         input_tokens: unsigned(&row, "input_tokens")?,
@@ -135,18 +135,20 @@ pub(crate) async fn request_metric_series(
     pool: &PgPool,
     range: ObservabilityRange,
     filter: &UsageRecordFilter,
+    granularity: ObservationGranularity,
     timezone: gateway_core::time::DeploymentTimeZone,
 ) -> StoreResult<Vec<RequestMetricPoint>> {
-    request_metric_series_inner(pool, range, filter, true, timezone).await
+    request_metric_series_inner(pool, range, filter, true, granularity, timezone).await
 }
 
 pub(crate) async fn dashboard_request_metric_series(
     pool: &PgPool,
     range: ObservabilityRange,
     filter: &UsageRecordFilter,
+    granularity: ObservationGranularity,
     timezone: gateway_core::time::DeploymentTimeZone,
 ) -> StoreResult<Vec<RequestMetricPoint>> {
-    request_metric_series_inner(pool, range, filter, false, timezone).await
+    request_metric_series_inner(pool, range, filter, false, granularity, timezone).await
 }
 
 async fn request_metric_series_inner(
@@ -154,10 +156,10 @@ async fn request_metric_series_inner(
     range: ObservabilityRange,
     filter: &UsageRecordFilter,
     load_costs: bool,
+    granularity: ObservationGranularity,
     timezone: gateway_core::time::DeploymentTimeZone,
 ) -> StoreResult<Vec<RequestMetricPoint>> {
     filter.validate()?;
-    let granularity = granularity_for(range);
     // 与 request_metrics 同一契约：结果计数覆盖全部请求，用量/延迟/成本
     // 聚合仅统计用量事实
     let fact = completed_usage_fact_predicate("mr");
@@ -220,19 +222,19 @@ async fn request_metric_series_inner(
                   as account_selection_wait_p99_ms,
                 round((percentile_cont(0.10) within group (
                   order by output_tokens::double precision * 1000.0
-                    / greatest(latency_ms - first_token_ms, 1)
+                    / nullif(latency_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > first_token_ms)))::bigint as output_throughput_p10,
+                          and latency_ms > 0)))::bigint as output_throughput_p10,
                 round((percentile_cont(0.50) within group (
                   order by output_tokens::double precision * 1000.0
-                    / greatest(latency_ms - first_token_ms, 1)
+                    / nullif(latency_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > first_token_ms)))::bigint as output_throughput_p50,
+                          and latency_ms > 0)))::bigint as output_throughput_p50,
                 round((percentile_cont(0.90) within group (
                   order by output_tokens::double precision * 1000.0
-                    / greatest(latency_ms - first_token_ms, 1)
+                    / nullif(latency_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > first_token_ms)))::bigint as output_throughput_p90,
+                          and latency_ms > 0)))::bigint as output_throughput_p90,
                 count(capacity_total_slots)::bigint as capacity_sample_count,
                 round(avg(capacity_used_slots::double precision
                           / nullif(capacity_total_slots, 0)) * 10000)::bigint
@@ -259,7 +261,7 @@ async fn request_metric_series_inner(
         .build()
         .fetch_all(pool)
         .await
-        .map_err(|_| postgres_unavailable("load request metric series"))?;
+        .map_err(|source| postgres_unavailable("load request metric series", source))?;
 
     let mut points = BTreeMap::new();
     for row in rows {
@@ -291,13 +293,13 @@ pub(crate) fn calculated_usage_billing_facts(
     pool: &PgPool,
     range: ObservabilityRange,
     filter: UsageRecordFilter,
+    granularity: ObservationGranularity,
     timezone: gateway_core::time::DeploymentTimeZone,
 ) -> futures::stream::BoxStream<'_, StoreResult<CalculatedUsageBillingFact>> {
     use futures::TryStreamExt;
 
     Box::pin(async_stream::try_stream! {
         filter.validate()?;
-        let granularity = granularity_for(range);
         let mut query = QueryBuilder::<Postgres>::new("select ");
         push_metric_bucket(&mut query, range, granularity, timezone)?;
         query.push(
@@ -321,7 +323,7 @@ pub(crate) fn calculated_usage_billing_facts(
         // 费用逐条累加与行顺序无关，避免全量物化和不必要的数据库排序
         let mut rows = query.build().fetch(pool);
         while let Some(row) = rows.try_next().await
-            .map_err(|_| postgres_unavailable("load calculated usage billing facts"))?
+            .map_err(|source| postgres_unavailable("load calculated usage billing facts", source))?
         {
             yield calculated_usage_billing_fact_from_row(&row)?;
         }
@@ -354,7 +356,7 @@ pub(crate) async fn request_costs_by_bucket(
         .build()
         .fetch_all(pool)
         .await
-        .map_err(|_| postgres_unavailable("load request costs by bucket"))?;
+        .map_err(|source| postgres_unavailable("load request costs by bucket", source))?;
     let mut result = BTreeMap::<DateTime<Utc>, Vec<CurrencyCostTotal>>::new();
     for row in rows {
         result
@@ -470,7 +472,7 @@ pub(crate) async fn attempt_metrics(
         .build()
         .fetch_one(pool)
         .await
-        .map_err(|_| postgres_unavailable("load attempt metrics"))?;
+        .map_err(|source| postgres_unavailable("load attempt metrics", source))?;
     Ok(AttemptMetrics {
         attempt_count: unsigned(&row, "attempt_count")?,
         success_count: unsigned(&row, "success_count")?,
@@ -505,7 +507,7 @@ pub(crate) async fn request_costs(
         .build()
         .fetch_all(pool)
         .await
-        .map_err(|_| postgres_unavailable("load request costs"))?
+        .map_err(|source| postgres_unavailable("load request costs", source))?
         .iter()
         .map(cost_from_row)
         .collect()
@@ -537,7 +539,7 @@ pub(crate) async fn provider_observations(
         .build()
         .fetch_all(pool)
         .await
-        .map_err(|_| postgres_unavailable("load provider observations"))?;
+        .map_err(|source| postgres_unavailable("load provider observations", source))?;
     rows.iter()
         .map(|row| {
             Ok(ProviderObservation {
@@ -565,9 +567,9 @@ pub(crate) fn request_metrics_from_row(row: &sqlx::postgres::PgRow) -> StoreResu
         cache_write_tokens: unsigned(row, "cache_write_tokens")?,
         reasoning_tokens: unsigned(row, "reasoning_tokens")?,
         total_tokens: unsigned(row, "total_tokens")?,
-        first_token_latency_sum: unsigned(row, "first_token_latency_sum")?,
+        first_token_latency_sum_ms: unsigned(row, "first_token_latency_sum")?,
         first_token_latency_count: unsigned(row, "first_token_latency_count")?,
-        latency_sum: unsigned(row, "latency_sum")?,
+        latency_sum_ms: unsigned(row, "latency_sum")?,
         latency_count: unsigned(row, "latency_count")?,
         max_latency_ms: optional_unsigned(row, "max_latency_ms")?,
         min_latency_ms: optional_unsigned(row, "min_latency_ms")?,
@@ -615,8 +617,11 @@ pub(crate) fn optional_percentile(
     column: &str,
 ) -> StoreResult<Option<PercentileMilliseconds>> {
     row.try_get::<Option<f64>, _>(column)
-        .map_err(|_| postgres_unavailable("decode latency percentile"))?
-        .map(PercentileMilliseconds::new)
+        .map_err(|source| postgres_unavailable("decode latency percentile", source))?
+        .map(|value| {
+            PercentileMilliseconds::new(value)
+                .map_err(|source| postgres_unavailable("decode latency percentile", source))
+        })
         .transpose()
 }
 
@@ -626,17 +631,6 @@ pub(crate) fn coverage_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<Cost
         calculated_count: unsigned(row, "calculated_count")?,
         unavailable_count: unsigned(row, "unavailable_count")?,
     })
-}
-
-pub(crate) fn granularity_for(range: ObservabilityRange) -> ObservationGranularity {
-    let seconds = range.end.signed_duration_since(range.start).num_seconds();
-    if seconds <= 2 * 24 * 60 * 60 {
-        ObservationGranularity::FifteenMinutes
-    } else if seconds <= 31 * 24 * 60 * 60 {
-        ObservationGranularity::Hour
-    } else {
-        ObservationGranularity::Day
-    }
 }
 
 pub(crate) fn fill_metric_gaps(
@@ -698,7 +692,7 @@ fn push_metric_bucket(
     } else {
         query
             .push("date_bin(")
-            .push_bind(granularity.sql_interval())
+            .push_bind(sql_interval(granularity))
             .push("::interval, mr.started_at, timestamptz '1970-01-01 00:00:00+00')");
     }
     Ok(())
@@ -719,4 +713,12 @@ fn calendar_buckets(
             .ok_or_else(|| invalid("invalid next calendar day"))?;
     }
     Ok(result)
+}
+
+fn sql_interval(granularity: ObservationGranularity) -> &'static str {
+    match granularity {
+        ObservationGranularity::FifteenMinutes => "15 minutes",
+        ObservationGranularity::Hour => "1 hour",
+        ObservationGranularity::Day => "1 day",
+    }
 }

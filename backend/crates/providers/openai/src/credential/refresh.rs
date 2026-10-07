@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use futures::{StreamExt as _, stream};
+use gateway_core::error::ErrorSource;
+
 use gateway_core::account::{
     AccountErrorReason, CredentialState, ProviderAccount, ProviderAccountId, ProviderRefreshQuery,
 };
@@ -93,7 +95,6 @@ fn log_refresh_deferred(
     access_token_expires_at: Option<SystemTime>,
     attempt: u32,
     reason: &'static str,
-    upstream_message: Option<&str>,
     upstream: Option<&RefreshUpstreamFailure>,
     retry_at: SystemTime,
 ) {
@@ -101,11 +102,11 @@ fn log_refresh_deferred(
         account_id = %account_id,
         attempt,
         reason,
-        upstream_message = ?upstream_message,
+
         upstream_status = ?upstream.map(RefreshUpstreamFailure::status),
-        upstream_code = ?upstream.and_then(RefreshUpstreamFailure::code),
-        upstream_type = ?upstream.and_then(RefreshUpstreamFailure::error_type),
-        upstream_body = ?upstream.map(RefreshUpstreamFailure::body),
+
+
+
         retry_at = %DateTime::<Utc>::from(retry_at),
         access_token_expires_at = ?access_token_expires_at.map(DateTime::<Utc>::from),
         recovery_deadline = ?refresh_recovery_deadline(access_token_expires_at)
@@ -191,6 +192,7 @@ pub struct CodexCredentialRefreshService {
     leases: Arc<dyn ProviderLeasePort>,
     credential_state: Arc<dyn ProviderCredentialStatePort>,
     runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
+    diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
 }
 
 impl CodexCredentialRefreshService {
@@ -200,6 +202,7 @@ impl CodexCredentialRefreshService {
         leases: Arc<dyn ProviderLeasePort>,
         credential_state: Arc<dyn ProviderCredentialStatePort>,
         runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
+        diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
     ) -> Self {
         Self {
             repository,
@@ -207,6 +210,7 @@ impl CodexCredentialRefreshService {
             leases,
             credential_state,
             runtime_policy,
+            diagnostics,
         }
     }
 
@@ -237,11 +241,21 @@ impl CodexCredentialRefreshService {
             match result {
                 Ok(outcome) => outcomes.push(outcome),
                 Err(error) => {
-                    tracing::warn!(
-                        account_id = %account_id,
-                        error = %error,
-                        "OpenAI OAuth refresh attempt failed"
+                    let mut failure = gateway_core::diagnostics::OperationalFailure::new(
+                        "oauth",
+                        "scheduled_refresh",
+                        "refresh_storage",
+                        "OpenAI OAuth refresh attempt failed",
                     );
+                    failure.account_id = ProviderAccountId::new(account_id.clone()).ok();
+                    failure.details = gateway_core::error::ErrorDetails::capture(
+                        Some(&ErrorSource::new(error)),
+                        None,
+                        false,
+                    );
+                    if self.diagnostics.record_failure(failure).await.is_err() {
+                        tracing::warn!(account_id = %account_id, "OAuth diagnostic could not be recorded");
+                    }
                     outcomes.push(CodexCredentialRefreshOutcome::Failed { account_id });
                 }
             }
@@ -292,6 +306,15 @@ impl CodexCredentialRefreshService {
             .refresher
             .refresh_with_proxy(refresh_token.expose_secret(), due.account.outbound_proxy())
             .await;
+        if let Err(failure) = &refresh_result {
+            super::diagnostics::record_refresh_failure(
+                self.diagnostics.as_ref(),
+                due.account.id(),
+                "scheduled_refresh",
+                failure,
+            )
+            .await;
+        }
         if recovery_window_exhausted && let Err(failure) = &refresh_result {
             let message = failure.message().map(str::to_owned);
             let upstream = failure.upstream();
@@ -354,7 +377,7 @@ impl CodexCredentialRefreshService {
                 )
                 .await
             }
-            Err(RefreshFailure::RetryableTransport { message }) => {
+            Err(RefreshFailure::RetryableTransport { message, .. }) => {
                 if self
                     .defer_refresh(&due.account, "transport-not-sent", Some(&message), None)
                     .await?
@@ -364,7 +387,9 @@ impl CodexCredentialRefreshService {
                     Ok(CodexCredentialRefreshOutcome::Stale { account_id })
                 }
             }
-            Err(RefreshFailure::Transport { message, upstream }) => {
+            Err(RefreshFailure::Transport {
+                message, upstream, ..
+            }) => {
                 // 上游瞬态（401/429/5xx/超时/畸形响应等）保留现有凭据、
                 // 记录最近一次失败并推进有界退避
                 if self
@@ -393,10 +418,11 @@ impl CodexCredentialRefreshService {
         CodexCredentialRefreshError,
     > {
         let now = SystemTime::now();
-        let provider = ProviderKind::new(PROVIDER_NAME)
-            .map_err(|_| CredentialRepositoryError::InvalidCredentialData)?;
+        let provider = ProviderKind::new(PROVIDER_NAME).map_err(|source| {
+            CredentialRepositoryError::InvalidCredentialData(Some(ErrorSource::new(source)))
+        })?;
         let limit = NonZeroU32::new(MAX_REFRESH_BATCH)
-            .ok_or(CredentialRepositoryError::InvalidCredentialData)?;
+            .ok_or(CredentialRepositoryError::InvalidCredentialData(None))?;
         // 查询窗口按错峰上界（2×margin）放宽，先取回候选超集，
         // 再在内存中按账号稳定偏移收窄；存储层谓词保持通用窗口语义。
         let query = ProviderRefreshQuery::new(
@@ -520,7 +546,7 @@ impl CodexCredentialRefreshService {
                     credential_revision: revision.get(),
                 })
             }
-            Err(CredentialRepositoryError::RevisionConflict) => {
+            Err(CredentialRepositoryError::RevisionConflict(_)) => {
                 Ok(CodexCredentialRefreshOutcome::Stale {
                     account_id: due.account.id().to_string(),
                 })
@@ -544,7 +570,7 @@ impl CodexCredentialRefreshService {
         } = failure;
         match self.repository.load_runtime_credential(account).await {
             Ok(_) => {}
-            Err(CredentialRepositoryError::RevisionConflict) => {
+            Err(CredentialRepositoryError::RevisionConflict(_)) => {
                 return Ok(CodexCredentialRefreshOutcome::Stale {
                     account_id: account.id().to_string(),
                 });
@@ -573,11 +599,11 @@ impl CodexCredentialRefreshService {
                     account_id = %account.id(),
                     ?credential_state,
                     reason,
-                    upstream_message = ?message.as_deref(),
+
                     upstream_status = ?upstream.map(RefreshUpstreamFailure::status),
-                    upstream_code = ?upstream.and_then(RefreshUpstreamFailure::code),
-                    upstream_type = ?upstream.and_then(RefreshUpstreamFailure::error_type),
-                    upstream_body = ?upstream.map(RefreshUpstreamFailure::body),
+
+
+
                     access_token_expires_at = ?account.access_token_expires_at()
                         .map(DateTime::<Utc>::from),
                     recovery_deadline = ?refresh_recovery_deadline(account.access_token_expires_at())
@@ -586,7 +612,7 @@ impl CodexCredentialRefreshService {
                 );
                 Ok(outcome)
             }
-            Err(CredentialRepositoryError::RevisionConflict) => {
+            Err(CredentialRepositoryError::RevisionConflict(_)) => {
                 Ok(CodexCredentialRefreshOutcome::Stale {
                     account_id: account.id().to_string(),
                 })
@@ -634,13 +660,12 @@ impl CodexCredentialRefreshService {
                     account.access_token_expires_at(),
                     attempt,
                     reason,
-                    upstream_message,
                     upstream,
                     retry_at,
                 );
                 Ok(true)
             }
-            Err(CredentialRepositoryError::RevisionConflict) => Ok(false),
+            Err(CredentialRepositoryError::RevisionConflict(_)) => Ok(false),
             Err(error) => Err(error.into()),
         }
     }

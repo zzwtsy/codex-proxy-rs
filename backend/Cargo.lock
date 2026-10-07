@@ -1745,7 +1745,6 @@ dependencies = [
  "futures",
  "futures-timer",
  "http",
- "http-body",
  "http-body-util",
  "semver",
  "serde",
@@ -3270,6 +3269,7 @@ dependencies = [
 name = "provider-openai"
 version = "0.0.0"
 dependencies = [
+ "allocation-counter",
  "async-stream",
  "async-trait",
  "aws-lc-rs",

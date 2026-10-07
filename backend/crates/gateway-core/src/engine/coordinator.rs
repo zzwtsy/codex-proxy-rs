@@ -398,7 +398,7 @@ struct FailureFinalization {
     upstream_status_code: Option<u16>,
     upstream_request_id: Option<String>,
     provider_error_code: Option<String>,
-    raw_upstream_error: Option<String>,
+    error_details: Option<String>,
     retry_after_ms: Option<u64>,
     observation: ModelRequestFailureObservation,
 }
@@ -464,7 +464,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     /// 已发生的换号次数：选中账号与上一 attempt 不同的路由 attempt 计一次。
     /// 首个 attempt 不计；同账号钉选重试（瞬态退避、传输恢复、凭据恢复重放、
     /// continuation 精确重连）不消耗。预算耗尽后所有必然换号的重试门关闭，
-    /// 换号深度由 [`crate::routing::MAX_ACCOUNT_ROTATION_ATTEMPTS`] 封顶。
+    /// 换号深度由请求冻结的调度策略封顶
     account_rotations: u32,
     candidate_index: usize,
     excluded_accounts: BTreeSet<crate::account::ProviderAccountId>,
@@ -521,6 +521,10 @@ where
     /// 当前请求共享的诊断上下文
     pub fn trace(&self) -> TraceContext {
         self.trace.clone()
+    }
+
+    pub(super) fn request_id(&self) -> &ModelRequestId {
+        &self.request_id
     }
 
     /// 读取下一条 canonical event；首条未提交事件会携带 commit 要求
@@ -956,7 +960,7 @@ where
                 upstream_status_code: None,
                 upstream_request_id: None,
                 provider_error_code: None,
-                raw_upstream_error: None,
+                error_details: None,
                 retry_after_ms: None,
                 observation: ModelRequestFailureObservation::default(),
             })
@@ -1026,6 +1030,9 @@ where
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    self.trace
+                        .attempt(self.attempts)
+                        .record_provider_failure(&error);
                     self.finish_provider_error(&error).await?;
                     return Err(provider_engine_error(error));
                 }
@@ -1101,7 +1108,7 @@ where
             ProviderBoundary::Result(result) => match *result {
                 Ok(stream) => stream,
                 Err(error) => {
-                    record_trace_error(&attempt_trace, &error);
+                    attempt_trace.record_provider_failure(&error);
                     let continuation_retry = !error.retry_is_prohibited()
                         && self.prepare_unavailable_native_continuation_replay(&error);
                     let candidate_retry = !error.retry_is_prohibited() && !continuation_retry
@@ -1122,7 +1129,7 @@ where
                         )
                         // 跨 Provider 候选推进必然换号（账号行按 Provider 隔离），
                         // 预算耗尽后不再推进，交回容量类失败的原有终态语义。
-                        && self.account_rotations < crate::routing::MAX_ACCOUNT_ROTATION_ATTEMPTS
+                        && self.account_rotations < self.plan.account_selection_policy().max_account_rotations()
                         && self.advance_provider_candidate();
                     let retryable = self
                         .apply_retry_policy(super::policy::RetryFacts {
@@ -1200,7 +1207,7 @@ where
                 upstream_status_code: None,
                 upstream_request_id: None,
                 provider_error_code: None,
-                raw_upstream_error: None,
+                error_details: None,
                 retry_after_ms: None,
                 observation: ModelRequestFailureObservation::default(),
             })
@@ -1233,7 +1240,7 @@ where
                 upstream_status_code: None,
                 upstream_request_id: None,
                 provider_error_code: None,
-                raw_upstream_error: None,
+                error_details: None,
                 retry_after_ms: None,
                 observation: ModelRequestFailureObservation::default(),
             })
@@ -1256,7 +1263,7 @@ where
                 upstream_status_code: None,
                 upstream_request_id: None,
                 provider_error_code: None,
-                raw_upstream_error: None,
+                error_details: None,
                 retry_after_ms: None,
                 observation: ModelRequestFailureObservation::default(),
             })
@@ -1282,7 +1289,7 @@ where
                 upstream_status_code: None,
                 upstream_request_id: None,
                 provider_error_code: None,
-                raw_upstream_error: None,
+                error_details: None,
                 retry_after_ms: None,
                 observation: ModelRequestFailureObservation::default(),
             })
@@ -1438,7 +1445,9 @@ where
     ) -> Result<StreamErrorOutcome, EngineError> {
         // 原始 wire 只活在 request-local 决策状态；clone、attempt 记录与持久化终态
         // 均只接触已剥离的稳定错误字段
-        record_trace_error(&self.trace.attempt(self.attempts), &error);
+        self.trace
+            .attempt(self.attempts)
+            .record_provider_failure(&error);
         let mut atomic_client_events = error.take_atomic_client_events();
         let current = self.current.take().ok_or(EngineError::NoActiveAttempt)?;
         if self.request_observation.is_some() {
@@ -1596,7 +1605,8 @@ where
             && transient_retry.is_none()
             && transport_recovery.is_none()
             && (ordinary_retry || account_rotation_retry)
-            && self.account_rotations < crate::routing::MAX_ACCOUNT_ROTATION_ATTEMPTS;
+            && self.account_rotations
+                < self.plan.account_selection_policy().max_account_rotations();
         let retryable = !error.retry_is_prohibited()
             && (continuation_retry
                 || same_account_retry
@@ -1839,7 +1849,8 @@ where
             // 两个排除臂都必然换号；预算耗尽后不再排除当前账号做跨账号续写重放，
             // 落回不可重试路径以原始上游错误终态。
             ContinuationAttempt::ReplayOwner | ContinuationAttempt::ReplayAny
-                if self.account_rotations >= crate::routing::MAX_ACCOUNT_ROTATION_ATTEMPTS =>
+                if self.account_rotations
+                    >= self.plan.account_selection_policy().max_account_rotations() =>
             {
                 return false;
             }
@@ -1890,9 +1901,8 @@ where
         {
             return false;
         }
-        // Native 期间所有 attempt 都在 pin 账号上，到这里预算必未耗尽；
-        // 与其余换号路径保持同一预算门，防止状态机演化后破坏换号上限。
-        if self.account_rotations >= crate::routing::MAX_ACCOUNT_ROTATION_ATTEMPTS {
+        // Native 期间仍可能配置为禁止换号，跨账号重放共用请求冻结的预算
+        if self.account_rotations >= self.plan.account_selection_policy().max_account_rotations() {
             return false;
         }
 
@@ -1961,7 +1971,7 @@ where
             diagnostic_trace_json: self.trace.snapshot().map(|value| value.to_string()),
             error: None,
             provider_error_code: None,
-            raw_upstream_error: None,
+            error_details: None,
             failure_observation: ModelRequestFailureObservation::default(),
             retry_after_ms: None,
             usage: self.observation.usage.clone(),
@@ -2002,9 +2012,7 @@ where
             upstream_status_code: error.upstream_status(),
             upstream_request_id: error.upstream_request_id().map(|id| id.as_str().to_owned()),
             provider_error_code: error.upstream_code().map(|code| code.as_str().to_owned()),
-            raw_upstream_error: error
-                .raw_upstream_error()
-                .map(|raw| raw.as_str().to_owned()),
+            error_details: error.error_details(),
             retry_after_ms: error.retry_after().map(duration_ms),
             observation: ModelRequestFailureObservation {
                 continuation_unavailable_reason: error
@@ -2065,7 +2073,7 @@ where
             upstream_status_code: None,
             upstream_request_id: None,
             provider_error_code: None,
-            raw_upstream_error: None,
+            error_details: None,
             retry_after_ms: None,
             observation: ModelRequestFailureObservation::default(),
         })
@@ -2128,7 +2136,7 @@ where
             diagnostic_trace_json: self.trace.snapshot().map(|value| value.to_string()),
             error: Some(finalization.error),
             provider_error_code: finalization.provider_error_code,
-            raw_upstream_error: finalization.raw_upstream_error,
+            error_details: finalization.error_details,
             failure_observation: finalization.observation,
             retry_after_ms: finalization.retry_after_ms,
             usage: self.observation.usage.clone(),
@@ -2488,20 +2496,4 @@ const fn escalate_send_state(a: UpstreamSendState, b: UpstreamSendState) -> Upst
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn record_trace_error(trace: &TraceContext, error: &ProviderError) {
-    trace.record("attempt.failed", json!({
-        "kind": error.kind().as_str(), "sendState": format!("{:?}", error.send_state()),
-        "diagnostic": error.diagnostic().map(|diagnostic| json!({
-            "stage": diagnostic.stage(), "code": diagnostic.code(), "message": diagnostic.as_str(),
-        })),
-        "upstreamStatus": error.upstream_status(),
-        "upstreamRequestId": error.upstream_request_id().map(|id| id.as_str()),
-        "upstreamCode": error.upstream_code().map(|code| code.as_str()),
-        "rawError": error.raw_upstream_error().map(|raw| {
-            let value = serde_json::from_str(raw.as_str()).unwrap_or_else(|_| json!(raw.as_str()));
-            crate::diagnostics::diagnostic_json(&value)
-        }),
-    }));
 }

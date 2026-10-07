@@ -93,15 +93,15 @@ impl ClientAdmissionPort for LocalClientAdmissionPort {
     ) -> BoxFuture<'_, Result<ClientAdmissionDecision, ClientAdmissionError>> {
         Box::pin(async move {
             if request.lease_ttl.is_zero() {
-                return Err(ClientAdmissionError);
+                return Err(ClientAdmissionError(None));
             }
             let now = SystemTime::now();
             let expires_at = now
                 .checked_add(request.lease_ttl)
-                .ok_or(ClientAdmissionError)?;
+                .ok_or(ClientAdmissionError(None))?;
             let cutoff = now
                 .checked_sub(CLIENT_ADMISSION_WINDOW)
-                .ok_or(ClientAdmissionError)?;
+                .ok_or(ClientAdmissionError(None))?;
             let mut state = self.state.lock().await;
             let client_id = request.client_api_key_id.as_str();
             state.prune_client(client_id, now, cutoff);
@@ -142,7 +142,7 @@ impl ClientAdmissionPort for LocalClientAdmissionPort {
             let now = SystemTime::now();
             let cutoff = now
                 .checked_sub(CLIENT_ADMISSION_WINDOW)
-                .ok_or(ClientAdmissionError)?;
+                .ok_or(ClientAdmissionError(None))?;
             let mut state = self.state.lock().await;
             let client_id = client_api_key_id.as_str();
             state.prune_client(client_id, now, cutoff);
@@ -165,12 +165,12 @@ impl ClientAdmissionPort for LocalClientAdmissionPort {
             let now = SystemTime::now();
             let cutoff = now
                 .checked_sub(CLIENT_ADMISSION_WINDOW)
-                .ok_or(ClientAdmissionError)?;
+                .ok_or(ClientAdmissionError(None))?;
             let mut recent_ids = HashSet::with_capacity(recovery.recent_requests.len());
             for request in &recovery.recent_requests {
                 if request.started_at > now || !recent_ids.insert(request.model_request_id.as_str())
                 {
-                    return Err(ClientAdmissionError);
+                    return Err(ClientAdmissionError(None));
                 }
             }
             let mut running_ids = HashSet::with_capacity(recovery.running_requests.len());
@@ -179,7 +179,7 @@ impl ClientAdmissionPort for LocalClientAdmissionPort {
                 .iter()
                 .any(|request| !running_ids.insert(request.model_request_id.as_str()))
             {
-                return Err(ClientAdmissionError);
+                return Err(ClientAdmissionError(None));
             }
 
             let mut state = self.state.lock().await;

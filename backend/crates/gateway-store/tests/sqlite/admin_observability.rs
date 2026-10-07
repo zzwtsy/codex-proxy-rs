@@ -3,11 +3,9 @@ use std::sync::Arc;
 use chrono::{TimeDelta, Utc};
 use futures::TryStreamExt;
 use gateway_admin::{
-    model::{
-        PageSize,
-        observability::{
-            DiagnosticDimension, OpsErrorFilter, OpsErrorQuery, TimeRange, UsageFilter, UsageQuery,
-        },
+    model::observability::{
+        DashboardQuery, DiagnosticDimension, Granularity, ObservabilityPageSize, OpsErrorFilter,
+        OpsErrorQuery, TimeRange, UsageFilter, UsageQuery,
     },
     ports::store::ObservabilityStore,
 };
@@ -107,7 +105,7 @@ async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_erro
     let store = SqliteAdminObservabilityStore::new(pool.clone(), cooldowns);
 
     let dashboard = store
-        .dashboard_summary(range, now)
+        .dashboard_summary(DashboardQuery::new(range), now)
         .await
         .expect("dashboard summary");
     assert_eq!(dashboard.totals.request_count, 3);
@@ -132,7 +130,7 @@ async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_erro
                 ..UsageFilter::default()
             },
             current_page: 1,
-            page_size: PageSize::new(20).expect("valid page size"),
+            page_size: ObservabilityPageSize::new(20).expect("valid page size"),
         })
         .await
         .expect("usage page with prefix search");
@@ -148,7 +146,7 @@ async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_erro
     );
 
     let usage_trend = store
-        .usage_trend(range, UsageFilter::default())
+        .usage_trend(range, UsageFilter::default(), Granularity::for_range(range))
         .await
         .expect("usage trend with precise currency totals");
     let usd_total = usage_trend
@@ -158,7 +156,11 @@ async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_erro
         .expect("USD cost bucket");
     assert_eq!(usd_total.amount.to_string(), "0.3000000003");
 
-    let mut billing_facts = store.usage_calculated_billing_facts(range, UsageFilter::default());
+    let mut billing_facts = store.usage_calculated_billing_facts(
+        range,
+        UsageFilter::default(),
+        Granularity::for_range(range),
+    );
     let calculated_fact = billing_facts
         .try_next()
         .await
@@ -186,7 +188,12 @@ async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_erro
     assert_eq!(overview.providers[0].request_count, 2);
 
     let diagnostics = store
-        .usage_diagnostics(range, UsageFilter::default(), DiagnosticDimension::Provider)
+        .usage_diagnostics(
+            range,
+            UsageFilter::default(),
+            DiagnosticDimension::Provider,
+            20,
+        )
         .await
         .expect("provider diagnostics");
     assert_eq!(diagnostics.total_request_count, 3);
@@ -204,7 +211,7 @@ async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_erro
             range,
             filter: OpsErrorFilter::default(),
             current_page: 1,
-            page_size: PageSize::new(20).expect("valid page size"),
+            page_size: ObservabilityPageSize::new(20).expect("valid page size"),
         })
         .await
         .expect("ops errors");
@@ -361,7 +368,12 @@ async fn sqlite_account_diagnostics_include_non_oauth_and_unrouted_requests() {
         Arc::new(SqliteProviderCooldownRepository::new(pool.clone()));
     let store = SqliteAdminObservabilityStore::new(pool.clone(), cooldowns);
     let diagnostics = store
-        .usage_diagnostics(range, UsageFilter::default(), DiagnosticDimension::Account)
+        .usage_diagnostics(
+            range,
+            UsageFilter::default(),
+            DiagnosticDimension::Account,
+            20,
+        )
         .await
         .expect("account diagnostics");
 
@@ -403,6 +415,7 @@ async fn sqlite_account_diagnostics_include_non_oauth_and_unrouted_requests() {
             range,
             UsageFilter::default(),
             DiagnosticDimension::AccountApiKey,
+            20,
         )
         .await
         .expect("OpenAI OAuth account-key diagnostics");

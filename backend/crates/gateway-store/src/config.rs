@@ -90,6 +90,7 @@ impl StorePoolConfig {
     pub(crate) fn validate(&self) -> StoreResult<()> {
         if self.max_connections < 2 || self.acquire_timeout_seconds == 0 {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "store config",
                 message:
                     "pool.max_connections must be at least 2 and acquire timeout must be positive"
@@ -131,6 +132,7 @@ impl StoreConfig {
     pub fn resolve_and_validate(&mut self, runtime_data_dir: &Path) -> StoreResult<()> {
         if runtime_data_dir.as_os_str().is_empty() {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "store config",
                 message: "runtime_data_dir must not be empty".to_owned(),
             });
@@ -147,6 +149,7 @@ impl StoreConfig {
             .to_path_buf();
         if self.backup_staging_dir.as_os_str().is_empty() {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "store config",
                 message: "runtime_data_dir was not resolved".to_owned(),
             });
@@ -259,6 +262,7 @@ impl StoreConfig {
 pub(crate) fn optional_environment_value(name: &'static str) -> StoreResult<Option<String>> {
     match optional_environment_value_allow_empty(name)? {
         Some(value) if value.trim().is_empty() => Err(StoreError::InvalidData {
+            source: None,
             entity: "store config",
             message: format!("environment variable {name} is empty"),
         }),
@@ -271,6 +275,7 @@ fn optional_environment_value_allow_empty(name: &'static str) -> StoreResult<Opt
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidData {
+            source: None,
             entity: "store config",
             message: format!("environment variable {name} is not Unicode"),
         }),
@@ -314,6 +319,7 @@ fn invalid_store_config(message: &'static str) -> StoreError {
     StoreError::InvalidData {
         entity: "store config",
         message: message.to_owned(),
+        source: None,
     }
 }
 
@@ -342,6 +348,7 @@ impl StoreConnectionConfig {
         require_nonempty("store config", field, &self.url)?;
         if password_required && self.password.is_empty() {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "store config",
                 message: format!("{field}.password must not be empty"),
             });
@@ -351,11 +358,13 @@ impl StoreConnectionConfig {
 
     fn connection_url(&self, field: &'static str) -> StoreResult<String> {
         let mut url = url::Url::parse(&self.url).map_err(|_| StoreError::InvalidData {
+            source: None,
             entity: "store config",
             message: format!("{field}.url is invalid"),
         })?;
         if url.password().is_some() {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "store config",
                 message: format!("{field}.url must not contain a password"),
             });
@@ -363,6 +372,7 @@ impl StoreConnectionConfig {
         if !self.password.is_empty() {
             url.set_password(Some(&self.password))
                 .map_err(|()| StoreError::InvalidData {
+                    source: None,
                     entity: "store config",
                     message: format!("{field}.url cannot carry credentials"),
                 })?;

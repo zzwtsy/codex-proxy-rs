@@ -89,7 +89,7 @@ return current
         .arg(expiry)
         .invoke_async(&mut self.connection.clone())
         .await
-        .map_err(|_| redis_unavailable("renew authentication session"))?;
+        .map_err(|source| redis_unavailable("renew authentication session", source))?;
         payload.map(|value| decode_session(&value)).transpose()
     }
 
@@ -100,7 +100,7 @@ return current
             .arg(key)
             .query_async::<Option<String>>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("load authentication session"))?;
+            .map_err(|source| redis_unavailable("load authentication session", source))?;
         payload.map(|value| decode_session(&value)).transpose()
     }
 
@@ -121,7 +121,7 @@ return current
             .arg(expires_at_millis)
             .query_async::<String>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("store authentication session"))?;
+            .map_err(|source| redis_unavailable("store authentication session", source))?;
         Ok(())
     }
 
@@ -132,7 +132,7 @@ return current
             .arg(key)
             .query_async::<Option<String>>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("delete authentication session"))?;
+            .map_err(|source| redis_unavailable("delete authentication session", source))?;
         payload.map(|value| decode_session(&value)).transpose()
     }
 
@@ -160,7 +160,7 @@ return current
             .arg(window_millis)
             .invoke_async(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("rate limit authentication login"))?;
+            .map_err(|source| redis_unavailable("rate limit authentication login", source))?;
         if retry_after_millis <= 0 {
             Ok(None)
         } else {
@@ -212,6 +212,7 @@ fn decode_session(value: &str) -> StoreResult<AuthSessionRecord> {
 
 fn auth_invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "authentication state",
         message: message.to_owned(),
     }

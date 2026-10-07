@@ -11,7 +11,7 @@ use gateway_admin::{
 };
 
 use crate::{
-    AccountRuntimeStateRepository, AccountRuntimeStoreAdapter, CredentialLeaseRepository,
+    AccountRuntimeSignalRepository, AccountRuntimeStateRepository, AccountRuntimeStoreAdapter,
     StoreResult,
 };
 
@@ -33,10 +33,27 @@ impl RedisAdminAccountRuntimeStore {
         leases: RedisCredentialLeaseRepository,
     ) -> Self {
         let state: Arc<dyn AccountRuntimeStateRepository> = Arc::new(cooldowns);
-        let leases: Arc<dyn CredentialLeaseRepository> = Arc::new(leases);
+        let leases: Arc<dyn AccountRuntimeSignalRepository> = Arc::new(leases);
         Self {
             inner: AccountRuntimeStoreAdapter::new(state, leases),
         }
+    }
+}
+
+#[async_trait]
+impl AccountRuntimeSignalRepository for RedisCredentialLeaseRepository {
+    async fn credential_runtime_signals(
+        &self,
+        account_ids: &[String],
+    ) -> StoreResult<Vec<(String, u32)>> {
+        super::CredentialLeaseRepository::credential_runtime_signals(self, account_ids)
+            .await
+            .map(|signals| {
+                signals
+                    .into_iter()
+                    .map(|signal| (signal.resource_id, signal.in_flight))
+                    .collect()
+            })
     }
 }
 

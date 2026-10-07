@@ -320,7 +320,12 @@ impl CodexProvider {
         );
         if !context.is_diagnostic_required_account() {
             self.selector
-                .validate_translated_selection(&mut lease, session_affinity.as_ref(), None)
+                .validate_translated_selection(
+                    &mut lease,
+                    session_affinity.as_ref(),
+                    None,
+                    context.account_selection_policy(),
+                )
                 .await
                 .map_err(map_selection_error)?;
         }
@@ -361,10 +366,8 @@ impl CodexProvider {
             client: self
                 .client_for_request(&context)?
                 .for_account(lease.account())
-                .map_err(|_| {
-                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-                })?
-                .with_authentication(lease.authentication())
+                .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?
+                .with_responses_api_base_url(lease.authentication().responses_api_base_url())
                 .with_middleware_headers(middleware_headers),
             registry: Arc::clone(&self.live_registry),
             response_origin: self.live_calls_url.clone(),

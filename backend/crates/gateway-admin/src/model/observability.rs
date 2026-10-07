@@ -1,10 +1,32 @@
 //! 用量、成本、健康与错误诊断的 UTC 语义事实
 
-use std::str::FromStr;
+use std::{num::NonZeroU16, str::FromStr};
 
 use chrono::{DateTime, Days, NaiveDate, TimeDelta, Utc};
 
-use super::{AdminModelError, PageSize};
+use super::AdminModelError;
+
+/// 观测记录查询的页大小，由 HTTP、管理用例和存储端口共同使用
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservabilityPageSize(NonZeroU16);
+
+impl ObservabilityPageSize {
+    pub const MAX: u16 = 100;
+
+    pub fn new(value: u16) -> Result<Self, AdminModelError> {
+        if value > Self::MAX {
+            return Err(AdminModelError::InvalidObservabilityPageSize(value));
+        }
+        NonZeroU16::new(value)
+            .map(Self)
+            .ok_or(AdminModelError::InvalidObservabilityPageSize(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
 
 /// 页面筛选表达自然日范围，具体 UTC 边界由部署时区解析
 #[derive(Debug, Clone, Copy)]
@@ -178,7 +200,33 @@ pub struct UsageQuery {
     pub range: TimeRange,
     pub filter: UsageFilter,
     pub current_page: u32,
-    pub page_size: PageSize,
+    pub page_size: ObservabilityPageSize,
+}
+
+/// Admin 确定概览的数量、趋势粒度及最近请求筛选，Store 只执行该选择
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardQuery {
+    pub range: TimeRange,
+    pub granularity: Granularity,
+    pub account_limit: u16,
+    pub recent_request_limit: u16,
+    pub recent_request_filter: UsageFilter,
+}
+
+impl DashboardQuery {
+    #[must_use]
+    pub fn new(range: TimeRange) -> Self {
+        Self {
+            range,
+            granularity: Granularity::for_range(range),
+            account_limit: 4,
+            recent_request_limit: 10,
+            recent_request_filter: UsageFilter {
+                outcome: Some(RequestOutcome::Succeeded),
+                ..UsageFilter::default()
+            },
+        }
+    }
 }
 
 /// 运维错误过滤条件
@@ -204,7 +252,7 @@ pub struct OpsErrorQuery {
     pub range: TimeRange,
     pub filter: OpsErrorFilter,
     pub current_page: u32,
-    pub page_size: PageSize,
+    pub page_size: ObservabilityPageSize,
 }
 
 /// 用量诊断维度
@@ -247,7 +295,7 @@ impl DecimalAmount {
     }
 
     fn from_decimal(value: gateway_core::metering::Decimal) -> Option<Self> {
-        Some(Self(value.canonical()))
+        Self::from_str(&value.canonical()).ok()
     }
 }
 
@@ -482,6 +530,30 @@ pub enum Granularity {
     Day,
 }
 
+impl Granularity {
+    /// 管理趋势按范围选择粒度，费用校验与请求指标必须使用同一策略
+    #[must_use]
+    pub fn for_range(range: TimeRange) -> Self {
+        let seconds = range.end.signed_duration_since(range.start).num_seconds();
+        if seconds <= 2 * 24 * 60 * 60 {
+            Self::FifteenMinutes
+        } else if seconds <= 31 * 24 * 60 * 60 {
+            Self::Hour
+        } else {
+            Self::Day
+        }
+    }
+
+    #[must_use]
+    pub const fn seconds(self) -> i64 {
+        match self {
+            Self::FifteenMinutes => 15 * 60,
+            Self::Hour => 60 * 60,
+            Self::Day => 24 * 60 * 60,
+        }
+    }
+}
+
 /// 一段时间桶内的请求指标
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestMetricPoint {
@@ -493,7 +565,7 @@ pub struct RequestMetricPoint {
 }
 
 /// 账号池的统一五态统计
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountPoolMetrics {
     pub total: u64,
     pub normal: u64,
@@ -503,9 +575,9 @@ pub struct AccountPoolMetrics {
     pub error: u64,
 }
 
-/// Dashboard 中一个账号的模型级用量事实
+/// 账号在查询时间范围内的模型级用量事实
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DashboardAccountModelUsage {
+pub struct AccountModelUsage {
     pub model: String,
     pub request_count: u64,
     pub success_count: u64,
@@ -524,9 +596,9 @@ pub struct DashboardAccountModelUsage {
     pub last_used_at: DateTime<Utc>,
 }
 
-/// Dashboard 中账号的单小时请求数
+/// 账号在单小时窗口内的请求数
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DashboardAccountRequestBucket {
+pub struct AccountRequestBucket {
     pub bucket_start: DateTime<Utc>,
     pub request_count: u64,
 }
@@ -557,14 +629,14 @@ pub struct DashboardAccountUsage {
     pub cost_coverage: CostCoverage,
     pub costs: Vec<CurrencyCost>,
     pub last_used_at: Option<DateTime<Utc>>,
-    pub request_buckets: Vec<DashboardAccountRequestBucket>,
+    pub request_buckets: Vec<AccountRequestBucket>,
     /// Provider 已持久化额度窗口投影出的代表性已用比例
     ///
     /// `None` 表示上游未提供可比较的百分比，不应伪造为零
     pub quota_used_percent: Option<f64>,
     /// Provider 返回的代表窗口；缺失时保留未知语义
     pub quota_window: Option<super::provider_credentials::ProviderQuotaWindow>,
-    pub models: Vec<DashboardAccountModelUsage>,
+    pub models: Vec<AccountModelUsage>,
 }
 
 /// Dashboard 当前账号池的可重建运行时槽位事实
@@ -579,7 +651,7 @@ pub struct DashboardRuntimeSlots {
 }
 
 /// 仪表盘卡片脚注展示的全历史累计
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DashboardTotals {
     pub request_count: u64,
     pub input_tokens: u64,
@@ -594,6 +666,7 @@ pub struct DashboardObservation {
     pub range: TimeRange,
     pub totals: DashboardTotals,
     pub provider_accounts: AccountPoolMetrics,
+    pub runtime_slots: Option<DashboardRuntimeSlots>,
     pub trend: Vec<RequestMetricPoint>,
     pub account_usage: Vec<DashboardAccountUsage>,
     pub recent_requests: Vec<UsageListRecord>,
@@ -882,7 +955,7 @@ pub struct OpsError {
     pub upstream_request_id: Option<String>,
     pub latency_ms: Option<u64>,
     pub message: String,
-    pub raw_upstream_error: Option<String>,
+    pub error_details: Option<String>,
     pub client_ip: Option<String>,
     pub user_agent: Option<String>,
     pub reasoning_effort: Option<String>,

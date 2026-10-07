@@ -23,11 +23,13 @@ impl ObservabilityQueryBudget {
     pub fn try_new(max_connections: u32, wait_timeout: Duration) -> StoreResult<Self> {
         if max_connections == 0 || wait_timeout.is_zero() {
             return Err(StoreError::InvalidData {
+                source: None,
                 entity: "observability query budget",
                 message: "requires a positive connection count and wait timeout".to_owned(),
             });
         }
         let permits = usize::try_from(max_connections).map_err(|_| StoreError::InvalidData {
+            source: None,
             entity: "observability query budget",
             message: "connection budget does not fit this platform".to_owned(),
         })?;
@@ -101,11 +103,12 @@ impl ObservabilityQueryBudget {
                 );
                 Ok(permit)
             }
-            Ok(Err(_)) => Err(StoreError::Unavailable {
+            Ok(Err(source)) => Err(StoreError::Unavailable {
                 backend: StoreBackend::PostgreSql,
                 message: "observability PostgreSQL connection budget is closed".to_owned(),
+                source: Some(gateway_core::error::ErrorSource::new(source)),
             }),
-            Err(_) => {
+            Err(source) => {
                 tracing::warn!(
                     query_class = "observability",
                     operation,
@@ -116,6 +119,7 @@ impl ObservabilityQueryBudget {
                 Err(StoreError::Unavailable {
                     backend: StoreBackend::PostgreSql,
                     message: "observability PostgreSQL connection budget is exhausted".to_owned(),
+                    source: Some(gateway_core::error::ErrorSource::new(source)),
                 })
             }
         }

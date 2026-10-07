@@ -1,15 +1,10 @@
 //! 查询模型、校验与观测端口契约
 
 use super::*;
-use futures::stream::BoxStream;
 
-pub(crate) const MAX_PAGE_SIZE: u16 = 100;
 pub(crate) const MAX_FILTER_BYTES: usize = 256;
 pub(crate) const MAX_SEARCH_BYTES: usize = 512;
 pub(crate) const MAX_ACCOUNT_IDS: usize = 200;
-/// 概览卡只展示最近使用的四个账号；完整账号用量由账号管理页单独查询
-pub(crate) const DASHBOARD_ACCOUNT_LIMIT: u16 = 4;
-pub(crate) const DIAGNOSTIC_LIMIT: i64 = 100;
 pub(crate) const ACCOUNT_USAGE_TIMELINE_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,22 +22,7 @@ impl ObservabilityRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObservabilityPageSize(u16);
-
-impl ObservabilityPageSize {
-    pub fn new(value: u16) -> StoreResult<Self> {
-        if value == 0 || value > MAX_PAGE_SIZE {
-            return Err(invalid("page size must be between 1 and 100"));
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u16 {
-        self.0
-    }
-}
+pub use gateway_admin::model::observability::ObservabilityPageSize;
 
 pub(crate) fn observability_page_offset(
     current_page: u32,
@@ -120,57 +100,44 @@ pub struct UsageRecordQuery {
     pub page_size: ObservabilityPageSize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OpsErrorFilter {
-    pub client_api_key_ref: Option<String>,
-    pub request_id: Option<String>,
-    pub provider_account_ref: Option<String>,
-    pub provider_kind: Option<String>,
-    pub operation: Option<String>,
-    pub model: Option<String>,
-    pub transport: Option<String>,
-    pub attempt_index: Option<u32>,
-    pub response_id: Option<String>,
-    pub upstream_request_id: Option<String>,
-    pub status_code: Option<u16>,
-    pub search: Option<String>,
-}
+pub use gateway_admin::model::observability::OpsErrorFilter;
 
-impl OpsErrorFilter {
-    pub fn validate(&self) -> StoreResult<()> {
-        for (value, field) in [
-            (self.client_api_key_ref.as_deref(), "client API key filter"),
-            (self.request_id.as_deref(), "request ID filter"),
-            (
-                self.provider_account_ref.as_deref(),
-                "provider account filter",
-            ),
-            (self.provider_kind.as_deref(), "provider filter"),
-            (self.operation.as_deref(), "operation filter"),
-            (self.model.as_deref(), "model filter"),
-            (self.transport.as_deref(), "transport filter"),
-            (
-                self.upstream_request_id.as_deref(),
-                "upstream request ID filter",
-            ),
-        ] {
-            validate_optional_text(value, MAX_FILTER_BYTES, field)?;
-        }
-        validate_optional_text(self.search.as_deref(), MAX_SEARCH_BYTES, "search filter")?;
-        if self
-            .status_code
-            .is_some_and(|status| !(100..=599).contains(&status))
-        {
-            return Err(invalid("status code filter must be between 100 and 599"));
-        }
-        if self
-            .attempt_index
-            .is_some_and(|index| index == 0 || i32::try_from(index).is_err())
-        {
-            return Err(invalid("attempt index filter is out of range"));
-        }
-        Ok(())
+pub(crate) fn validate_ops_error_filter(filter: &OpsErrorFilter) -> StoreResult<()> {
+    for (value, field) in [
+        (
+            filter.client_api_key_ref.as_deref(),
+            "client API key filter",
+        ),
+        (filter.request_id.as_deref(), "request ID filter"),
+        (
+            filter.provider_account_ref.as_deref(),
+            "provider account filter",
+        ),
+        (filter.provider_kind.as_deref(), "provider filter"),
+        (filter.operation.as_deref(), "operation filter"),
+        (filter.model.as_deref(), "model filter"),
+        (filter.transport.as_deref(), "transport filter"),
+        (
+            filter.upstream_request_id.as_deref(),
+            "upstream request ID filter",
+        ),
+    ] {
+        validate_optional_text(value, MAX_FILTER_BYTES, field)?;
     }
+    validate_optional_text(filter.search.as_deref(), MAX_SEARCH_BYTES, "search filter")?;
+    if filter
+        .status_code
+        .is_some_and(|status| !(100..=599).contains(&status))
+    {
+        return Err(invalid("status code filter must be between 100 and 599"));
+    }
+    if filter
+        .attempt_index
+        .is_some_and(|index| index == 0 || i32::try_from(index).is_err())
+    {
+        return Err(invalid("attempt index filter is out of range"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,23 +148,9 @@ pub struct OpsErrorQuery {
     pub page_size: ObservabilityPageSize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticDimension {
-    Provider,
-    Model,
-    Account,
-    ApiKey,
-    AccountApiKey,
-    Transport,
-    Failure,
-    Status,
-}
+pub use gateway_admin::model::observability::DiagnosticDimension;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CurrencyCostTotal {
-    pub currency: String,
-    pub amount: DecimalAmount,
-}
+pub use gateway_admin::model::observability::CurrencyCost as CurrencyCostTotal;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CostCoverage {
@@ -206,83 +159,9 @@ pub struct CostCoverage {
     pub unavailable_count: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RequestMetrics {
-    pub request_count: u64,
-    pub success_count: u64,
-    pub failure_count: u64,
-    pub cancelled_count: u64,
-    pub incomplete_count: u64,
-    pub caller_error_count: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub total_tokens: u64,
-    pub first_token_latency_sum: u64,
-    pub first_token_latency_count: u64,
-    pub latency_sum: u64,
-    pub latency_count: u64,
-    pub max_latency_ms: Option<u64>,
-    pub min_latency_ms: Option<u64>,
-    /// 分母：`input_tokens is not null`，即上游确实报告过 input token 事实的请求
-    pub cache_eligible_request_count: u64,
-    /// 分子：分母集合中 `cached_tokens > 0` 的请求
-    pub cache_hit_request_count: u64,
-    pub latency_percentiles: LatencyPercentiles,
-    pub first_token_latency_percentiles: LatencyPercentiles,
-    pub admission_decision_count: u64,
-    pub admission_decision_percentiles: LatencyPercentiles,
-    pub account_selection_wait_count: u64,
-    pub account_selection_wait_percentiles: LatencyPercentiles,
-    pub output_throughput_p10: Option<u64>,
-    pub output_throughput_p50: Option<u64>,
-    pub output_throughput_p90: Option<u64>,
-    pub capacity_sample_count: u64,
-    pub capacity_utilization_avg_basis_points: Option<u64>,
-    pub capacity_utilization_p95_basis_points: Option<u64>,
-}
+pub use gateway_admin::model::observability::RequestMetrics;
 
-impl RequestMetrics {
-    /// 请求级 cache hit rate；没有 input token 事实时返回 `None`
-    #[must_use]
-    pub fn cache_hit_request_rate(&self) -> Option<f64> {
-        (self.cache_eligible_request_count > 0)
-            .then(|| self.cache_hit_request_count as f64 / self.cache_eligible_request_count as f64)
-    }
-}
-
-/// PostgreSQL `percentile_cont` 的非负、有限毫秒值；bits 保留插值小数且可安全比较
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PercentileMilliseconds(u64);
-
-impl PercentileMilliseconds {
-    pub(crate) fn new(value: f64) -> StoreResult<Self> {
-        if !value.is_finite() || value < 0.0 {
-            return Err(postgres_unavailable("decode latency percentile"));
-        }
-        Ok(Self(value.to_bits()))
-    }
-
-    #[must_use]
-    pub const fn as_f64(self) -> f64 {
-        f64::from_bits(self.0)
-    }
-}
-
-impl std::fmt::Debug for PercentileMilliseconds {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_f64().fmt(formatter)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LatencyPercentiles {
-    pub p50_ms: Option<PercentileMilliseconds>,
-    pub p95_ms: Option<PercentileMilliseconds>,
-    pub p99_ms: Option<PercentileMilliseconds>,
-}
+pub use gateway_admin::model::observability::{LatencyPercentiles, PercentileMilliseconds};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttemptMetrics {
@@ -298,31 +177,7 @@ pub struct AttemptMetrics {
     pub costs: Vec<CurrencyCostTotal>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservationGranularity {
-    FifteenMinutes,
-    Hour,
-    Day,
-}
-
-impl ObservationGranularity {
-    #[must_use]
-    pub const fn seconds(self) -> i64 {
-        match self {
-            Self::FifteenMinutes => 15 * 60,
-            Self::Hour => 60 * 60,
-            Self::Day => 24 * 60 * 60,
-        }
-    }
-
-    pub(crate) const fn sql_interval(self) -> &'static str {
-        match self {
-            Self::FifteenMinutes => "15 minutes",
-            Self::Hour => "1 hour",
-            Self::Day => "1 day",
-        }
-    }
-}
+pub use gateway_admin::model::observability::Granularity as ObservationGranularity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestMetricPoint {
@@ -348,21 +203,9 @@ pub struct CalculatedUsageBillingFact {
     pub total: CurrencyCostTotal,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProviderAccountMetrics {
-    pub total: u64,
-    pub normal: u64,
-    pub quota_exhausted: u64,
-    pub rate_limited: u64,
-    pub disabled: u64,
-    pub error: u64,
-}
+pub use gateway_admin::model::observability::AccountPoolMetrics as ProviderAccountMetrics;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderAccountRequestBucket {
-    pub bucket_start: DateTime<Utc>,
-    pub request_count: u64,
-}
+pub use gateway_admin::model::observability::AccountRequestBucket as ProviderAccountRequestBucket;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountUsageObservation {
@@ -464,215 +307,31 @@ impl ProviderAccountUsageQuery {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DashboardTotals {
-    pub request_count: u64,
-    pub input_tokens: u64,
-    pub cached_tokens: u64,
-    pub total_tokens: u64,
-    pub billing_usd: Option<DecimalAmount>,
-}
+pub use gateway_admin::model::observability::DashboardTotals;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardObservation {
     pub range: ObservabilityRange,
     pub totals: DashboardTotals,
     pub provider_accounts: ProviderAccountMetrics,
+    pub runtime_slots: admin_observability::DashboardRuntimeSlots,
     pub trend: Vec<RequestMetricPoint>,
     pub account_usage: Vec<ProviderAccountUsageObservation>,
     pub recent_requests: Vec<UsageListRecord>,
 }
 
 /// 使用记录列表所需的窄投影；完整执行、路由和客户端详情按 ID 单独读取
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageListRecord {
-    pub client_api_key_name: Option<String>,
-    pub billing_snapshot_json: Option<serde_json::Value>,
-    pub id: String,
-    pub endpoint: String,
-    pub client_transport: String,
-    pub requested_model_id: Option<String>,
-    pub provider_kind: Option<String>,
-    pub provider_account_ref: Option<String>,
-    pub provider_account_name: Option<String>,
-    pub provider_account_email: Option<String>,
-    pub provider_account_notes: Option<String>,
-    pub provider_account_plan_type: Option<String>,
-    pub provider_account_authentication_kind: Option<String>,
-    pub upstream_model_id: Option<String>,
-    pub upstream_transport: Option<String>,
-    pub upstream_response_model: Option<String>,
-    pub service_tier: Option<String>,
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub cached_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
-    pub reasoning_tokens: Option<u64>,
-    pub image_input_tokens: Option<u64>,
-    pub image_output_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-    pub cost_source: String,
-    pub cost_amount: Option<DecimalAmount>,
-    pub cost_currency: Option<String>,
-    pub transport_decision_wait_ms: Option<u64>,
-    pub connect_ms: Option<u64>,
-    pub headers_ms: Option<u64>,
-    pub first_event_ms: Option<u64>,
-    pub first_reasoning_ms: Option<u64>,
-    pub first_text_ms: Option<u64>,
-    pub first_token_ms: Option<u64>,
-    pub provider_processing_ms: Option<u64>,
-    pub latency_ms: Option<u64>,
-    pub admission_decision_ms: Option<u64>,
-    pub account_selection_wait_ms: Option<u64>,
-    pub capacity_used_slots: Option<u64>,
-    pub capacity_total_slots: Option<u64>,
-    pub client_ip: Option<String>,
-    pub user_agent: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub reasoning_preset: Option<String>,
-    pub subagent_kind: Option<String>,
-    pub compact: bool,
-    pub started_at: DateTime<Utc>,
-}
+pub use gateway_admin::model::observability::UsageListRecord;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageRecord {
-    pub billing_snapshot_json: Option<serde_json::Value>,
-    pub id: String,
-    pub client_api_key_ref: String,
-    pub config_revision: u64,
-    pub routing_scope: String,
-    pub routing_group_refs: Vec<String>,
-    pub routing_group_names_snapshot: Vec<String>,
-    pub protocol: String,
-    pub operation: String,
-    pub endpoint: String,
-    pub client_transport: String,
-    pub requested_model_id: Option<String>,
-    pub provider_kind: Option<String>,
-    pub provider_account_ref: Option<String>,
-    pub provider_account_name: Option<String>,
-    pub provider_account_email: Option<String>,
-    pub provider_account_authentication_kind: Option<String>,
-    pub upstream_model_id: Option<String>,
-    pub upstream_transport: Option<String>,
-    pub http_version: Option<String>,
-    pub websocket_pool: Option<String>,
-    pub upstream_response_model: Option<String>,
-    pub service_tier: Option<String>,
-    pub provider_metadata_json: Option<String>,
-    pub attempt_count: u32,
-    pub upstream_send_state: String,
-    pub downstream_committed_at: Option<DateTime<Utc>>,
-    pub outcome: String,
-    pub client_status_code: Option<u16>,
-    pub upstream_status_code: Option<u16>,
-    pub client_response_id: Option<String>,
-    pub upstream_request_id: Option<String>,
-    pub upstream_response_id: Option<String>,
-    pub error_kind: Option<String>,
-    pub provider_error_code: Option<String>,
-    pub error_message: Option<String>,
-    pub retry_after_ms: Option<u64>,
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub cached_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
-    pub reasoning_tokens: Option<u64>,
-    pub image_input_tokens: Option<u64>,
-    pub image_output_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-    pub cost_source: String,
-    pub cost_amount: Option<DecimalAmount>,
-    pub cost_currency: Option<String>,
-    pub transport_decision_wait_ms: Option<u64>,
-    pub connect_ms: Option<u64>,
-    pub headers_ms: Option<u64>,
-    pub first_event_ms: Option<u64>,
-    pub first_reasoning_ms: Option<u64>,
-    pub first_text_ms: Option<u64>,
-    pub first_token_ms: Option<u64>,
-    pub provider_processing_ms: Option<u64>,
-    pub latency_ms: Option<u64>,
-    pub admission_decision_ms: Option<u64>,
-    pub account_selection_wait_ms: Option<u64>,
-    pub capacity_used_slots: Option<u64>,
-    pub capacity_total_slots: Option<u64>,
-    pub client_ip: Option<String>,
-    pub user_agent: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub reasoning_preset: Option<String>,
-    pub request_kind: Option<String>,
-    pub subagent_kind: Option<String>,
-    pub compact: bool,
-    pub image_generation_requested: bool,
-    pub image_generation_succeeded: Option<bool>,
-    pub started_at: DateTime<Utc>,
-    pub deadline_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-}
+pub use gateway_admin::model::observability::UsageRecord;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageRecordPage {
-    pub items: Vec<UsageListRecord>,
-    pub current_page: u32,
-    pub page_size: u16,
-    pub total: u64,
-}
+pub use gateway_admin::model::observability::UsagePage as UsageRecordPage;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageAttemptObservation {
-    pub source: String,
-    pub id: String,
-    pub attempt_index: u32,
-    pub component: String,
-    pub operation: String,
-    pub provider_kind: Option<String>,
-    pub provider_account_ref: Option<String>,
-    pub provider_account_name: Option<String>,
-    pub provider_account_email: Option<String>,
-    pub provider_account_authentication_kind: Option<String>,
-    pub upstream_model_id: Option<String>,
-    pub upstream_transport: Option<String>,
-    pub upstream_send_state: Option<String>,
-    pub outcome: String,
-    pub downstream_committed: bool,
-    pub status_code: Option<u16>,
-    pub provider_error_code: Option<String>,
-    pub failure_kind: Option<String>,
-    pub retry_after_ms: Option<u64>,
-    pub upstream_request_id: Option<String>,
-    pub latency_ms: Option<u64>,
-    pub message: Option<String>,
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub cached_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
-    pub reasoning_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-    pub cost_source: Option<String>,
-    pub cost_amount: Option<DecimalAmount>,
-    pub cost_currency: Option<String>,
-    pub occurred_at: DateTime<Utc>,
-}
+pub use gateway_admin::model::observability::UsageAttempt as UsageAttemptObservation;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageRecordDetail {
-    pub trace: Option<serde_json::Value>,
-    pub related_requests: Vec<serde_json::Value>,
-    pub request: UsageRecord,
-    pub attempts: Vec<UsageAttemptObservation>,
-}
+pub use gateway_admin::model::observability::UsageDetail as UsageRecordDetail;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderObservation {
-    pub provider_kind: String,
-    pub request_count: u64,
-    pub attempt_count: u64,
-    pub failure_count: u64,
-    pub total_tokens: u64,
-}
+pub use gateway_admin::model::observability::ProviderObservation;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageOverview {
@@ -713,107 +372,6 @@ pub struct DiagnosticObservation {
     pub costs: Vec<CurrencyCostTotal>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpsErrorRecord {
-    pub client_api_key_name: Option<String>,
-    pub source: String,
-    pub event_id: String,
-    pub request_id: Option<String>,
-    pub attempt_index: Option<u32>,
-    pub client_api_key_ref: Option<String>,
-    pub component: String,
-    pub operation: String,
-    pub protocol: Option<String>,
-    pub client_transport: Option<String>,
-    pub requested_model_id: Option<String>,
-    pub service_tier: Option<String>,
-    pub endpoint: Option<String>,
-    pub provider_kind: Option<String>,
-    pub provider_account_ref: Option<String>,
-    pub provider_account_name: Option<String>,
-    pub provider_account_email: Option<String>,
-    pub provider_account_plan_type: Option<String>,
-    pub provider_account_authentication_kind: Option<String>,
-    pub upstream_model_id: Option<String>,
-    pub upstream_transport: Option<String>,
-    pub failure_kind: String,
-    pub upstream_send_state: Option<String>,
-    pub client_status_code: Option<u16>,
-    pub upstream_status_code: Option<u16>,
-    pub provider_error_code: Option<String>,
-    pub client_response_id: Option<String>,
-    pub upstream_request_id: Option<String>,
-    pub latency_ms: Option<u64>,
-    pub message: String,
-    pub raw_upstream_error: Option<String>,
-    pub client_ip: Option<String>,
-    pub user_agent: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub reasoning_preset: Option<String>,
-    pub request_kind: Option<String>,
-    pub subagent_kind: Option<String>,
-    pub compact: Option<bool>,
-    pub continuation_affinity_hash: Option<String>,
-    pub continuation_previous_response_id_hash: Option<String>,
-    pub continuation_unavailable_reason: Option<String>,
-    pub upstream_connection_id: Option<String>,
-    pub upstream_connection_exit_reason: Option<String>,
-    pub upstream_connection_age_ms: Option<u64>,
-    pub upstream_connection_idle_ms: Option<u64>,
-    pub recovery_request_id: Option<String>,
-    pub recovered_at: Option<DateTime<Utc>>,
-    pub recovery_attempt_count: u32,
-    pub recovery_retry_delay_ms: Option<u64>,
-    pub recovery_total_latency_ms: Option<u64>,
-    pub occurred_at: DateTime<Utc>,
-    pub stable_sort_id: String,
-}
+pub use gateway_admin::model::observability::OpsError as OpsErrorRecord;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpsErrorPage {
-    pub items: Vec<OpsErrorRecord>,
-    pub current_page: u32,
-    pub page_size: u16,
-    pub total: u64,
-}
-
-#[async_trait]
-pub trait ObservabilityRepository: Send + Sync {
-    async fn dashboard_summary(
-        &self,
-        range: ObservabilityRange,
-        observed_at: DateTime<Utc>,
-    ) -> StoreResult<DashboardObservation>;
-    async fn dashboard_trend(
-        &self,
-        range: ObservabilityRange,
-    ) -> StoreResult<Vec<RequestMetricPoint>>;
-    async fn usage_trend(
-        &self,
-        range: ObservabilityRange,
-        filter: UsageRecordFilter,
-    ) -> StoreResult<Vec<RequestMetricPoint>>;
-    fn usage_calculated_billing_facts(
-        &self,
-        range: ObservabilityRange,
-        filter: UsageRecordFilter,
-    ) -> BoxStream<'_, StoreResult<CalculatedUsageBillingFact>>;
-    async fn provider_account_usage(
-        &self,
-        query: ProviderAccountUsageQuery,
-    ) -> StoreResult<Vec<ProviderAccountUsageObservation>>;
-    async fn list_usage_records(&self, query: UsageRecordQuery) -> StoreResult<UsageRecordPage>;
-    async fn usage_record_detail(&self, request_id: &str) -> StoreResult<UsageRecordDetail>;
-    async fn usage_summary(
-        &self,
-        range: ObservabilityRange,
-        filter: UsageRecordFilter,
-    ) -> StoreResult<UsageOverview>;
-    async fn usage_diagnostics(
-        &self,
-        range: ObservabilityRange,
-        filter: UsageRecordFilter,
-        dimension: DiagnosticDimension,
-    ) -> StoreResult<DiagnosticsObservation>;
-    async fn list_ops_errors(&self, query: OpsErrorQuery) -> StoreResult<OpsErrorPage>;
-}
+pub use gateway_admin::model::observability::OpsErrorPage;

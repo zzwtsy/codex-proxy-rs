@@ -280,7 +280,7 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
         request.validate()?;
         let keys = self.keys(&request.client_api_key_ref)?;
         let lease_ttl_ms = u64::try_from(request.lease_ttl.as_millis())
-            .map_err(|_| invalid("lease TTL is too large"))?;
+            .map_err(|source| invalid("lease TTL is too large").with_source(source))?;
         let mut connection = self.connection.clone();
         let code = Script::new(ADMIT_SCRIPT)
             .key(&keys[0])
@@ -293,7 +293,7 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
             .arg(u8::from(request.allow_concurrency_acquire))
             .invoke_async::<i64>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("admit client request"))?;
+            .map_err(|source| redis_unavailable("admit client request", source))?;
         match code {
             0 => Ok(ClientAdmissionDecision::Granted),
             1 => Ok(ClientAdmissionDecision::Rejected(
@@ -320,7 +320,7 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
             .arg(model_request_id)
             .query_async::<i64>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("release client request"))?;
+            .map_err(|source| redis_unavailable("release client request", source))?;
         Ok(removed == 1)
     }
 
@@ -361,7 +361,7 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
         let (code, restored_recent_requests, restored_running_requests) = invocation
             .invoke_async::<(i64, u64, u64)>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("restore client admission"))?;
+            .map_err(|source| redis_unavailable("restore client admission", source))?;
         if code == -1 {
             return Err(invalid("request start time is after Redis server time"));
         }
@@ -381,7 +381,7 @@ impl ClientAdmissionRepository for RedisClientAdmissionRepository {
             .arg(&keys)
             .query_async::<i64>(&mut connection)
             .await
-            .map_err(|_| redis_unavailable("clear client admission"))?;
+            .map_err(|source| redis_unavailable("clear client admission", source))?;
         Ok(())
     }
 }
@@ -413,7 +413,7 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
                         .arg(redis_duration_millis(ttl)?)
                         .invoke_async::<i64>(&mut connection)
                         .await
-                        .map_err(|_| redis_unavailable("renew client request"))?;
+                        .map_err(|source| redis_unavailable("renew client request", source))?;
                     Ok(renewed == 1)
                 })
             },
@@ -462,7 +462,7 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
                     CoreAdmissionDecision::Rejected(CoreAdmissionRejection::ConcurrencyLimited)
                 }
             })
-            .map_err(|_| CoreAdmissionError)
+            .map_err(|source| CoreAdmissionError(Some(source.into())))
         })
     }
 
@@ -474,7 +474,7 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
         Box::pin(async move {
             self.release_client_request(client_api_key_id.as_str(), model_request_id.as_str())
                 .await
-                .map_err(|_| CoreAdmissionError)
+                .map_err(|source| CoreAdmissionError(Some(source.into())))
         })
     }
 
@@ -508,13 +508,14 @@ impl ClientAdmissionPort for RedisClientAdmissionRepository {
                 restored_recent_requests: restored.restored_recent_requests,
                 restored_running_requests: restored.restored_running_requests,
             })
-            .map_err(|_| CoreAdmissionError)
+            .map_err(|source| CoreAdmissionError(Some(source.into())))
         })
     }
 }
 
 fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "client admission",
         message: message.to_owned(),
     }
@@ -525,18 +526,19 @@ fn validate_recovery_request_id(model_request_id: &str) -> StoreResult<()> {
 }
 
 fn redis_duration_millis(duration: Duration) -> StoreResult<u64> {
-    let milliseconds =
-        u64::try_from(duration.as_millis()).map_err(|_| invalid("lease TTL is too large"))?;
+    let milliseconds = u64::try_from(duration.as_millis())
+        .map_err(|source| invalid("lease TTL is too large").with_source(source))?;
     redis_integer(milliseconds, "lease TTL")
 }
 
 fn redis_timestamp_millis(timestamp: DateTime<Utc>, field: &str) -> StoreResult<u64> {
-    let milliseconds = u64::try_from(timestamp.timestamp_millis()).map_err(|_| invalid(field))?;
+    let milliseconds = u64::try_from(timestamp.timestamp_millis())
+        .map_err(|source| invalid(field).with_source(source))?;
     redis_integer(milliseconds, field)
 }
 
 fn redis_len(length: usize, field: &str) -> StoreResult<u64> {
-    let value = u64::try_from(length).map_err(|_| invalid(field))?;
+    let value = u64::try_from(length).map_err(|source| invalid(field).with_source(source))?;
     redis_integer(value, field)
 }
 

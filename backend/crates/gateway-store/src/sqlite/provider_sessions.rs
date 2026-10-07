@@ -184,8 +184,8 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
         Box::pin(async move {
             let fingerprint = Self::alias_key(provider, alias)?;
             let now = datetime_to_micros(Utc::now());
-            let value = sqlx::query_as::<_, (String, i64)>(
-                "SELECT session_key, follow_only FROM provider_session_aliases
+            let value = sqlx::query_as::<_, (String, i64, Option<String>)>(
+                "SELECT session_key, follow_only, root_session_key FROM provider_session_aliases
                  WHERE alias_fingerprint = ? AND expires_at_us > ?",
             )
             .bind(&fingerprint)
@@ -205,9 +205,12 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
                 .map_err(|_| provider_unavailable("clean expired provider session alias"))?;
             }
             value
-                .map(|(session_key, follow_only)| {
+                .map(|(session_key, follow_only, root_session_key)| {
                     Ok(ProviderSessionAlias {
                         session_key: ProviderSessionAffinityKey::try_new(session_key)?,
+                        root_session_key: root_session_key
+                            .map(ProviderSessionAffinityKey::try_new)
+                            .transpose()?,
                         follow_only: follow_only != 0,
                     })
                 })
@@ -239,20 +242,28 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
                 .ok_or_else(|| provider_invalid("validate provider session alias expiry"))?;
             let result = sqlx::query(
                 "INSERT INTO provider_session_aliases
-                 (alias_fingerprint, session_key, follow_only, expires_at_us)
-                 VALUES (?, ?, ?, ?)
+                 (alias_fingerprint, session_key, follow_only, expires_at_us, root_session_key)
+                 VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT (alias_fingerprint) DO UPDATE SET
                    session_key = excluded.session_key,
                    follow_only = excluded.follow_only,
-                   expires_at_us = excluded.expires_at_us
+                   expires_at_us = excluded.expires_at_us,
+                   root_session_key = excluded.root_session_key
                  WHERE provider_session_aliases.expires_at_us <= ?
                     OR (provider_session_aliases.session_key = excluded.session_key
-                        AND provider_session_aliases.follow_only = excluded.follow_only)",
+                        AND provider_session_aliases.follow_only = excluded.follow_only
+                        AND provider_session_aliases.root_session_key = excluded.root_session_key)",
             )
             .bind(fingerprint)
             .bind(session.session_key.expose_to_store())
             .bind(i64::from(session.follow_only))
             .bind(expires_at)
+            .bind(
+                session
+                    .root_session_key
+                    .as_ref()
+                    .map(ProviderSessionAffinityKey::expose_to_store),
+            )
             .bind(now)
             .execute(&mut *transaction)
             .await

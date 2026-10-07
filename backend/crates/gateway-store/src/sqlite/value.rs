@@ -33,6 +33,7 @@ pub(crate) fn datetime_from_micros(value: i64) -> StoreResult<chrono::DateTime<c
     chrono::DateTime::from_timestamp_micros(value).ok_or_else(|| StoreError::InvalidData {
         entity: "SQLite timestamp",
         message: "timestamp is outside UTC range".to_owned(),
+        source: None,
     })
 }
 
@@ -40,6 +41,7 @@ pub(crate) fn duration_micros(value: std::time::Duration) -> StoreResult<i64> {
     i64::try_from(value.as_micros()).map_err(|_| StoreError::InvalidData {
         entity: "SQLite duration",
         message: "duration is outside SQLite timestamp range".to_owned(),
+        source: None,
     })
 }
 
@@ -47,5 +49,6 @@ fn invalid_amount() -> StoreError {
     StoreError::InvalidData {
         entity: "decimal amount",
         message: "amount is malformed or exceeds numeric(20, 10)".to_owned(),
+        source: None,
     }
 }

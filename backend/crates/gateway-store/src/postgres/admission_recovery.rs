@@ -50,7 +50,7 @@ impl ClientAdmissionRecoveryRepository for PgClientAdmissionRecoveryRepository {
         .bind(window_started_at)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| postgres_unavailable("load client admission recovery"))?;
+        .map_err(|source| postgres_unavailable("load client admission recovery", source))?;
         let mut recoveries = BTreeMap::<String, ClientAdmissionRecovery>::new();
         for (client_api_key_ref, model_request_id, started_at, deadline_at, outcome) in rows {
             let recovery = recoveries
@@ -88,18 +88,18 @@ impl ClientAdmissionRecoveryPort for PgClientAdmissionRecoveryRepository {
         Box::pin(async move {
             self.load_client_admission_recovery(DateTime::<Utc>::from(since))
                 .await
-                .map_err(|_| ClientAdmissionError)?
+                .map_err(|source| ClientAdmissionError(Some(source.into())))?
                 .into_iter()
                 .map(|recovery| {
                     let client_api_key_id = ClientApiKeyId::new(recovery.client_api_key_ref)
-                        .map_err(|_| ClientAdmissionError)?;
+                        .map_err(|source| ClientAdmissionError(Some(source.into())))?;
                     let recent_requests = recovery
                         .recent_requests
                         .into_iter()
                         .map(|request| {
                             Ok(RecentAdmissionFact {
                                 model_request_id: ModelRequestId::new(request.model_request_id)
-                                    .map_err(|_| ClientAdmissionError)?,
+                                    .map_err(|source| ClientAdmissionError(Some(source.into())))?,
                                 started_at: request.started_at.into(),
                             })
                         })
@@ -110,7 +110,7 @@ impl ClientAdmissionRecoveryPort for PgClientAdmissionRecoveryRepository {
                         .map(|request| {
                             Ok(RunningAdmissionFact {
                                 model_request_id: ModelRequestId::new(request.model_request_id)
-                                    .map_err(|_| ClientAdmissionError)?,
+                                    .map_err(|source| ClientAdmissionError(Some(source.into())))?,
                                 expires_at: request.deadline_at.into(),
                             })
                         })

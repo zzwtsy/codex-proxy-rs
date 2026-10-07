@@ -334,6 +334,7 @@ fn invalid_lease(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: "credential lease",
         message: message.to_owned(),
+        source: None,
     }
 }
 
@@ -341,5 +342,6 @@ fn sqlite_unavailable(_error: impl std::fmt::Display) -> StoreError {
     StoreError::Unavailable {
         backend: StoreBackend::Sqlite,
         message: "credential lease operation failed".to_owned(),
+        source: None,
     }
 }

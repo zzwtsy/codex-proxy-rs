@@ -28,7 +28,7 @@ pub async fn run() -> Result<(), BootstrapError> {
         Some(plugin_runtime.clone()),
         Some(plugin_runtime.observer_registry()),
         Some(plugin_runtime.policy_registry()),
-        Some(plugin_runtime.middleware_registry()),
+        Some(plugin_runtime.execution_registry()),
         Some(plugin_runtime.frontend_authentication_registry()),
     );
     let management = ManagementPorts::new(&store, providers.admin.clone(), core.snapshot_control());
@@ -117,18 +117,19 @@ pub async fn run() -> Result<(), BootstrapError> {
             probes,
             host.worker_health(),
             host.connection_lifecycle(),
+            store.diagnostics(),
         )
     )
     .with_middleware({
         let snapshots = core.snapshots();
-        let middleware = plugin_runtime.middleware_registry();
+        let middleware = plugin_runtime.execution_registry();
         move |snapshot| {
             if let Some(snapshot) = snapshot {
-                return middleware.resolve(snapshot.extensions()?);
+                return middleware.middleware(snapshot.extensions()?);
             }
             // 数据面未就绪时，管理与诊断路由仍可使用发布候选中的插件
             let diagnostic = snapshots.snapshot_for_diagnostics()?;
-            middleware.resolve(diagnostic.extensions()?)
+            middleware.middleware(diagnostic.extensions()?)
         }
     });
     let http_dispatcher = api.dispatcher();
@@ -155,7 +156,7 @@ pub async fn run() -> Result<(), BootstrapError> {
     ));
     or_shutdown!(
         plugin_runtime,
-        host.start_workers(plan, store.worker_leader_lease())
+        host.start_workers(plan, store.worker_leader_lease(), store.diagnostics())
     );
     host.report_startup_ready("Workers");
     let served = host.serve(api.router()).await;

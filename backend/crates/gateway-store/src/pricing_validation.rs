@@ -35,5 +35,6 @@ fn invalid_pricing() -> StoreError {
     StoreError::InvalidData {
         entity: "model pricing",
         message: "invalid model pricing".to_owned(),
+        source: None,
     }
 }

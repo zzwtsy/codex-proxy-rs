@@ -163,7 +163,37 @@ fn sdk_settings_contract_matches_host_declarations() {
                     _ => false,
                 })
                 .unwrap_or_else(|| panic!("缺少合同类型 {name}"));
-            if let Item::Struct(item) = item
+            let mut item = item.clone();
+            // SDK 保持独立的平铺合同，不暴露宿主内部的值对象组合
+            if matches!(*name, "RuntimeSettings" | "ReplaceRuntimeSettings") {
+                let values = items
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Struct(item) if item.ident == "RuntimeSettingsValues" => {
+                            Some(&item.fields)
+                        }
+                        _ => None,
+                    })
+                    .expect("settings values");
+                let Item::Struct(record) = &mut item else {
+                    unreachable!()
+                };
+                let syn::Fields::Named(fields) = &mut record.fields else {
+                    unreachable!()
+                };
+                fields.named = fields
+                    .named
+                    .iter()
+                    .flat_map(|field| {
+                        if field.ident.as_ref().is_some_and(|ident| ident == "values") {
+                            values.iter().cloned().collect::<Vec<_>>()
+                        } else {
+                            vec![field.clone()]
+                        }
+                    })
+                    .collect();
+            }
+            if let Item::Struct(item) = &item
                 && item.ident == "ReplaceRuntimeSettings"
             {
                 replacement_fields = item
@@ -173,7 +203,7 @@ fn sdk_settings_contract_matches_host_declarations() {
                     .collect();
             }
             types.push(contract_type(
-                item.clone(),
+                item,
                 if *name == "SmartSchedulingValues" {
                     "SmartSchedulingConfig"
                 } else {
@@ -217,7 +247,7 @@ fn sdk_settings_contract_matches_host_declarations() {
             _ => None,
         })
         .collect();
-    let register = source(root, "src/service/settings.rs")
+    let register = source(root, "src/public_service/settings.rs")
         .items
         .into_iter()
         .find_map(|item| match item {
@@ -263,7 +293,7 @@ fn sdk_settings_contract_matches_host_declarations() {
     let generated = quote! {
         //! 宿主设置服务的操作标识与请求、响应数据合同
         //!
-        //! 从宿主设置类型与 service/settings.rs 生成；更新命令见 SDK 维护说明
+        //! 从宿主设置类型与 public_service/settings.rs 生成；更新命令见 SDK 维护说明
 
         use super::Operation;
         use serde::{Deserialize, Serialize};
@@ -273,6 +303,7 @@ fn sdk_settings_contract_matches_host_declarations() {
         pub type ModelMappings = BTreeMap<String, String>;
         pub type Revision = NonZeroU64;
         pub type RotationStrategy = String;
+        pub type AccountAffinity = String;
         pub type PricingOverrides = BTreeMap<String, BTreeMap<String, ModelPriceOverride>>;
         #(#types)*
         #(#operations)*

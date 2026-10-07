@@ -37,9 +37,10 @@ use gateway_admin::{
             NewClientKey, SetClientKeyEnabled, UpdateClientKey,
         },
         observability::{
-            DashboardObservation, DecimalAmount, DiagnosticDimension, DiagnosticsObservation,
-            OpsError, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange, UsageDetail,
-            UsageFilter, UsageListRecord, UsageOverview, UsagePage, UsageQuery,
+            DashboardObservation, DashboardQuery, DecimalAmount, DiagnosticDimension,
+            DiagnosticsObservation, Granularity, OpsError, OpsErrorPage, OpsErrorQuery,
+            RequestMetricPoint, TimeRange, UsageDetail, UsageFilter, UsageListRecord,
+            UsageOverview, UsagePage, UsageQuery,
         },
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
@@ -86,6 +87,7 @@ mod account_groups;
 mod accounts;
 mod auth;
 mod client_keys;
+mod error_diagnostics;
 mod errors;
 mod observability;
 mod proxies;
@@ -592,37 +594,46 @@ impl SettingsStore for MemorySettingsStore {
         }
         let updated = RuntimeSettings {
             request_profiles,
-            request_location_enabled: command.request_location_enabled,
-            request_location: command.request_location,
             config_revision: next_revision(settings.config_revision),
             model_mappings: command.model_mappings,
-            refresh_margin_seconds: command.refresh_margin_seconds,
-            refresh_concurrency: command.refresh_concurrency,
-            max_concurrent_per_account: command.max_concurrent_per_account,
-            request_interval_ms: command.request_interval_ms,
-            max_waiting_per_key: command.max_waiting_per_key,
-            max_waiting_per_account: command.max_waiting_per_account,
-            concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
-            openai_guardian_reserved_concurrency: command.openai_guardian_reserved_concurrency,
-            responses_max_decompressed_body_bytes: command.responses_max_decompressed_body_bytes,
-            smart_scheduling: command.smart_scheduling,
             rotation_strategy: command.rotation_strategy,
-            min_codex_desktop_version: command.min_codex_desktop_version,
-            min_codex_cli_version: command.min_codex_cli_version,
-            usage_retention_days: command.usage_retention_days,
-            ops_event_retention_days: command.ops_event_retention_days,
-            audit_retention_days: command.audit_retention_days,
-            account_auto_freeze_enabled: true,
-            account_auto_freeze_threshold: 12,
-            account_auto_freeze_window_seconds: 600,
-            account_auto_freeze_duration_seconds: 7_200,
-            account_auto_freeze_probe_enabled: true,
-            account_auto_freeze_probe_model: None,
-            account_auto_freeze_adaptive_concurrency: true,
-            account_warmup_enabled: false,
-            account_warmup_schedule_time: "08:00".to_owned(),
-            account_warmup_model: None,
             updated_at: Utc::now(),
+            values: gateway_admin::model::settings::RuntimeSettingsValues {
+                request_location_enabled: command.values.request_location_enabled,
+                request_location: command.values.request_location,
+                refresh_margin_seconds: command.values.refresh_margin_seconds,
+                refresh_concurrency: command.values.refresh_concurrency,
+                max_concurrent_per_account: command.values.max_concurrent_per_account,
+                request_interval_ms: command.values.request_interval_ms,
+                max_waiting_per_key: command.values.max_waiting_per_key,
+                max_waiting_per_account: command.values.max_waiting_per_account,
+                concurrency_wait_timeout_seconds: command.values.concurrency_wait_timeout_seconds,
+                openai_guardian_reserved_concurrency: command
+                    .values
+                    .openai_guardian_reserved_concurrency,
+                openai_account_affinity: command.values.openai_account_affinity,
+                max_account_rotations: command.values.max_account_rotations,
+                openai_session_affinity_ttl_hours: command.values.openai_session_affinity_ttl_hours,
+                responses_max_decompressed_body_bytes: command
+                    .values
+                    .responses_max_decompressed_body_bytes,
+                smart_scheduling: command.values.smart_scheduling,
+                min_codex_desktop_version: command.values.min_codex_desktop_version,
+                min_codex_cli_version: command.values.min_codex_cli_version,
+                usage_retention_days: command.values.usage_retention_days,
+                ops_event_retention_days: command.values.ops_event_retention_days,
+                audit_retention_days: command.values.audit_retention_days,
+                account_auto_freeze_enabled: true,
+                account_auto_freeze_threshold: 12,
+                account_auto_freeze_window_seconds: 600,
+                account_auto_freeze_duration_seconds: 7_200,
+                account_auto_freeze_probe_enabled: true,
+                account_auto_freeze_probe_model: None,
+                account_auto_freeze_adaptive_concurrency: true,
+                account_warmup_enabled: false,
+                account_warmup_schedule_time: "08:00".to_owned(),
+                account_warmup_model: None,
+            },
         };
         *settings = updated.clone();
         Ok(updated)
@@ -1294,13 +1305,13 @@ impl AccountRuntimeStore for UnusedStore {
 impl ObservabilityStore for UnusedStore {
     async fn dashboard_summary(
         &self,
-        range: TimeRange,
+        query: DashboardQuery,
         _: DateTime<Utc>,
     ) -> AdminStoreResult<DashboardObservation> {
         *self
             .dashboard_summary_range
             .lock()
-            .expect("dashboard summary range") = Some(range);
+            .expect("dashboard summary range") = Some(query.range);
         self.dashboard_observation
             .lock()
             .expect("dashboard observation")
@@ -1308,7 +1319,11 @@ impl ObservabilityStore for UnusedStore {
             .ok_or_else(|| unavailable("dashboard"))
     }
 
-    async fn dashboard_trend(&self, _: TimeRange) -> AdminStoreResult<Vec<RequestMetricPoint>> {
+    async fn dashboard_trend(
+        &self,
+        _: TimeRange,
+        _: Granularity,
+    ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
         Err(unavailable("dashboard trend"))
     }
 
@@ -1316,6 +1331,7 @@ impl ObservabilityStore for UnusedStore {
         &self,
         range: TimeRange,
         filter: UsageFilter,
+        _: Granularity,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>> {
         let mut data = self.observations.lock().expect("observations");
         data.trends.push((range, filter));
@@ -1326,6 +1342,7 @@ impl ObservabilityStore for UnusedStore {
         &self,
         _: TimeRange,
         _: UsageFilter,
+        _: Granularity,
     ) -> gateway_admin::ports::store::UsageCalculatedBillingStream<'_> {
         Box::pin(futures::stream::once(async {
             Err(unavailable("usage billing facts"))
@@ -1373,6 +1390,7 @@ impl ObservabilityStore for UnusedStore {
         range: TimeRange,
         filter: UsageFilter,
         dimension: DiagnosticDimension,
+        _: u16,
     ) -> AdminStoreResult<DiagnosticsObservation> {
         self.observations
             .lock()
@@ -1607,37 +1625,42 @@ fn test_runtime_settings() -> RuntimeSettings {
     ]);
     RuntimeSettings {
         request_profiles: Default::default(),
-        request_location_enabled: false,
-        request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
         model_mappings: mappings,
-        refresh_margin_seconds: 3_600,
-        refresh_concurrency: 2,
-        max_concurrent_per_account: 3,
-        request_interval_ms: 50,
-        max_waiting_per_key: 0,
-        max_waiting_per_account: 0,
-        concurrency_wait_timeout_seconds: 30,
-        openai_guardian_reserved_concurrency: 0,
-        responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
-        smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
         rotation_strategy: RotationStrategy::Smart,
-        min_codex_desktop_version: None,
-        min_codex_cli_version: None,
-        usage_retention_days: 31,
-        ops_event_retention_days: 30,
-        audit_retention_days: 90,
-        account_auto_freeze_enabled: true,
-        account_auto_freeze_threshold: 12,
-        account_auto_freeze_window_seconds: 600,
-        account_auto_freeze_duration_seconds: 7_200,
-        account_auto_freeze_probe_enabled: true,
-        account_auto_freeze_probe_model: None,
-        account_auto_freeze_adaptive_concurrency: true,
-        account_warmup_enabled: false,
-        account_warmup_schedule_time: "08:00".to_owned(),
-        account_warmup_model: None,
         updated_at: Utc::now(),
+        values: gateway_admin::model::settings::RuntimeSettingsValues {
+            request_location_enabled: false,
+            request_location: Default::default(),
+            refresh_margin_seconds: 3_600,
+            refresh_concurrency: 2,
+            max_concurrent_per_account: 3,
+            request_interval_ms: 50,
+            max_waiting_per_key: 0,
+            max_waiting_per_account: 0,
+            concurrency_wait_timeout_seconds: 30,
+            openai_guardian_reserved_concurrency: 0,
+            openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
+            max_account_rotations: 3,
+            openai_session_affinity_ttl_hours: 24,
+            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+            smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+            min_codex_desktop_version: None,
+            min_codex_cli_version: None,
+            usage_retention_days: 31,
+            ops_event_retention_days: 30,
+            audit_retention_days: 90,
+            account_auto_freeze_enabled: true,
+            account_auto_freeze_threshold: 12,
+            account_auto_freeze_window_seconds: 600,
+            account_auto_freeze_duration_seconds: 7_200,
+            account_auto_freeze_probe_enabled: true,
+            account_auto_freeze_probe_model: None,
+            account_auto_freeze_adaptive_concurrency: true,
+            account_warmup_enabled: false,
+            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_model: None,
+        },
     }
 }
 
@@ -1679,6 +1702,7 @@ fn unavailable(resource: &'static str) -> AdminStoreError {
         resource,
         "unused test port",
     )
+    .with_source(std::io::Error::other("PRIVATE_ADMIN_NATIVE_CAUSE"))
 }
 
 fn not_found(resource: &'static str) -> AdminStoreError {

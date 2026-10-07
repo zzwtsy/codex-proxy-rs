@@ -393,7 +393,7 @@ fn make_finalization(
         diagnostic_trace_json: None,
         error: None,
         provider_error_code: None,
-        raw_upstream_error: None,
+        error_details: None,
         failure_observation: Default::default(),
         retry_after_ms: None,
         usage: Usage::new(),

@@ -25,6 +25,7 @@ async fn dashboard_summary_should_include_quota_exhaustion_in_unavailable_headli
         .dashboard_observation
         .lock()
         .expect("dashboard observation") = Some(DashboardObservation {
+        runtime_slots: None,
         range: TimeRange::new(now - Duration::hours(1), now).expect("dashboard range"),
         totals: Default::default(),
         provider_accounts: AccountPoolMetrics {
@@ -107,6 +108,7 @@ async fn dashboard_summary_should_use_lifetime_totals_for_card_footers() {
         .dashboard_observation
         .lock()
         .expect("dashboard observation") = Some(DashboardObservation {
+        runtime_slots: None,
         range: TimeRange::new(now - Duration::hours(1), now).expect("dashboard range"),
         totals: DashboardTotals {
             request_count: 42,
@@ -178,6 +180,7 @@ async fn dashboard_summary_should_default_to_current_deployment_day() {
         .dashboard_observation
         .lock()
         .expect("dashboard observation") = Some(DashboardObservation {
+        runtime_slots: None,
         range: TimeRange::new(now - Duration::hours(1), now).expect("dashboard range"),
         totals: Default::default(),
         provider_accounts: AccountPoolMetrics::default(),
@@ -466,7 +469,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
             upstream_request_id: None,
             latency_ms: Some(90),
             message: "snapshot error".to_owned(),
-            raw_upstream_error: Some(
+            error_details: Some(
                 r#"{"error":{"code":"upstream","message":"raw upstream marker"}}"#.to_owned(),
             ),
             client_ip: Some("203.0.113.8".to_owned()),
@@ -526,7 +529,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
             "userAgent": value["data"]["items"][0]["userAgent"],
             "providerErrorCode": value["data"]["items"][0]["providerErrorCode"],
             "upstreamSendState": value["data"]["items"][0]["upstreamSendState"],
-            "rawUpstreamError": value["data"]["items"][0]["rawUpstreamError"],
+            "errorDetails": value["data"]["items"][0]["errorDetails"],
             "continuationUnavailableReason": value["data"]["items"][0]["metadata"]["continuationUnavailableReason"],
             "upstreamConnectionExitReason": value["data"]["items"][0]["metadata"]["upstreamConnectionExitReason"],
             "upstreamConnectionAgeMs": value["data"]["items"][0]["metadata"]["upstreamConnectionAgeMs"],
@@ -547,7 +550,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
             "userAgent": "codex-cli/0.144.0",
             "providerErrorCode": "upstream",
             "upstreamSendState": "sent",
-            "rawUpstreamError": "{\"error\":{\"code\":\"upstream\",\"message\":\"raw upstream marker\"}}",
+            "errorDetails": "{\"error\":{\"code\":\"upstream\",\"message\":\"raw upstream marker\"}}",
             "continuationUnavailableReason": "reused_connection_lost",
             "upstreamConnectionExitReason": "tcp_reset",
             "upstreamConnectionAgeMs": 12000,
@@ -1054,6 +1057,7 @@ async fn calendar_queries_and_display_follow_deployment_timezone_with_one_anchor
         let fixture = AdminTestFixture::with_timezone(timezone).await;
         fixture.auth.insert_session("valid-session");
         *fixture.dashboard_observation.lock().unwrap() = Some(DashboardObservation {
+            runtime_slots: None,
             range,
             totals: Default::default(),
             provider_accounts: Default::default(),

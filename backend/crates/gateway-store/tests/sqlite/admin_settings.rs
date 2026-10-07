@@ -2,10 +2,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use gateway_admin::model::pricing::{PricingChange, StoredPricing, UpdatePricing};
-    use gateway_admin::model::settings::ReplaceRuntimeSettings;
+    use gateway_admin::model::settings::{ReplaceRuntimeSettings, RuntimeSettingsValues};
     use gateway_admin::model::{MutationActor, MutationContext, Revision};
     use gateway_core::metering::ModelPriceOverride;
     use gateway_store::{SqliteStoreConfig, sqlite};
+    use sqlx::sqlite::SqlitePoolOptions;
 
     fn context(request_id: &str) -> MutationContext {
         MutationContext {
@@ -18,35 +19,40 @@ mod tests {
         ReplaceRuntimeSettings {
             expected_revision: Revision::new(expected_revision).unwrap(),
             request_profile_updates: BTreeMap::new(),
-            request_location_enabled: false,
-            request_location: Default::default(),
             model_mappings: BTreeMap::new(),
-            refresh_margin_seconds: 3_600,
-            refresh_concurrency: 2,
-            max_concurrent_per_account: 3,
-            request_interval_ms: 50,
-            max_waiting_per_key: 0,
-            max_waiting_per_account: 0,
-            concurrency_wait_timeout_seconds: 30,
-            openai_guardian_reserved_concurrency: 0,
-            responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
-            smart_scheduling: Default::default(),
             rotation_strategy: gateway_core::account::RotationStrategy::Smart,
-            min_codex_desktop_version: None,
-            min_codex_cli_version: None,
-            usage_retention_days: 31,
-            ops_event_retention_days: 30,
-            audit_retention_days: 90,
-            account_auto_freeze_enabled: false,
-            account_auto_freeze_threshold: 12,
-            account_auto_freeze_window_seconds: 600,
-            account_auto_freeze_duration_seconds: 7_200,
-            account_auto_freeze_probe_enabled: true,
-            account_auto_freeze_probe_model: None,
-            account_auto_freeze_adaptive_concurrency: true,
-            account_warmup_enabled: false,
-            account_warmup_schedule_time: "08:00".to_owned(),
-            account_warmup_model: None,
+            values: RuntimeSettingsValues {
+                request_location_enabled: false,
+                request_location: Default::default(),
+                refresh_margin_seconds: 3_600,
+                refresh_concurrency: 2,
+                max_concurrent_per_account: 3,
+                request_interval_ms: 50,
+                max_waiting_per_key: 0,
+                max_waiting_per_account: 0,
+                concurrency_wait_timeout_seconds: 30,
+                openai_guardian_reserved_concurrency: 0,
+                openai_account_affinity: gateway_core::account::AccountAffinity::Preferred,
+                max_account_rotations: 5,
+                openai_session_affinity_ttl_hours: 48,
+                responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
+                smart_scheduling: Default::default(),
+                min_codex_desktop_version: None,
+                min_codex_cli_version: None,
+                usage_retention_days: 31,
+                ops_event_retention_days: 30,
+                audit_retention_days: 90,
+                account_auto_freeze_enabled: false,
+                account_auto_freeze_threshold: 12,
+                account_auto_freeze_window_seconds: 600,
+                account_auto_freeze_duration_seconds: 7_200,
+                account_auto_freeze_probe_enabled: true,
+                account_auto_freeze_probe_model: None,
+                account_auto_freeze_adaptive_concurrency: true,
+                account_warmup_enabled: false,
+                account_warmup_schedule_time: "08:00".to_owned(),
+                account_warmup_model: None,
+            },
         }
     }
 
@@ -154,6 +160,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved.config_revision.get(), 2);
+        assert_eq!(
+            saved.values.openai_account_affinity,
+            gateway_core::account::AccountAffinity::Preferred
+        );
+        assert_eq!(saved.values.max_account_rotations, 5);
+        assert_eq!(saved.values.openai_session_affinity_ttl_hours, 48);
 
         let stale = repository
             .replace_runtime_settings(runtime_update(1), &context("settings.replace"))
@@ -186,6 +198,89 @@ mod tests {
             overflow.kind(),
             gateway_admin::ports::store::AdminStoreErrorKind::Invalid
         );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn affinity_migration_preserves_error_details_and_existing_revision_semantics() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create SQLite migration fixture");
+        sqlx::raw_sql(
+            "create table model_requests (id text primary key, raw_upstream_error text);
+             create table ops_events (id text primary key, raw_upstream_error text);
+             create table provider_session_aliases (
+               alias_fingerprint text primary key, session_key text not null,
+               follow_only integer not null, expires_at_us integer not null
+             );
+             create table runtime_settings (id integer primary key, config_revision integer not null);
+             insert into model_requests values ('request-1', 'response body');
+             insert into ops_events values ('event-1', 'source chain');
+             insert into provider_session_aliases values ('alias-1', 'root-session', 0, 1000);
+             insert into runtime_settings values (1, 1), (2, 2);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed pre-migration schema");
+
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/sqlite/0015_error_details_and_account_affinity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply SQLite 0015");
+
+        let request_details: String =
+            sqlx::query_scalar("select error_details from model_requests where id = 'request-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("read renamed request details");
+        let event_details: String =
+            sqlx::query_scalar("select error_details from ops_events where id = 'event-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("read renamed event details");
+        assert_eq!(request_details, "response body");
+        assert_eq!(event_details, "source chain");
+        let root_session_key: Option<String> = sqlx::query_scalar(
+            "select root_session_key from provider_session_aliases where alias_fingerprint = 'alias-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read migrated session alias");
+        assert_eq!(root_session_key, None);
+
+        let affinities: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+            "select config_revision, openai_account_affinity, max_account_rotations,
+                    openai_session_affinity_ttl_hours
+               from runtime_settings order by id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated affinity settings");
+        assert_eq!(
+            affinities,
+            [
+                (1, "strict".to_owned(), 3, 24),
+                (2, "relaxed".to_owned(), 3, 24)
+            ]
+        );
+
+        sqlx::query(
+            "update runtime_settings set openai_account_affinity = 'preferred' where id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("preferred affinity is accepted");
+        let invalid = sqlx::query(
+            "update runtime_settings set openai_account_affinity = 'unsupported' where id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("unsupported affinity is rejected");
+        assert!(invalid.to_string().contains("CHECK constraint failed"));
         pool.close().await;
     }
 

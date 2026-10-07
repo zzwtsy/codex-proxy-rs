@@ -59,12 +59,14 @@ impl SqliteRuntimeSettingsRepository {
             .ok_or_else(|| StoreError::NotFound {
                 entity: "runtime settings",
                 id: "1".to_owned(),
+                source: None,
             })?;
             if u64::try_from(current_revision).ok() != Some(expected_revision.get()) {
                 return Err(StoreError::Conflict {
                     entity: "runtime settings",
                     id: "1".to_owned(),
                     kind: crate::ConflictKind::StaleRevision,
+                    source: None,
                 });
             }
         }
@@ -78,6 +80,7 @@ impl SqliteRuntimeSettingsRepository {
         .ok_or_else(|| StoreError::NotFound {
             entity: "runtime settings",
             id: "1".to_owned(),
+            source: None,
         })?;
         let mut profiles = decode_profiles(&current_profiles)?;
         for (provider, profile) in &update.request_profile_updates {
@@ -128,7 +131,10 @@ impl SqliteRuntimeSettingsRepository {
                account_warmup_model = ?28,
                smart_scheduling_json = ?29,
                openai_guardian_reserved_concurrency = ?30,
-               updated_at_us = max(updated_at_us, ?31)
+               openai_account_affinity = ?31,
+               max_account_rotations = ?32,
+               openai_session_affinity_ttl_hours = ?33,
+               updated_at_us = max(updated_at_us, ?34)
              where id = 1 and config_revision < 9223372036854775807
              returning config_revision",
         )
@@ -162,6 +168,9 @@ impl SqliteRuntimeSettingsRepository {
         .bind(update.account_warmup_model.as_deref())
         .bind(smart_scheduling)
         .bind(i64::from(update.openai_guardian_reserved_concurrency))
+        .bind(update.openai_account_affinity.as_str())
+        .bind(i64::from(update.max_account_rotations))
+        .bind(i64::from(update.openai_session_affinity_ttl_hours))
         .bind(now)
         .fetch_optional(&mut *transaction)
         .await
@@ -169,6 +178,7 @@ impl SqliteRuntimeSettingsRepository {
         .ok_or_else(|| StoreError::InvalidData {
             entity: "runtime settings",
             message: "config revision cannot be advanced".to_owned(),
+            source: None,
         })?;
         if let Some(mut audit) = audit {
             audit.config_revision = Some(next_revision);
@@ -205,6 +215,8 @@ impl RuntimeSettingsRepository for SqliteRuntimeSettingsRepository {
                     min_codex_desktop_version, min_codex_cli_version, updated_at_us,
                     max_waiting_per_key, max_waiting_per_account,
                     concurrency_wait_timeout_seconds, openai_guardian_reserved_concurrency,
+                    openai_account_affinity, max_account_rotations,
+                    openai_session_affinity_ttl_hours,
                     responses_max_decompressed_body_bytes, account_auto_freeze_enabled,
                     account_auto_freeze_threshold, account_auto_freeze_window_seconds,
                     account_auto_freeze_duration_seconds, account_auto_freeze_probe_enabled,
@@ -218,6 +230,7 @@ impl RuntimeSettingsRepository for SqliteRuntimeSettingsRepository {
         .ok_or_else(|| StoreError::NotFound {
             entity: "runtime settings",
             id: "1".to_owned(),
+            source: None,
         })?;
         settings_from_row(&row)
     }
@@ -549,6 +562,16 @@ fn settings_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<RuntimeSettin
             row,
             "openai_guardian_reserved_concurrency",
         )?)?,
+        openai_account_affinity: gateway_core::account::AccountAffinity::parse(&read_string(
+            row,
+            "openai_account_affinity",
+        )?)
+        .ok_or_else(|| invalid("persisted account affinity is invalid"))?,
+        max_account_rotations: to_u32(read_i64(row, "max_account_rotations")?)?,
+        openai_session_affinity_ttl_hours: to_u32(read_i64(
+            row,
+            "openai_session_affinity_ttl_hours",
+        )?)?,
         responses_max_decompressed_body_bytes: nonnegative(read_i64(
             row,
             "responses_max_decompressed_body_bytes",
@@ -641,6 +664,7 @@ fn provider_error(kind: ProviderStoreErrorKind, operation: &'static str) -> Prov
 
 fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
+        source: None,
         entity: "runtime settings",
         message: message.to_owned(),
     }
@@ -658,6 +682,8 @@ async fn load_runtime_settings_in_transaction(
                 min_codex_desktop_version, min_codex_cli_version, updated_at_us,
                 max_waiting_per_key, max_waiting_per_account,
                 concurrency_wait_timeout_seconds, openai_guardian_reserved_concurrency,
+                openai_account_affinity, max_account_rotations,
+                openai_session_affinity_ttl_hours,
                 responses_max_decompressed_body_bytes, account_auto_freeze_enabled,
                 account_auto_freeze_threshold, account_auto_freeze_window_seconds,
                 account_auto_freeze_duration_seconds, account_auto_freeze_probe_enabled,
@@ -671,6 +697,7 @@ async fn load_runtime_settings_in_transaction(
     .ok_or_else(|| StoreError::NotFound {
         entity: "runtime settings",
         id: "1".to_owned(),
+        source: None,
     })?;
     settings_from_row(&row)
 }

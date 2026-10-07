@@ -27,9 +27,9 @@ use crate::model::{
         UpdateClientKey, UpdateClientKeyBudgetLimits,
     },
     observability::{
-        DashboardObservation, DashboardRuntimeSlots, DiagnosticDimension, DiagnosticsObservation,
-        OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange, UsageCalculatedBillingFact,
-        UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
+        DashboardObservation, DashboardQuery, DiagnosticDimension, DiagnosticsObservation,
+        Granularity, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange,
+        UsageCalculatedBillingFact, UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
     },
     provider_credentials::{
         AuthorizationCommit, CredentialDetails, CredentialImportCommit, CredentialImportResult,
@@ -52,12 +52,13 @@ pub enum AdminStoreErrorKind {
 }
 
 /// 隐藏数据库实现细节的持久化错误
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{resource} store operation failed: {message}")]
 pub struct AdminStoreError {
     kind: AdminStoreErrorKind,
     resource: &'static str,
     message: String,
+    source: Option<gateway_core::error::ErrorSource>,
 }
 
 impl AdminStoreError {
@@ -71,7 +72,25 @@ impl AdminStoreError {
             kind,
             resource,
             message: message.into(),
+            source: None,
         }
+    }
+
+    /// 来源留在内部诊断链，公开消息不展开基础设施错误
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<gateway_core::error::ErrorSource>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// 清理失败不覆盖最初操作的分类与原因
+    #[must_use]
+    pub fn with_cleanup(mut self, cleanup: impl Into<gateway_core::error::ErrorSource>) -> Self {
+        self.source = Some(gateway_core::error::ErrorSource::cleanup(
+            self.source.take(),
+            cleanup,
+        ));
+        self
     }
 
     #[must_use]
@@ -406,27 +425,21 @@ pub trait ObservabilityStore: Send + Sync {
     /// 返回历史统计区间和指定观测时刻下的实时账号状态
     async fn dashboard_summary(
         &self,
-        range: TimeRange,
+        query: DashboardQuery,
         observed_at: DateTime<Utc>,
     ) -> AdminStoreResult<DashboardObservation>;
 
-    /// 返回 Dashboard 可选的实时槽位事实
-    ///
-    /// 该状态来自可丢失的运行时存储；无实现或运行时存储不可用时返回 `None`，不影响
-    /// 持久观测数据的读取
-    async fn dashboard_runtime_slots(
+    async fn dashboard_trend(
         &self,
-        _observed_at: DateTime<Utc>,
-    ) -> AdminStoreResult<Option<DashboardRuntimeSlots>> {
-        Ok(None)
-    }
-
-    async fn dashboard_trend(&self, range: TimeRange) -> AdminStoreResult<Vec<RequestMetricPoint>>;
+        range: TimeRange,
+        granularity: Granularity,
+    ) -> AdminStoreResult<Vec<RequestMetricPoint>>;
 
     async fn usage_trend(
         &self,
         range: TimeRange,
         filter: UsageFilter,
+        granularity: Granularity,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>>;
 
     /// 流式返回可由 Provider 重新校验的已计算费用事实，不保证顺序
@@ -435,6 +448,7 @@ pub trait ObservabilityStore: Send + Sync {
         &self,
         range: TimeRange,
         filter: UsageFilter,
+        granularity: Granularity,
     ) -> UsageCalculatedBillingStream<'_>;
 
     async fn list_usage_records(&self, query: UsageQuery) -> AdminStoreResult<UsagePage>;
@@ -452,6 +466,7 @@ pub trait ObservabilityStore: Send + Sync {
         range: TimeRange,
         filter: UsageFilter,
         dimension: DiagnosticDimension,
+        limit: u16,
     ) -> AdminStoreResult<DiagnosticsObservation>;
 
     async fn list_ops_errors(&self, query: OpsErrorQuery) -> AdminStoreResult<OpsErrorPage>;

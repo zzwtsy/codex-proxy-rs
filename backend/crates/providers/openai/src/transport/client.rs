@@ -775,12 +775,9 @@ impl CodexBackendClient {
         fallback.send().await.map_err(CodexClientError::HttpJson)
     }
 
-    pub(crate) fn with_authentication(
-        mut self,
-        authentication: &crate::credential::CodexRuntimeAuthentication,
-    ) -> Self {
-        if let crate::credential::CodexRuntimeAuthentication::ApiKey(auth) = authentication {
-            self.base_url = auth.configuration.base_url.trim_end_matches('/').to_owned();
+    pub(crate) fn with_responses_api_base_url(mut self, base_url: Option<&str>) -> Self {
+        if let Some(base_url) = base_url {
+            self.base_url = base_url.trim_end_matches('/').to_owned();
             self.protocol = OpenAiUpstreamProtocol::ResponsesApi;
             self.websocket_origin_key = format!(
                 "{}:{}",
@@ -798,7 +795,7 @@ impl CodexBackendClient {
         let mut client = self.clone();
         client.outbound_proxy = account.outbound_proxy().cloned();
         client.egress_key = egress_key(account.id().as_str(), account.outbound_proxy());
-        if account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
+        if account.authentication_kind() == crate::CODEX_AUTHENTICATION_KIND_API_KEY {
             client
                 .egress_key
                 .push_str(&format!(":revision:{}", account.revision().get()));
@@ -946,6 +943,54 @@ pub(super) async fn read_error_response_body(
     response: ReqwestResponse,
 ) -> Result<Bytes, reqwest::Error> {
     response.bytes().await
+}
+
+/// JSON 与 Live 的非成功响应保留同一份原始正文、诊断和账号侧观测
+pub(super) async fn http_json_upstream_error(
+    response: ReqwestResponse,
+    trace: &gateway_core::diagnostics::TraceContext,
+    transport_metrics: CodexTransportMetrics,
+) -> CodexClientError {
+    let status = response.status();
+    let headers = response.headers();
+    let diagnostics = super::response_meta::diagnostics(Some(status.as_u16()), headers);
+    let set_cookie_headers = super::response_meta::set_cookie_headers(headers);
+    let rate_limit_headers = super::response_meta::rate_limit_headers(headers);
+    let retry_after_seconds = retry_after_seconds(headers, None);
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .map(|value| value.as_bytes().to_vec());
+    let client_headers = super::response_meta::client_headers(headers);
+    let raw_body = match read_error_response_body(response).await {
+        Ok(body) => body,
+        Err(source) => {
+            return CodexClientError::ErrorBodyRead {
+                source,
+                status,
+                diagnostics: Box::new(diagnostics),
+                transport: CodexBackendTransport::HttpJson,
+                transport_metrics: Box::new(transport_metrics),
+            };
+        }
+    };
+    trace.capture("upstream.error.body", &raw_body);
+    CodexClientError::Upstream {
+        status,
+        body: String::from_utf8_lossy(&raw_body).into_owned(),
+        client_response: Some(Box::new(CodexClientVisibleUpstreamResponse::new(
+            status,
+            content_type,
+            client_headers,
+            raw_body,
+        ))),
+        retry_after_seconds,
+        diagnostics: Box::new(diagnostics),
+        set_cookie_headers,
+        rate_limit_headers,
+        transport: CodexBackendTransport::HttpJson,
+        transport_metrics: Box::new(transport_metrics),
+        send_phase: CodexUpstreamSendPhase::AfterPayload,
+    }
 }
 
 // ---------------------------------------------------------------------------

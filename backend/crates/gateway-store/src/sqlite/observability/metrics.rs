@@ -1,6 +1,6 @@
 //! SQLite 用量指标、趋势和计费事实查询。
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{TryStreamExt, stream::BoxStream};
@@ -272,7 +272,7 @@ fn cost_totals(
         .map(|(currency, amount)| {
             Ok(CurrencyCostTotal {
                 currency,
-                amount: DecimalAmount::from_str(&amount.canonical())?,
+                amount: crate::postgres::parse_decimal_amount(&amount.canonical())?,
             })
         })
         .collect()
@@ -431,7 +431,7 @@ impl MetricAccumulator {
         }
         if let Some(value) = record.latency_ms {
             self.metrics.latency_count = add_u64(self.metrics.latency_count, 1)?;
-            self.metrics.latency_sum = add_u64(self.metrics.latency_sum, value)?;
+            self.metrics.latency_sum_ms = add_u64(self.metrics.latency_sum_ms, value)?;
             self.metrics.max_latency_ms = Some(self.metrics.max_latency_ms.unwrap_or(0).max(value));
             self.metrics.min_latency_ms = Some(
                 self.metrics
@@ -443,8 +443,8 @@ impl MetricAccumulator {
         if let Some(value) = record.first_token_ms {
             self.metrics.first_token_latency_count =
                 add_u64(self.metrics.first_token_latency_count, 1)?;
-            self.metrics.first_token_latency_sum =
-                add_u64(self.metrics.first_token_latency_sum, value)?;
+            self.metrics.first_token_latency_sum_ms =
+                add_u64(self.metrics.first_token_latency_sum_ms, value)?;
             self.first_token_ms.push(value as f64);
         }
         if let (Some(output), Some(latency), Some(first_token)) = (
@@ -506,7 +506,7 @@ impl MetricAccumulator {
             .map(|(currency, amount)| {
                 Ok(CurrencyCostTotal {
                     currency,
-                    amount: DecimalAmount::from_str(&amount.canonical())?,
+                    amount: crate::postgres::parse_decimal_amount(&amount.canonical())?,
                 })
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -568,7 +568,7 @@ pub(crate) async fn dashboard_account_usage(
         let cost_amount = amount
             .map(|value| {
                 let decimal = decode_amount(&value)?;
-                DecimalAmount::from_str(&decimal.canonical())
+                crate::postgres::parse_decimal_amount(&decimal.canonical())
             })
             .transpose()?;
         let usage = UsageFact {
@@ -757,6 +757,7 @@ pub(crate) async fn usage_diagnostics(
     range: ObservabilityRange,
     filter: &UsageRecordFilter,
     dimension: DiagnosticDimension,
+    limit: u16,
 ) -> StoreResult<DiagnosticsObservation> {
     filter.validate()?;
     let mut query = QueryBuilder::<Sqlite>::new("select ");
@@ -914,7 +915,7 @@ pub(crate) async fn usage_diagnostics(
         dimension,
         DiagnosticDimension::Account | DiagnosticDimension::AccountApiKey
     ) {
-        items.truncate(100);
+        items.truncate(usize::from(limit));
     }
     Ok(DiagnosticsObservation {
         total_request_count,
@@ -1054,11 +1055,11 @@ pub(crate) async fn metric_series(
     pool: &SqlitePool,
     range: ObservabilityRange,
     filter: &UsageRecordFilter,
+    granularity: ObservationGranularity,
     timezone: gateway_core::time::DeploymentTimeZone,
     include_costs: bool,
 ) -> StoreResult<Vec<RequestMetricPoint>> {
     filter.validate()?;
-    let granularity = granularity_for(range);
     let mut groups = BTreeMap::<DateTime<Utc>, MetricAccumulator>::new();
     let mut rows = metric_records(pool, range, filter);
     while let Some(row) = rows.try_next().await? {
@@ -1124,7 +1125,7 @@ fn metric_record_from_row(row: &SqliteRow) -> StoreResult<MetricRecord> {
     let cost_amount = cost_amount
         .map(|value| {
             let decimal = decode_amount(&value)?;
-            DecimalAmount::from_str(&decimal.canonical())
+            crate::postgres::parse_decimal_amount(&decimal.canonical())
         })
         .transpose()?;
     Ok(MetricRecord {
@@ -1203,7 +1204,7 @@ pub(crate) async fn dashboard_totals(pool: &SqlitePool) -> StoreResult<Dashboard
         has_billing = true;
     }
     let billing_usd = has_billing
-        .then(|| DecimalAmount::from_str(&billing.canonical()))
+        .then(|| crate::postgres::parse_decimal_amount(&billing.canonical()))
         .transpose()?;
     Ok(DashboardTotals {
         request_count: checked_u64(row.try_get("request_count").map_err(|_| unavailable())?)?,
@@ -1218,11 +1219,11 @@ pub(crate) fn calculated_billing_facts(
     pool: &SqlitePool,
     range: ObservabilityRange,
     filter: UsageRecordFilter,
+    granularity: ObservationGranularity,
     timezone: gateway_core::time::DeploymentTimeZone,
 ) -> BoxStream<'_, StoreResult<CalculatedUsageBillingFact>> {
     Box::pin(async_stream::try_stream! {
         filter.validate()?;
-        let granularity = granularity_for(range);
         let mut query = QueryBuilder::<Sqlite>::new(
             "select mr.started_at_us, mr.provider_kind, mr.upstream_model_id, mr.service_tier,
                     mr.input_tokens, mr.output_tokens, mr.cached_tokens, mr.cache_write_tokens,
@@ -1263,22 +1264,11 @@ pub(crate) fn calculated_billing_facts(
                 cache_write_tokens: optional_u64("cache_write_tokens")?,
                 total: CurrencyCostTotal {
                     currency,
-                    amount: DecimalAmount::from_str(&decimal.canonical())?,
+                    amount: crate::postgres::parse_decimal_amount(&decimal.canonical())?,
                 },
             };
         }
     })
-}
-
-fn granularity_for(range: ObservabilityRange) -> ObservationGranularity {
-    let seconds = range.end.signed_duration_since(range.start).num_seconds();
-    if seconds <= 2 * 24 * 60 * 60 {
-        ObservationGranularity::FifteenMinutes
-    } else if seconds <= 31 * 24 * 60 * 60 {
-        ObservationGranularity::Hour
-    } else {
-        ObservationGranularity::Day
-    }
 }
 
 fn metric_bucket(
@@ -1347,13 +1337,22 @@ fn fill_gaps(
 fn percentiles(values: &[f64]) -> StoreResult<LatencyPercentiles> {
     Ok(LatencyPercentiles {
         p50_ms: percentile(values, 0.50)?
-            .map(PercentileMilliseconds::new)
+            .map(|value| {
+                PercentileMilliseconds::new(value)
+                    .map_err(|_| invalid("invalid latency percentile"))
+            })
             .transpose()?,
         p95_ms: percentile(values, 0.95)?
-            .map(PercentileMilliseconds::new)
+            .map(|value| {
+                PercentileMilliseconds::new(value)
+                    .map_err(|_| invalid("invalid latency percentile"))
+            })
             .transpose()?,
         p99_ms: percentile(values, 0.99)?
-            .map(PercentileMilliseconds::new)
+            .map(|value| {
+                PercentileMilliseconds::new(value)
+                    .map_err(|_| invalid("invalid latency percentile"))
+            })
             .transpose()?,
     })
 }

@@ -49,6 +49,16 @@ use super::{
     sqlite_unavailable,
 };
 
+const fn account_status_sort_rank(status: AccountStatus) -> u8 {
+    match status {
+        AccountStatus::Normal => 0,
+        AccountStatus::RateLimited => 1,
+        AccountStatus::QuotaExhausted => 2,
+        AccountStatus::Error => 3,
+        AccountStatus::Disabled => 4,
+    }
+}
+
 #[derive(Clone)]
 pub struct SqliteAdminAccountStore {
     pool: SqlitePool,
@@ -737,6 +747,7 @@ impl SqliteAdminAccountStore {
                 .ok_or_else(|| StoreError::NotFound {
                     entity: "outbound proxy",
                     id: id.clone(),
+                    source: None,
                 })?;
                 (Some(id.clone()), Some(url))
             }
@@ -826,6 +837,7 @@ impl SqliteAdminAccountStore {
                     return Err(StoreError::NotFound {
                         entity: "account group",
                         id: "one or more group IDs".to_owned(),
+                        source: None,
                     });
                 }
             }
@@ -1018,6 +1030,7 @@ fn invalid_store(message: &'static str) -> StoreError {
     StoreError::InvalidData {
         entity: "provider account",
         message: message.to_owned(),
+        source: None,
     }
 }
 
@@ -1057,6 +1070,7 @@ async fn ensure_accounts_exist(
         return Err(StoreError::NotFound {
             entity: "provider account",
             id: "one or more account IDs".to_owned(),
+            source: None,
         });
     }
     Ok(())
@@ -2074,11 +2088,8 @@ impl AccountStore for SqliteAdminAccountStore {
             items.sort_by(|left, right| {
                 let ordering = match sort.field {
                     AccountSortField::Email => left.account.email.cmp(&right.account.email),
-                    AccountSortField::Status => left
-                        .projection
-                        .status
-                        .sort_rank()
-                        .cmp(&right.projection.status.sort_rank()),
+                    AccountSortField::Status => account_status_sort_rank(left.projection.status)
+                        .cmp(&account_status_sort_rank(right.projection.status)),
                     AccountSortField::PlanType => {
                         left.account.plan_type.cmp(&right.account.plan_type)
                     }
@@ -2641,7 +2652,7 @@ impl AccountStore for SqliteAdminAccountStore {
             ).bind(now).bind(account_id.as_str()).execute(&mut *transaction).await
                 .map_err(|_| sqlite_unavailable("recover provider account"))?;
             if updated.rows_affected() != 1 {
-                return Err(StoreError::NotFound { entity: "provider account", id: account_id.as_str().to_owned() });
+                return Err(StoreError::NotFound { entity: "provider account", id: account_id.as_str().to_owned(), source: None, });
             }
             append_account_audit(
                 &mut transaction,
@@ -2762,6 +2773,7 @@ impl AccountStore for SqliteAdminAccountStore {
             .ok_or_else(|| StoreError::NotFound {
                 entity: "provider account",
                 id: command.account_ids[0].clone(),
+                source: None,
             })?;
             let mut query = QueryBuilder::<Sqlite>::new(
                 "select count(*) from provider_accounts where provider_kind = ",
@@ -2784,6 +2796,7 @@ impl AccountStore for SqliteAdminAccountStore {
                 return Err(StoreError::InvalidData {
                     entity: "provider account",
                     message: "all deleted accounts must exist and match Provider scope".to_owned(),
+                    source: None,
                 });
             }
             let revision =
@@ -2869,6 +2882,7 @@ impl AccountStore for SqliteAdminAccountStore {
             .ok_or_else(|| StoreError::NotFound {
                 entity: "runtime settings",
                 id: "1".to_owned(),
+                source: None,
             })?;
             let revision = crate::Revision::new(
                 u64::try_from(revision).map_err(|_| invalid_store("decode config revision"))?,

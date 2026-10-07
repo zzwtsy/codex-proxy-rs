@@ -70,6 +70,7 @@ impl AuthSessionRecord {
             return Err(StoreError::InvalidData {
                 entity: "authentication state",
                 message: "session expiry must be in the future".to_owned(),
+                source: None,
             });
         }
         if self
@@ -252,6 +253,7 @@ fn auth_state_invalid(message: &'static str) -> StoreError {
     StoreError::InvalidData {
         entity: "authentication state",
         message: message.to_owned(),
+        source: None,
     }
 }
 
@@ -587,6 +589,7 @@ impl CredentialLeaseGuard {
         let grant = self.grant.clone().ok_or_else(|| StoreError::InvalidData {
             entity: "credential lease",
             message: "lease has already been released".to_owned(),
+            source: None,
         })?;
         let renewal =
             crate::lease_renewal::LeaseRenewal::spawn(deadline, Some(cancellation), move |ttl| {
@@ -693,6 +696,7 @@ fn invalid(message: &str) -> StoreError {
     StoreError::InvalidData {
         entity: "credential lease",
         message: message.to_owned(),
+        source: None,
     }
 }
 
