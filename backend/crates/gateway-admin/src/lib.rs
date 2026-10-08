@@ -330,6 +330,7 @@ impl AdminBundle {
 
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入
 pub struct AdminRuntimePorts {
+    pub diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
     pub timezone: gateway_core::time::DeploymentTimeZone,
     pub service_middleware: public_service::PlanSource,
     pub plugin_preparation: Arc<dyn ports::plugins::PluginPreparation>,
@@ -380,6 +381,7 @@ async fn initialize_inner(
     plugin_accounts: Option<Arc<dyn PluginAccountAccess>>,
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
+        diagnostics,
         timezone,
         service_middleware,
         plugin_preparation,
@@ -459,7 +461,8 @@ async fn initialize_inner(
     let plugin_accounts = plugin_accounts.unwrap_or_else(|| {
         initialize_plugin_accounts(registry.clone(), store.accounts(), snapshot.clone())
     });
-    let import_tasks = use_case::import_tasks::DefaultImportTasksService::new(credentials.clone());
+    let import_tasks =
+        use_case::import_tasks::DefaultImportTasksService::new(credentials.clone(), diagnostics);
     let import_task = use_case::import_tasks::ImportTaskWorker(import_tasks.clone());
     let settings = initialize_settings(
         store.settings(),

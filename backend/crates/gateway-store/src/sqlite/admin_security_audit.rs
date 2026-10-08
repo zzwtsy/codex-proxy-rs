@@ -139,6 +139,8 @@ pub(crate) async fn append_admin_audit_event_in_transaction(
     .bind(event.created_at.timestamp_micros())
     .execute(&mut **transaction)
     .await
-    .map_err(|_| sqlite_unavailable("append SQLite admin audit event in transaction"))?;
+    .map_err(|error| {
+        sqlite_unavailable("append SQLite admin audit event in transaction").with_source(error)
+    })?;
     Ok(())
 }

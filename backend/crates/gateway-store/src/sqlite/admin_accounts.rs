@@ -1,4 +1,4 @@
-//! SQLite Admin 账号查询与凭据事务 adapter。
+//! SQLite Admin 账号查询与凭据事务适配
 
 use std::{collections::HashMap, str::FromStr, time::SystemTime};
 
@@ -552,7 +552,7 @@ impl SqliteAdminAccountStore {
             .bind(&binding.id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|_| unavailable("validate imported outbound proxy"))?
+            .map_err(|error| unavailable("validate imported outbound proxy").with_source(error))?
             .ok_or_else(|| not_found("imported outbound proxy does not exist"))?;
             if current != binding.proxy.expose_url() {
                 return Err(AdminStoreError::new(
@@ -602,7 +602,9 @@ impl SqliteAdminAccountStore {
                 .bind(url)
                 .fetch_optional(&mut **transaction)
                 .await
-                .map_err(|_| unavailable("resolve imported outbound proxy"))?,
+                .map_err(|error| {
+                    unavailable("resolve imported outbound proxy").with_source(error)
+                })?,
                 None => None,
             };
             let observed = account.credential_observed_at.timestamp_micros();
@@ -652,10 +654,10 @@ impl SqliteAdminAccountStore {
             .bind(observed).bind(outbound_proxy_url).bind(outbound_proxy_id).bind(created)
             .bind(i64::from(model_access_explicit))
             .fetch_one(&mut **transaction).await
-            .map_err(|_| AdminStoreError::new(AdminStoreErrorKind::Conflict, "SQLite account", "credential import conflicts with an existing account"))?;
+            .map_err(|error| AdminStoreError::new(AdminStoreErrorKind::Conflict, "SQLite account", "credential import conflicts with an existing account").with_source(error))?;
             let id: String = imported
                 .try_get("id")
-                .map_err(|_| unavailable("decode imported account ID"))?;
+                .map_err(|error| unavailable("decode imported account ID").with_source(error))?;
             account_ids.push(id);
         }
         let mut unique_ids = account_ids.clone();
@@ -703,8 +705,9 @@ impl SqliteAdminAccountStore {
         let credential_ids = account_ids
             .into_iter()
             .map(|id| {
-                ProviderAccountId::new(id)
-                    .map_err(|_| unavailable("import returned an invalid account ID"))
+                ProviderAccountId::new(id).map_err(|error| {
+                    unavailable("import returned an invalid account ID").with_source(error)
+                })
             })
             .collect::<AdminStoreResult<Vec<_>>>()?;
         Ok(CredentialImportResult {
@@ -743,7 +746,9 @@ impl SqliteAdminAccountStore {
                 .bind(id)
                 .fetch_optional(&mut **transaction)
                 .await
-                .map_err(|_| sqlite_unavailable("load account outbound proxy"))?
+                .map_err(|error| {
+                    sqlite_unavailable("load account outbound proxy").with_source(error)
+                })?
                 .ok_or_else(|| StoreError::NotFound {
                     entity: "outbound proxy",
                     id: id.clone(),
@@ -790,11 +795,14 @@ impl SqliteAdminAccountStore {
                 separated.push_bind(account_id);
             }
         }
+        query.push(")");
         query
             .build()
             .execute(&mut **transaction)
             .await
-            .map_err(|_| sqlite_unavailable("update SQLite provider account settings"))?;
+            .map_err(|error| {
+                sqlite_unavailable("update SQLite provider account settings").with_source(error)
+            })?;
 
         if let Some(notes) = notes {
             let notes = (!notes.trim().is_empty()).then(|| notes.trim());
@@ -809,11 +817,14 @@ impl SqliteAdminAccountStore {
                     separated.push_bind(account_id);
                 }
             }
+            query.push(")");
             query
                 .build()
                 .execute(&mut **transaction)
                 .await
-                .map_err(|_| sqlite_unavailable("update SQLite provider account notes"))?;
+                .map_err(|error| {
+                    sqlite_unavailable("update SQLite provider account notes").with_source(error)
+                })?;
         }
 
         if let Some(group_ids) = group_ids {
@@ -850,11 +861,14 @@ impl SqliteAdminAccountStore {
                     separated.push_bind(account_id);
                 }
             }
+            delete.push(")");
             delete
                 .build()
                 .execute(&mut **transaction)
                 .await
-                .map_err(|_| sqlite_unavailable("clear account group assignments"))?;
+                .map_err(|error| {
+                    sqlite_unavailable("clear account group assignments").with_source(error)
+                })?;
             if !group_ids.is_empty() {
                 let now = Utc::now().timestamp_micros();
                 for group_id in group_ids {
@@ -869,7 +883,9 @@ impl SqliteAdminAccountStore {
                         .bind(now)
                         .execute(&mut **transaction)
                         .await
-                        .map_err(|_| sqlite_unavailable("assign account group"))?;
+                        .map_err(|error| {
+                            sqlite_unavailable("assign account group").with_source(error)
+                        })?;
                     }
                 }
             }
@@ -1005,15 +1021,15 @@ async fn finish_account_admin_transaction<T>(
             transaction
                 .commit()
                 .await
-                .map_err(|_| unavailable(operation))?;
+                .map_err(|error| unavailable(operation).with_source(error))?;
             Ok(value)
         }
         Err(error) => {
-            transaction
-                .rollback()
-                .await
-                .map_err(|_| unavailable(operation))?;
-            Err(error)
+            // 显式等待回滚，清理失败作为附属原因保留，不覆盖主失败
+            match transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.with_cleanup(cleanup)),
+            }
         }
     }
 }
@@ -1065,7 +1081,9 @@ async fn ensure_accounts_exist(
         .build_query_scalar()
         .fetch_one(&mut **transaction)
         .await
-        .map_err(|_| sqlite_unavailable("validate provider account selection"))?;
+        .map_err(|error| {
+            sqlite_unavailable("validate provider account selection").with_source(error)
+        })?;
     if usize::try_from(count).ok() != Some(account_ids.len()) {
         return Err(StoreError::NotFound {
             entity: "provider account",
@@ -1093,7 +1111,7 @@ async fn count_group_ids(
         .build_query_scalar()
         .fetch_one(&mut **transaction)
         .await
-        .map_err(|_| sqlite_unavailable("validate account group selection"))
+        .map_err(|error| sqlite_unavailable("validate account group selection").with_source(error))
 }
 
 async fn bump_account_revision(
@@ -1127,15 +1145,15 @@ async fn finish_account_transaction<T>(
             transaction
                 .commit()
                 .await
-                .map_err(|_| sqlite_unavailable(operation))?;
+                .map_err(|error| sqlite_unavailable(operation).with_source(error))?;
             Ok(value)
         }
         Err(error) => {
-            transaction
-                .rollback()
-                .await
-                .map_err(|_| sqlite_unavailable(operation))?;
-            Err(error)
+            // 显式等待回滚，清理失败作为附属原因保留，不覆盖主失败
+            match transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.with_cleanup(cleanup)),
+            }
         }
     }
 }
@@ -2307,11 +2325,9 @@ impl AccountStore for SqliteAdminAccountStore {
         command: CredentialImportCommit,
         context: &MutationContext,
     ) -> AdminStoreResult<CredentialImportResult> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| unavailable("begin credential import transaction"))?;
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            unavailable("begin credential import transaction").with_source(error)
+        })?;
         let result = async {
             acquire_write_lock(&mut transaction)
                 .await
@@ -2510,11 +2526,10 @@ impl AccountStore for SqliteAdminAccountStore {
                 "invalid account ID",
             )
         })?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| unavailable("begin account update transaction"))?;
+        let mut transaction =
+            self.pool.begin().await.map_err(|error| {
+                unavailable("begin account update transaction").with_source(error)
+            })?;
         let result = async {
             let revision = bump_account_revision(&mut transaction).await?;
             self.update_account_settings(
@@ -2706,11 +2721,9 @@ impl AccountStore for SqliteAdminAccountStore {
                 fields.push(name.to_owned());
             }
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| unavailable("begin account batch update transaction"))?;
+        let mut transaction = self.pool.begin().await.map_err(|error| {
+            unavailable("begin account batch update transaction").with_source(error)
+        })?;
         let result = async {
             let revision = bump_account_revision(&mut transaction).await?;
             self.update_account_settings(

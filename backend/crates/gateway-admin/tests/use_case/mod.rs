@@ -89,6 +89,7 @@ use gateway_core::{
 use std::collections::BTreeMap;
 
 pub(super) struct AdminHarness {
+    diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
     default_password: String,
     session_ttl_minutes: u64,
     client_session_ttl_minutes: u64,
@@ -114,6 +115,7 @@ impl AdminHarness {
     pub(super) fn new() -> Self {
         let unavailable = Arc::new(UnavailableStore);
         Self {
+            diagnostics: Arc::new(RecordingDiagnostics::default()),
             default_password: "strong-test-password".to_owned(),
             session_ttl_minutes: 60,
             client_session_ttl_minutes: 1_440,
@@ -151,6 +153,14 @@ impl AdminHarness {
 
     pub(super) fn accounts(mut self, store: Arc<dyn AccountStore>) -> Self {
         self.accounts = store;
+        self
+    }
+
+    pub(super) fn diagnostics(
+        mut self,
+        diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
+    ) -> Self {
+        self.diagnostics = diagnostics;
         self
     }
 
@@ -274,6 +284,7 @@ impl AdminHarness {
                 Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
+                diagnostics: self.diagnostics,
                 timezone: Default::default(),
                 service_middleware: self.service_middleware,
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),
@@ -296,6 +307,22 @@ impl AdminHarness {
         )
         .await
         .expect("initialize admin test harness")
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RecordingDiagnostics(
+    pub(super) Mutex<Vec<gateway_core::diagnostics::OperationalFailure>>,
+);
+
+#[async_trait]
+impl gateway_core::diagnostics::OperationalDiagnostics for RecordingDiagnostics {
+    async fn record_failure(
+        &self,
+        failure: gateway_core::diagnostics::OperationalFailure,
+    ) -> Result<(), gateway_core::error::StoreError> {
+        self.0.lock().unwrap().push(failure);
+        Ok(())
     }
 }
 

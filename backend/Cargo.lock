@@ -1679,6 +1679,7 @@ dependencies = [
  "cron",
  "futures",
  "gateway-core",
+ "gateway-store",
  "heck",
  "hex",
  "prettyplease",

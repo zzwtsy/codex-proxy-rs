@@ -195,6 +195,7 @@ impl AdminTestFixture {
             ClientConfig::default(),
             stores,
             gateway_admin::AdminRuntimePorts {
+                diagnostics: Arc::new(crate::support::RecordingDiagnostics::default()),
                 timezone,
                 service_middleware: std::sync::Arc::new(|| None),
                 plugin_preparation: plugin_ports.clone(),

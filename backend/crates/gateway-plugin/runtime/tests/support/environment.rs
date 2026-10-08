@@ -533,6 +533,7 @@ impl Environment {
             ClientConfig::default(),
             self.store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
+                diagnostics: self.store.diagnostics(),
                 timezone: Default::default(),
                 service_middleware: {
                     let snapshots = core.snapshots();

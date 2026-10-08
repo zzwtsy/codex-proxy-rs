@@ -1,3 +1,5 @@
+//! 验证 SQLite 账号查询、导入、设置更新与失败事务的原子性
+
 use gateway_admin::{
     model::{
         PageSize,
@@ -117,6 +119,457 @@ async fn sqlite_admin_account_views_read_core_accounts_and_credentials() {
     );
 
     pool.close().await;
+}
+
+async fn account_write_fixture() -> (tempfile::TempDir, sqlx::SqlitePool, SqliteAdminAccountStore) {
+    let root = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect_and_migrate(
+        &root.path().join("account-writes.sqlite3"),
+        &SqliteStoreConfig::default(),
+    )
+    .await
+    .unwrap();
+    let store = SqliteAdminAccountStore::new(pool.clone());
+    (root, pool, store)
+}
+
+fn write_context() -> gateway_admin::model::MutationContext {
+    gateway_admin::model::MutationContext {
+        actor: gateway_admin::model::MutationActor::System,
+        request_id: "sqlite-account-write-test".to_owned(),
+    }
+}
+
+fn imported_credential(
+    id: &str,
+    user: &str,
+) -> gateway_admin::model::provider_credentials::PreparedCredentialCreate {
+    use gateway_admin::model::provider_credentials::{PreparedCredentialCreate, ProviderDocument};
+    use gateway_core::account::{CredentialState, OpaqueProviderData};
+    PreparedCredentialCreate {
+        model_access: None,
+        outbound_proxy: None,
+        account_id: ProviderAccountId::new(id).unwrap(),
+        provider_kind: ProviderKind::new("example").unwrap(),
+        name: id.to_owned(),
+        email: None,
+        upstream_user_id: Some(user.to_owned()),
+        upstream_account_id: None,
+        plan_type: None,
+        authentication_kind: "oauth".to_owned(),
+        provider_material: ProviderDocument::new(OpaqueProviderData::new(
+            serde_json::json!({"access_token": "synthetic-import-secret"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )),
+        has_refresh_token: false,
+        access_token_expires_at: None,
+        next_refresh_at: None,
+        enabled: true,
+        credential_state: CredentialState::Ready,
+        credential_observed_at: chrono::Utc::now(),
+    }
+}
+
+fn import_command(
+    identities: &[(&str, &str)],
+    settings: Option<gateway_admin::model::accounts::AccountImportSettings>,
+) -> gateway_admin::model::provider_credentials::CredentialImportCommit {
+    use gateway_admin::model::provider_credentials::{
+        CredentialImportCommit, PreparedCredentialImport,
+    };
+    CredentialImportCommit {
+        outbound_proxy: None,
+        settings,
+        prepared: PreparedCredentialImport {
+            provider_kind: ProviderKind::new("example").unwrap(),
+            credentials: identities
+                .iter()
+                .map(|(id, user)| imported_credential(id, user))
+                .collect(),
+        },
+    }
+}
+
+fn import_settings() -> gateway_admin::model::accounts::AccountImportSettings {
+    use gateway_core::account::{AccountConcurrencyLimit, AccountWeight};
+    gateway_admin::model::accounts::AccountImportSettings {
+        enabled: false,
+        concurrency_limit: AccountConcurrencyLimit::new(3),
+        weight: AccountWeight::new(7).unwrap(),
+        notes: Some("  团队备用  ".to_owned()),
+        model_access: None,
+        group_ids: vec![
+            gateway_core::routing::AccountGroupId::new("grp_0123456789abcdef0123456789abcdef")
+                .unwrap(),
+        ],
+    }
+}
+
+async fn seed_import_group(pool: &sqlx::SqlitePool) {
+    sqlx::query("insert into account_groups (id, name, created_at_us, updated_at_us) values (?1, 'Import group', 1, 1)")
+        .bind(import_settings().group_ids[0].as_str()).execute(pool).await.unwrap();
+}
+
+async fn write_snapshot(pool: &sqlx::SqlitePool) -> (Vec<String>, Vec<(String, String)>, i64, i64) {
+    let accounts = sqlx::query_scalar("select json_object('id', id, 'credentials', provider_credentials_json, 'credential_revision', credential_revision, 'enabled', enabled, 'limit', concurrency_limit, 'weight', weight, 'notes', notes, 'updated', updated_at_us) from provider_accounts order by id")
+        .fetch_all(pool).await.unwrap();
+    let groups = sqlx::query_as("select provider_account_id, account_group_id from account_group_accounts order by provider_account_id, account_group_id")
+        .fetch_all(pool).await.unwrap();
+    let revision = sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let audits = sqlx::query_scalar("select count(*) from admin_audit_events")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (accounts, groups, revision, audits)
+}
+
+#[tokio::test]
+async fn sqlite_import_settings_apply_to_new_and_existing_identities_and_preserve_memberships() {
+    let (_root, pool, store) = account_write_fixture().await;
+    seed_import_group(&pool).await;
+    store
+        .commit_credential_import(
+            import_command(&[("acct_existing", "existing-user")], None),
+            &write_context(),
+        )
+        .await
+        .unwrap();
+    let result = store
+        .commit_credential_import(
+            import_command(
+                &[
+                    ("acct_new", "new-user"),
+                    ("acct_candidate", "existing-user"),
+                    ("acct_duplicate", "existing-user"),
+                ],
+                Some(import_settings()),
+            ),
+            &write_context(),
+        )
+        .await
+        .expect("import settings must execute valid SQLite SQL");
+    assert_eq!(
+        result
+            .credential_ids
+            .iter()
+            .map(ProviderAccountId::as_str)
+            .collect::<Vec<_>>(),
+        ["acct_new", "acct_existing", "acct_existing"]
+    );
+    type SavedAccountSettings = (String, i64, Option<i64>, i64, Option<String>);
+    let saved: Vec<SavedAccountSettings> = sqlx::query_as(
+        "select id, enabled, concurrency_limit, weight, notes from provider_accounts order by id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        saved,
+        [
+            (
+                "acct_existing".to_owned(),
+                0,
+                Some(3),
+                7,
+                Some("团队备用".to_owned())
+            ),
+            (
+                "acct_new".to_owned(),
+                0,
+                Some(3),
+                7,
+                Some("团队备用".to_owned())
+            )
+        ]
+    );
+    let before = write_snapshot(&pool).await;
+    assert_eq!(before.1.len(), 2);
+    store
+        .commit_credential_import(
+            import_command(&[("acct_reimported", "existing-user")], None),
+            &write_context(),
+        )
+        .await
+        .unwrap();
+    let after = write_snapshot(&pool).await;
+    assert_eq!(after.1, before.1);
+    let notes: Option<String> =
+        sqlx::query_scalar("select notes from provider_accounts where id = 'acct_existing'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notes.as_deref(), Some("团队备用"));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_single_account_settings_replace_and_clear_notes_and_groups() {
+    use gateway_admin::model::accounts::UpdateAccount;
+    let (_root, pool, store) = account_write_fixture().await;
+    seed_import_group(&pool).await;
+    store
+        .commit_credential_import(
+            import_command(&[("acct_single", "single-user")], None),
+            &write_context(),
+        )
+        .await
+        .unwrap();
+    let settings = import_settings();
+    let mut command = UpdateAccount {
+        account_id: "acct_single".to_owned(),
+        enabled: settings.enabled,
+        concurrency_limit: settings.concurrency_limit,
+        weight: settings.weight,
+        notes: settings.notes,
+        model_access: None,
+        group_ids: settings.group_ids,
+        outbound_proxy: None,
+    };
+    store
+        .update_account(command.clone(), &write_context())
+        .await
+        .unwrap();
+    let before = write_snapshot(&pool).await;
+    assert_eq!(before.1.len(), 1);
+    command.notes = None;
+    store
+        .update_account(command.clone(), &write_context())
+        .await
+        .unwrap();
+    let notes: Option<String> =
+        sqlx::query_scalar("select notes from provider_accounts where id = 'acct_single'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notes.as_deref(), Some("团队备用"));
+    command.notes = Some(" \n\t ".to_owned());
+    command.group_ids.clear();
+    store
+        .update_account(command, &write_context())
+        .await
+        .unwrap();
+    let notes: Option<String> =
+        sqlx::query_scalar("select notes from provider_accounts where id = 'acct_single'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notes, None);
+    assert!(write_snapshot(&pool).await.1.is_empty());
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_batch_settings_update_one_or_many_accounts_without_overwriting_omitted_fields() {
+    use gateway_admin::model::accounts::BatchUpdateAccounts;
+    use gateway_core::account::AccountWeight;
+    let (_root, pool, store) = account_write_fixture().await;
+    seed_import_group(&pool).await;
+    store
+        .commit_credential_import(
+            import_command(
+                &[("acct_first", "first-user"), ("acct_second", "second-user")],
+                Some(import_settings()),
+            ),
+            &write_context(),
+        )
+        .await
+        .unwrap();
+    for ids in [vec!["acct_first"], vec!["acct_first", "acct_second"]] {
+        store
+            .batch_update_accounts(
+                BatchUpdateAccounts {
+                    account_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+                    enabled: None,
+                    concurrency_limit: None,
+                    weight: Some(AccountWeight::new(9).unwrap()),
+                    model_access: None,
+                    group_ids: None,
+                    outbound_proxy: None,
+                },
+                &write_context(),
+            )
+            .await
+            .unwrap();
+        for id in ids {
+            let saved: (i64, Option<i64>, i64, Option<String>) = sqlx::query_as("select enabled, concurrency_limit, weight, notes from provider_accounts where id = ?1")
+                .bind(id).fetch_one(&pool).await.unwrap();
+            assert_eq!(saved, (0, Some(3), 9, Some("团队备用".to_owned())));
+        }
+        assert_eq!(write_snapshot(&pool).await.1.len(), 2);
+    }
+    store
+        .batch_update_accounts(
+            BatchUpdateAccounts {
+                account_ids: vec!["acct_first".to_owned(), "acct_second".to_owned()],
+                enabled: None,
+                concurrency_limit: Some(None),
+                weight: None,
+                model_access: None,
+                group_ids: Some(Vec::new()),
+                outbound_proxy: None,
+            },
+            &write_context(),
+        )
+        .await
+        .unwrap();
+    assert!(write_snapshot(&pool).await.1.is_empty());
+    let limits: Vec<Option<i64>> =
+        sqlx::query_scalar("select concurrency_limit from provider_accounts")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(limits, [None, None]);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_import_write_failure_rolls_back_credentials_settings_revision_and_audit() {
+    let (_root, pool, store) = account_write_fixture().await;
+    seed_import_group(&pool).await;
+    store
+        .commit_credential_import(
+            import_command(&[("acct_existing", "existing-user")], None),
+            &write_context(),
+        )
+        .await
+        .unwrap();
+    let before = write_snapshot(&pool).await;
+    sqlx::query("create trigger reject_import_notes before update of notes on provider_accounts begin select raise(ABORT, 'PRIVATE_SQLITE_WRITE_CAUSE'); end")
+        .execute(&pool).await.unwrap();
+    let error = store
+        .commit_credential_import(
+            import_command(
+                &[
+                    ("acct_new", "new-user"),
+                    ("acct_replacement", "existing-user"),
+                ],
+                Some(import_settings()),
+            ),
+            &write_context(),
+        )
+        .await
+        .unwrap_err();
+    let error = gateway_admin::model::AdminError::new(
+        gateway_admin::model::AdminErrorKind::Unavailable,
+        "依赖服务暂不可用",
+    )
+    .with_source(error);
+    assert!(
+        error
+            .error_details()
+            .unwrap()
+            .as_str()
+            .contains("PRIVATE_SQLITE_WRITE_CAUSE")
+    );
+    assert!(!error.to_string().contains("PRIVATE_SQLITE_WRITE_CAUSE"));
+    assert_eq!(write_snapshot(&pool).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_import_rollback_failure_keeps_the_primary_database_cause() {
+    let (_root, pool, store) = account_write_fixture().await;
+    seed_import_group(&pool).await;
+    let before = write_snapshot(&pool).await;
+    sqlx::query("create trigger rollback_import_notes before update of notes on provider_accounts begin select raise(ROLLBACK, 'PRIVATE_SQLITE_PRIMARY_CAUSE'); end")
+        .execute(&pool).await.unwrap();
+    let error = store
+        .commit_credential_import(
+            import_command(&[("acct_new", "new-user")], Some(import_settings())),
+            &write_context(),
+        )
+        .await
+        .unwrap_err();
+    let error = gateway_admin::model::AdminError::new(
+        gateway_admin::model::AdminErrorKind::Unavailable,
+        "依赖服务暂不可用",
+    )
+    .with_source(error);
+    let details: serde_json::Value =
+        serde_json::from_str(error.error_details().unwrap().as_str()).unwrap();
+    assert!(
+        details["causes"]["messages"]
+            .to_string()
+            .contains("PRIVATE_SQLITE_PRIMARY_CAUSE")
+    );
+    assert!(
+        details["causes"]["cleanup"]
+            .to_string()
+            .contains("no transaction is active")
+    );
+    assert_eq!(write_snapshot(&pool).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_account_update_failures_preserve_primary_and_cleanup_causes_and_roll_back_state() {
+    use gateway_admin::model::accounts::UpdateAccount;
+    for action in ["ABORT", "ROLLBACK"] {
+        let (_root, pool, store) = account_write_fixture().await;
+        seed_import_group(&pool).await;
+        store
+            .commit_credential_import(
+                import_command(&[("acct_existing", "existing-user")], None),
+                &write_context(),
+            )
+            .await
+            .unwrap();
+        let before = write_snapshot(&pool).await;
+        // 两种固定触发器分别验证仍可回滚和数据库已自行回滚的清理出口
+        let trigger = match action {
+            "ABORT" => {
+                "create trigger reject_update_notes before update of notes on provider_accounts begin select raise(ABORT, 'PRIVATE_UPDATE_PRIMARY_CAUSE'); end"
+            }
+            _ => {
+                "create trigger reject_update_notes before update of notes on provider_accounts begin select raise(ROLLBACK, 'PRIVATE_UPDATE_PRIMARY_CAUSE'); end"
+            }
+        };
+        sqlx::query(trigger).execute(&pool).await.unwrap();
+        let settings = import_settings();
+        let error = store
+            .update_account(
+                UpdateAccount {
+                    account_id: "acct_existing".to_owned(),
+                    enabled: settings.enabled,
+                    concurrency_limit: settings.concurrency_limit,
+                    weight: settings.weight,
+                    notes: settings.notes,
+                    model_access: None,
+                    group_ids: settings.group_ids,
+                    outbound_proxy: None,
+                },
+                &write_context(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable
+        );
+        let error = gateway_admin::model::AdminError::new(
+            gateway_admin::model::AdminErrorKind::Unavailable,
+            "依赖服务暂不可用",
+        )
+        .with_source(error);
+        let details: serde_json::Value =
+            serde_json::from_str(error.error_details().unwrap().as_str()).unwrap();
+        assert!(
+            details["causes"]["messages"]
+                .to_string()
+                .contains("PRIVATE_UPDATE_PRIMARY_CAUSE")
+        );
+        assert_eq!(
+            details["causes"]["cleanup"].is_array(),
+            action == "ROLLBACK"
+        );
+        assert_eq!(write_snapshot(&pool).await, before);
+        pool.close().await;
+    }
 }
 
 #[tokio::test]

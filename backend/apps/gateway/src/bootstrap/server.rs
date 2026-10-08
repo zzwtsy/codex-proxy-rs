@@ -63,6 +63,7 @@ pub async fn run() -> Result<(), BootstrapError> {
             config.client,
             store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
+                diagnostics: store.diagnostics(),
                 timezone,
                 service_middleware: service_middleware(core.snapshots(), &plugin_runtime),
                 providers: providers.admin,

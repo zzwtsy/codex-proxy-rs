@@ -226,7 +226,7 @@ pub(crate) async fn acquire_write_lock(
         .execute(&mut **transaction)
         .await
         .map(|_| ())
-        .map_err(|_| sqlite_unavailable("acquire SQLite write lock"))
+        .map_err(|error| sqlite_unavailable("acquire SQLite write lock").with_source(error))
 }
 
 pub(crate) fn sqlite_unavailable(operation: &'static str) -> StoreError {
@@ -252,7 +252,7 @@ pub(crate) async fn bump_config_revision(
     .bind(updated_at_us)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|_| sqlite_unavailable("advance SQLite config revision"))?
+    .map_err(|error| sqlite_unavailable("advance SQLite config revision").with_source(error))?
     .ok_or_else(|| StoreError::InvalidData {
         entity: "runtime settings",
         message: "config revision is missing or cannot be advanced".to_owned(),

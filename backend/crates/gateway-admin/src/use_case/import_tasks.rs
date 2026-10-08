@@ -10,6 +10,8 @@ use std::{
 use chrono::Utc;
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use gateway_core::{
+    diagnostics::{OperationalDiagnostics, OperationalFailure},
+    error::{ErrorDetails, ErrorSource},
     lifecycle::CancellationToken,
     task::{DaemonTask, WorkerTaskError},
 };
@@ -130,14 +132,19 @@ pub(crate) struct DefaultImportTasksService {
     registry: Mutex<Registry>,
     notify: Notify,
     credentials: Arc<CredentialsService>,
+    diagnostics: Arc<dyn OperationalDiagnostics>,
 }
 
 impl DefaultImportTasksService {
-    pub(crate) fn new(credentials: Arc<CredentialsService>) -> Arc<Self> {
+    pub(crate) fn new(
+        credentials: Arc<CredentialsService>,
+        diagnostics: Arc<dyn OperationalDiagnostics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::default(),
             notify: Notify::new(),
             credentials,
+            diagnostics,
         })
     }
 
@@ -174,44 +181,101 @@ impl DefaultImportTasksService {
     }
 
     async fn execute(&self, id: Uuid, index: usize, input: ImportTaskInput) {
+        let provider = input.provider;
+        let request_id = input.command.context.request_id.clone();
         let operation = async {
             self.credentials
-                .for_provider(&input.provider)?
+                .for_provider(&provider)?
                 .import_document(input.command)
                 .await
         };
         let result = AssertUnwindSafe(operation).catch_unwind().await;
-        let mut registry = self.registry();
-        let Some(entry) = registry.tasks.iter_mut().find(|entry| entry.task_id == id) else {
-            return;
+        let result = match result {
+            Ok(result) => result,
+            // 任意 panic payload 可能包含凭据，受控诊断也只保存确定的中断事实
+            Err(_) => Err(AdminError::new(
+                AdminErrorKind::Internal,
+                "执行中断，请先核对账号列表再决定是否重新导入",
+            )),
         };
-        let item = &mut entry.items[index];
-        match result {
-            Ok(Ok(result)) => {
-                item.status = ImportItemStatus::Succeeded;
-                item.account_ids = result.credential_ids;
-            }
-            Ok(Err(error)) => {
-                // 存储或发布异常也可能发生在提交之后；不自动重放可能轮换 RT 的操作
-                item.status = if matches!(
-                    error.kind(),
-                    AdminErrorKind::UpstreamResultUnknown
-                        | AdminErrorKind::Internal
-                        | AdminErrorKind::Unavailable
-                ) {
-                    ImportItemStatus::Unknown
-                } else {
-                    ImportItemStatus::Failed
-                };
-                item.message = Some(error.message().to_owned());
-            }
-            Err(_) => {
-                item.status = ImportItemStatus::Unknown;
-                item.message = Some("执行中断，请先核对账号列表再决定是否重新导入".to_owned());
+        let error = {
+            let mut registry = self.registry();
+            let Some(entry) = registry.tasks.iter_mut().find(|entry| entry.task_id == id) else {
+                return;
+            };
+            let item = &mut entry.items[index];
+            let error = match result {
+                Ok(result) => {
+                    item.status = ImportItemStatus::Succeeded;
+                    item.account_ids = result.credential_ids;
+                    None
+                }
+                Err(error) => {
+                    // 存储或发布异常也可能发生在提交之后；不自动重放可能轮换 RT 的操作
+                    item.status = if matches!(
+                        error.kind(),
+                        AdminErrorKind::UpstreamResultUnknown
+                            | AdminErrorKind::Internal
+                            | AdminErrorKind::Unavailable
+                    ) {
+                        ImportItemStatus::Unknown
+                    } else {
+                        ImportItemStatus::Failed
+                    };
+                    item.message = Some(error.message().to_owned());
+                    Some(error)
+                }
+            };
+            entry.finish_if_done();
+            error
+        };
+        // 终态先对轮询可见，异步诊断不能持有注册表锁或改变业务结果
+        if let Some(error) = error {
+            tracing::warn!(
+                stage = "account_import.item_failed",
+                task_id = %id,
+                item_index = index + 1,
+                request_id = %request_id,
+                provider = %provider.as_str(),
+                error_kind = error.kind().as_str(),
+                "account import item failed"
+            );
+            let mut failure = OperationalFailure::new(
+                "admin",
+                "account_import",
+                error.kind().as_str(),
+                error.message(),
+            );
+            failure.correlation_id = Some(id.to_string());
+            failure.provider_kind = Some(provider);
+            let source = ErrorSource::new(ImportItemFailure {
+                task_id: id,
+                index: index + 1,
+                request_id: request_id.clone(),
+                source: error,
+            });
+            failure.details = ErrorDetails::capture(Some(&source), None, false);
+            if self.diagnostics.record_failure(failure).await.is_err() {
+                tracing::warn!(
+                    stage = "account_import.diagnostic_dropped",
+                    task_id = %id,
+                    item_index = index + 1,
+                    request_id = %request_id,
+                    "account import diagnostic could not be recorded"
+                );
             }
         }
-        entry.finish_if_done();
     }
+}
+
+// 条目上下文只进入受控原因链，不增加公开任务字段或记录原始输入
+#[derive(Debug, thiserror::Error)]
+#[error("account import task {task_id}, item {index}, submit request {request_id} failed")]
+struct ImportItemFailure {
+    task_id: Uuid,
+    index: usize,
+    request_id: String,
+    source: AdminError,
 }
 
 impl ImportTasksService for DefaultImportTasksService {
