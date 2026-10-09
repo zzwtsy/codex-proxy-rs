@@ -14,7 +14,7 @@
 
 ## 环境与依赖
 
-需要 Node.js 24、pnpm 和 [Rust 工具链](architecture.md#验证命令)。服务可使用 PostgreSQL + Redis，也可用单文件 SQLite 本地运行
+需要 Node.js 24、pnpm 12.6.0 和 Rust 1.97 工具链。服务可使用 PostgreSQL + Redis，也可用单文件 SQLite 本地运行
 
 各前端的 `packageManager` 固定 pnpm 版本，宿主 CI 和 Docker 从 `frontend/package.json` 读取
 
@@ -22,7 +22,7 @@ Rust 工具链声明位于 `backend/rust-toolchain.toml`，从仓库根目录运
 `--manifest-path` 只选择 manifest，不切换 rustup 按当前目录选定的工具链
 
 ```bash
-git clone https://github.com/zyycn/codex-proxy-rs.git
+git clone https://github.com/zzwtsy/codex-proxy-rs.git
 cd codex-proxy-rs
 pnpm --dir frontend install --frozen-lockfile
 ```
@@ -35,28 +35,76 @@ pnpm --dir frontend install --frozen-lockfile
 
 ## 启动宿主
 
-使用源码仓库自带的 Compose 与配置模板，按[手动安装](../deploy/README.md#手动安装)中的配置与权限要求准备 `deploy/config.yaml` 和 `.runtime/` 目录
+命令从仓库根目录执行，不覆盖已有 `deploy/config.yaml`。本地开发优先使用 SQLite 快速启动；验证 PostgreSQL + Redis 行为时选择对应模式。两种模式的数据库互不迁移
 
-默认 backend 的数据库及 Redis 可由 Compose 启动：
+### SQLite 本地启动
 
 ```bash
-docker compose --env-file .env -f deploy/compose.yaml up -d postgres redis
+set -e
+test ! -e deploy/config.yaml
+mkdir -p .runtime/data .runtime/logs
+cp deploy/config.example.sqlite.yaml deploy/config.yaml
+chmod 0600 deploy/config.yaml
+```
+
+在配置中填写符合策略的 `admin.default_password`：至少 12 个字符，不含 `$`，不能使用常见弱口令。由当前用户运行后端，数据库保存在 `.runtime/data/codex-proxy.sqlite3`
+
+```bash
 cargo +1.97.0 run --manifest-path backend/Cargo.toml -p codex-proxy-rs --locked
 ```
 
-本机也可在 `deploy/config.yaml` 选择 `store.backend: sqlite`，设置 `host.runtime_data_dir`，然后直接运行网关；无需启动外部存储服务。后端从当前目录向上查找 `deploy/config.yaml`。PostgreSQL + Redis 模式的宿主机进程不读取 `.env`，须在配置中填写密码或设置 `CPR_DATABASE_PASSWORD` / `CPR_REDIS_PASSWORD`
+后端从当前目录向上查找 `deploy/config.yaml`，数据、日志和静态资源的相对路径以配置目录解析，SQLite 数据库相对路径以运行数据目录解析。可写启动自动建库并执行迁移，不需外部服务
 
-`host.runtime_data_dir` 和日志的相对路径以该配置文件所在目录解析
+### PostgreSQL + Redis 本地启动
 
-另开终端启动管理端：
+使用源码仓库自带模板准备一个新的开发环境，需要 Docker Compose 和 OpenSSL。以下命令不下载发行版模板，只启动依赖服务：
 
 ```bash
+set -e
+test ! -e deploy/config.yaml
+test ! -e .env
+cp deploy/config.example.yaml deploy/config.yaml
+chmod 0600 deploy/config.yaml
+mkdir -p .runtime/postgres .runtime/redis .runtime/data .runtime/logs
+(umask 077; printf 'CPR_DATABASE_PASSWORD=%s\nCPR_REDIS_PASSWORD=%s\n' \
+  "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > .env)
+docker compose --env-file .env -f deploy/compose.yaml up -d --wait postgres redis
+```
+
+原生后端不读取 `.env`，在 `deploy/config.yaml` 的 `store.database.password`、`store.redis.password` 填写相同服务密码，或由启动终端提供 `CPR_DATABASE_PASSWORD`、`CPR_REDIS_PASSWORD`。确认数据库与 Redis URL 指向 Compose 发布的本机端口，不使用容器主机名，填写管理员初始密码后运行上面的 Cargo 命令
+
+### 管理端与启动验收
+
+另开终端运行：
+
+```bash
+curl -i http://127.0.0.1:8080/healthz
 pnpm --dir frontend dev
 ```
 
-后端代理由 `frontend/vite.config.ts` 配置，验证 WebSocket 时直接连接后端
+`204` 表示服务健康，不证明上游账号可用。访问 Vite 输出的本机地址登录管理端，后端代理由 `frontend/vite.config.ts` 配置；验证 WebSocket 时直接连接后端。纯后端开发不需先构建静态页面，正式页面验证使用构建后的资源
 
-前后端检查见 [贡献与审查](../CONTRIBUTING.md#验证)，数据库集成测试使用[专用测试库](../backend/migrations/postgres/README.md#本地测试库)
+首次使用按[使用指南](usage.md)添加账号和密钥。前端开发服务不应暴露到公网，联调完成后停止开发进程
+
+## 验证命令
+
+按变更范围选择检查，完整交付要求见[贡献与审查](../CONTRIBUTING.md#验证)。仓库根目录没有 Cargo manifest，`--manifest-path` 不切换 rustup 工具链
+
+```bash
+cargo +1.97.0 fmt --all --manifest-path backend/Cargo.toml -- --check
+RUST_MIN_STACK=16777216 cargo +1.97.0 clippy --manifest-path backend/Cargo.toml --all-targets --all-features --locked -- -D warnings
+RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml --test main --locked
+pnpm --dir frontend lint
+pnpm --dir frontend build
+```
+
+线程栈设置与 CI 一致。PostgreSQL / Redis 测试使用[专用测试库](../backend/migrations/postgres/README.md#本地测试库)，不得指向部署数据；缺少变量时相关本地测试会跳过，不能报告为已验证。SQLite 测试使用隔离临时数据库
+
+插件 Runtime 的真实子进程与持久化测试使用 `CPR_PLUGIN_TEST_DATABASE_URL` 和 `CPR_PLUGIN_TEST_REDIS_URL`；未提供时复用 `CPR_TEST_DATABASE_URL` 和 `CPR_TEST_REDIS_URL`，密码与隔离要求同 Store 测试，CI 缺少配置直接失败
+
+测试归档缓存在 Cargo 临时目录的 `plugin-packages-v1/`，按含 worker 摘要的清单复用；每项测试仍独立创建会话、子进程和 Store，缓存不承载可变运行状态。独立插件验证按其仓库的 `examples/workbench/README.md` 执行
+
+纯文档改动检查内容、链接、锚点与相关命令，不必重建前后端；构建通过也不能替代界面与集成验收
 
 ## 源码入口
 
@@ -78,7 +126,7 @@ pnpm --dir frontend dev
 首次检出可同时下载子模块：
 
 ```bash
-git clone --recurse-submodules https://github.com/zyycn/codex-proxy-rs.git
+git clone --recurse-submodules https://github.com/zzwtsy/codex-proxy-rs.git
 cd codex-proxy-rs
 ```
 

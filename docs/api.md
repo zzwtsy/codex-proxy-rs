@@ -2,7 +2,7 @@
 
 本文描述当前源码的公开 HTTP 合同，路由以 `backend/crates/gateway-api/src` 中的 router 为准
 
-配置客户端见[部署文档](../deploy/README.md#客户端配置)，内部职责见[系统架构](architecture.md)，部署实例的功能以实际运行版本和 revision 为准
+管理端操作见[使用指南](usage.md)，配置客户端见[部署文档](../deploy/README.md#客户端配置)，内部职责见[系统架构](architecture.md)，部署实例的功能以实际运行版本和 revision 为准
 
 | 查找内容 | 入口 |
 | --- | --- |
@@ -179,6 +179,22 @@ Codex PAT 验证服务不可用和身份响应无效分别返回 `50301`、`5020
 账号、分组等响应中的 `configRevision` 表示已提交事实，不是这些接口的写入前置条件。
 [运行设置整体更新](#8-运行设置)必须提交读取时的 `configRevision`，过期返回 `409`；
 代理的 `revision`、插件实例的 `expectedRevision` 属于各自资源，按对应接口提交，不与全局版本混用
+
+### 最小调用示例
+
+下例假定服务监听本机 `8080`，占位符需替换为对应身份的密钥，切勿把真实密钥提交到脚本或日志
+
+```bash
+# 数据面：客户端密钥
+curl -fsS http://127.0.0.1:8080/v1/models \
+  -H 'Authorization: Bearer <client-api-key>'
+
+# 控制面：管理 API Key，不能使用客户端密钥
+curl -fsS http://127.0.0.1:8080/api/admin/settings \
+  -H 'x-api-key: <admin-api-key>'
+```
+
+管理写入以对应路由字段合同为准，更新设置不能把单个字段当作补丁发送；先读取设置与版本，再提交完整更新对象。时间范围只选择一套参数，不混用自然日期、相对周期和 RFC3339 起止时间
 
 ## 2. 健康检查
 
@@ -1033,9 +1049,9 @@ OAuth start 使用：
 - 账号 `enabled` 控制是否参与请求调度，不控制 OAuth 凭据续期。OpenAI 与 xAI 的停用账号仍按各自刷新
   策略维护 Token；刷新结果更新凭据状态，但不会启用调度。无 refresh token 或凭据已进入失效、无效、
   封禁状态的账号不参加后台自动续期
-- `POST /accounts/recover` 对停用账号只将 `enabled` 改为 `true`，保留已有额度快照、凭据、错误和 Redis
+- `POST /accounts/recover` 对停用账号只将 `enabled` 改为 `true`，保留已有额度快照、凭据、错误和协调存储中的
   cooldown；启用后仍按这些事实投影状态，不会把已有错误或耗尽改成正常。对已启用账号则执行强制恢复：
-  清除 Redis cooldown 和已保存的额度/错误，恢复为可调度 credential。两条路径均不访问上游；强制恢复
+  清除协调存储中的 cooldown 和已保存的额度/错误，恢复为可调度 credential。两条路径均不访问上游；强制恢复
   不验证上游账号是否已经恢复，下一次真实请求仍可重新写入失败事实
 - 成功额度观测会 revision-fenced 写入 quota；明确 `Allowed` 投影为 `normal`，明确耗尽投影为
   `quota_exhausted`。额度观测不会清除凭据过期、无效或封禁事实；这些事实统一投影为 `error`，并由
@@ -1148,7 +1164,7 @@ revision 变化时丢弃结果
 ### 主动额度重置卡
 
 `GET /api/admin/accounts/reset-credits?accountId=...` 每次都查询对应 Provider；后端不把卡片列表写入
-PostgreSQL 或 Redis。当前由 OpenAI Provider 为 OAuth 账号提供，账号视图分别以 `resetCredits` 和
+持久数据库或协调存储。当前由 OpenAI Provider 为 OAuth 账号提供，账号视图分别以 `resetCredits` 和
 `consumeResetCredit` 表示查询和消费能力
 
 查询响应：
@@ -1208,7 +1224,7 @@ HTTP 请求头及新建 WS 的握手提示按当时的最终出站档位构造�
 
 | 方法 | 路由 | 主要 query/body | 说明 |
 | --- | --- | --- | --- |
-| `GET` | `/api/admin/account-groups` | `page`、`pageSize`、`search`、`enabled` | 分页查询分组；返回账号可用性、并发槽位（Redis 不可用时 `usedSlots=null`）及成功请求 USD 用量 |
+| `GET` | `/api/admin/account-groups` | `page`、`pageSize`、`search`、`enabled` | 分页查询分组；返回账号可用性、并发槽位（并发状态不可用时 `usedSlots=null`）及成功请求 USD 用量 |
 | `GET` | `/api/admin/account-groups/options` | `page`、`pageSize`、`search`、`enabled` | 分页查询分组选择项；item 仅返回 `id`、`name`、`color`、`enabled` |
 | `POST` | `/api/admin/account-groups/create` | `{ name, description, color, fastMode? }` | 创建空分组；`color` 严格为 `#RRGGBBAA`，返回时统一大写 |
 | `POST` | `/api/admin/account-groups/update` | `{ id, name, description, color, fastMode? }` | 更新名称、描述、颜色和 Fast 模式 |
@@ -1220,7 +1236,7 @@ HTTP 请求头及新建 WS 的握手提示按当时的最终出站档位构造�
 `providerCounts` 和 `clientKeyCount`。查询分组成员使用账号列表的 `groupId` 筛选，
 不提供独立的分组成员路由；账号的 Provider 不代表整个分组的 Provider。
 `capacity.totalSlots` 为 `number | null`：`null` 表示可用成员中存在继承无限并发的账号，`0` 表示没有可用槽位。
-分组容量只统计普通池，`capacity.usedSlots` 返回其实际在途数；Redis 不可用时为 `null`
+分组容量只统计普通池，`capacity.usedSlots` 返回其实际在途数；并发状态不可用时为 `null`
 
 分组费用按请求执行时实际服务账号的分组快照归属，不按 Client Key 绑定的分组分摊。
 账号属于多个组时，各组均包含该请求费用；之后调整账号分组不重写历史归属
@@ -1450,7 +1466,7 @@ Guardian 以 `subagent_kind` 或 `client_metadata.x-openai-subagent` 值 `guardi
 
 `openaiSessionAffinityTtlHours` 是账号绑定及其会话关联的滑动保留时长，单位小时，默认 24，取值 1～720。
 各类请求统一在发送前成功准入时按请求冻结值续期。
-响应完成不回写或续期。调整时长不扫描已有 Redis 键，已有记录保留原到期时间，下一次成功准入时使用新值；
+响应完成不回写或续期。调整时长不扫描已有亲和记录，已有记录保留原到期时间，下一次成功准入时使用新值；
 真正过期或丢失后按缺失绑定处理，存储读取错误不会被当作过期
 
 `maxAccountRotations` 是单请求最大换号次数，默认 3，取值 0～31；0 表示不换号。
@@ -1766,7 +1782,7 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 | `404` | 备份记录不存在 |
 | `409` | 已有活跃任务、状态冲突或存储身份锁定 |
 | `502` | S3 兼容服务返回无效或失败响应 |
-| `503` | PostgreSQL、`pg_dump` 或对象存储暂不可用 |
+| `503` | 所选数据库、对应快照工具或对象存储暂不可用（PostgreSQL 使用 `pg_dump`，SQLite 使用数据库快照） |
 
 审计动作：`backup.s3_config_updated`、`backup.s3_connection_tested`、`backup.schedule_updated`、`backup.created`、`backup.download_url_created`、`backup.delete_requested`。审计详情与记录表均不保存 Secret、数据库连接串或预签名 URL query
 
@@ -1787,7 +1803,7 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 
 Dashboard 的 `capacityInfo` 统计普通容量，不含独立审批池；`maxConcurrentPerAccount` 为默认账号并发上限，`0` 表示不限制。
 `capacityInfo.totalSlots` 为 `number | null`；可用账号池含无限并发账号时为 `null`，此时 `availableSlots` 也为 `null`。
-`usedSlots` 仍表示实际在途数，Redis 不可用时为 `null`；没有可用账号时 `totalSlots` 为 `0`
+`usedSlots` 仍表示实际在途数，并发状态不可用时为 `null`；没有可用账号时 `totalSlots` 为 `0`
 
 Dashboard 的 `accountUsage[]` 由后端提供 `usageWindow`、`metricLabel`、`metricValue`
 

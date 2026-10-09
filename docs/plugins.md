@@ -1,5 +1,7 @@
 # 插件使用
 
+本文面向管理员，账号与密钥配置见[使用指南](usage.md)。插件作者从[SDK](../backend/crates/gateway-plugin/sdk/README.md)和[打包工具](../backend/apps/plugin-cli/README.md)开始；宿主职责见[架构](architecture.md#31-插件扩展)
+
 插件“制品”是按 SHA-256 固定的代码与版本；“配置”是运行实例，保存普通设置、敏感设置和功能范围。
 日常使用只维护一个当前配置，同一插件最多启用一个实例
 

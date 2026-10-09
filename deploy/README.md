@@ -1,7 +1,6 @@
 # 部署与运维
 
-首次安装可按 [快速开始](../README.md#快速开始) 操作。
-本文补充客户端配置、权限、备份和升级；部署命令从安装目录 `codex-proxy-rs/` 执行，
+本文面向部署维护者，说明安装、接入、排障、升级和恢复。管理端日常操作见[使用指南](../docs/usage.md)；部署命令从安装目录 `codex-proxy-rs/` 执行，
 其中 `deploy/` 存放 Compose 文件和配置，`.runtime/` 存放持久化数据
 
 | 任务 | 入口 |
@@ -11,86 +10,6 @@
 | 日常运维 | [运行设置](#启动后的运行设置) · [小内存优化](#小内存优化) · [持久化与日志](#持久化与备份) · [请求排查](#请求错误排查) · [密码轮换](#密码语义) |
 | 更新与恢复 | [镜像升级](#镜像升级与源码构建) · [在线更新](#管理端在线更新) · [备份与恢复](#备份与恢复) · [停止与重启](#停止与重启) |
 | 运行源码 | [开发与源码联调](../docs/development.md) |
-
-## 配置归属
-
-配置按职责保存，不都在 YAML 中：
-
-| 位置 | 内容 | 修改方式 |
-| --- | --- | --- |
-| `deploy/config.yaml` | 存储 backend、对应连接选项、管理员初始密码、时区与日志等启动配置 | 从匹配的模板创建，已有部署合并修改，不覆盖原文件 |
-| `.env` | PostgreSQL + Redis Compose 的两个服务密码；SQLite 不需要 | PostgreSQL 安装器生成；手动安装设为 `0600` |
-| `deploy/compose.yaml` / `deploy/compose.sqlite.yaml` | PostgreSQL + Redis 或 SQLite 单服务的镜像、网络、端口、挂载与资源限制 | 新安装选择；已有部署修改 Compose 并重建受影响容器 |
-| PostgreSQL 或 SQLite 文件 | 账号、Key、运行设置、上游身份、插件配置等业务数据 | 管理端或管理 API |
-| 浏览器本地 | 主题和界面偏好 | 当前浏览器的主题设置 |
-
-Compose 命令从安装目录运行，并通过 `--env-file .env` 显式加载 Compose 插值。PostgreSQL + Redis 模式将服务密码传给应用和基础设施容器；SQLite 模式不读取数据库或 Redis 密码，也不声明这些服务。后端进程本身不读取 `.env`。
-PostgreSQL 模式的密码从 `store.database.password` 或 `CPR_DATABASE_PASSWORD` 读取；Redis 密码可留空、省略，或将 `CPR_REDIS_PASSWORD` 设为空以关闭认证。镜像、构建与发布选项仍通过 Compose 环境变量配置。配置加载会忽略未知字段，并在启动控制台提示字段名；
-不输出对应值。缺少必填字段时会指出缺项并停止启动，已知字段的类型和取值仍需合法；可选字段省略时使用默认值
-
-可选的 Linux/glibc 内存分配策略通过 `config.yaml` 的 `services.app-runtime` 桥接到应用容器；默认关闭，配置和重建方式见[小内存优化](#小内存优化)
-
-后端从当前目录向上查找 `deploy/config.yaml`，相对数据、日志和静态资源路径以该文件所在目录解析
-
-Compose 通过环境变量将监听和数据库地址设为容器内地址，并指定镜像中的静态资源目录
-
-### 部署时区
-
-在 `deploy/config.yaml` 设置统一的 IANA 时区，省略时默认 `Asia/Shanghai`：
-
-```yaml
-host:
-  timezone: 'Asia/Shanghai'
-```
-
-支持 `UTC`、`America/New_York`、`Asia/Kathmandu` 等名称；空值、未知名称和错误类型会阻止启动，
-错误指出 `host.timezone`，不输出配置值。修改后重启网关生效，二进制与 Compose 使用同一配置
-
-管理端与 Key 用量页的时间文本由后端生成；自然日筛选、日统计、Key 限额、账号预热和备份 Cron 使用该时区。
-浏览器、进程 `TZ` 和 PostgreSQL 会话时区不覆盖业务配置；Compose 的基础设施时间基准为 UTC。
-上游请求身份中的位置时区仍由对应运行设置或代理配置控制，与部署时区独立
-
-切换时区保留已打开限额窗口的 UTC 边界与用量，到期后按新时区续接；不会因重启立即清零。
-备份调度从切换后的当前时刻计算未来执行点，不补跑旧时区漏过的任务，已入队任务保持原状态。
-夏令时中不存在的预热或 Cron 时刻跳过，重复时刻只选较早一次。日志日期与保留规则见[日志与保留窗口](#日志与保留窗口)
-
-### 小内存优化
-
-Linux/glibc 部署可选择更积极地归还请求结束后的空闲内存，适合内存紧张且请求后 RSS 长时间偏高的机器。
-该选项默认关闭，官方 Linux 镜像支持；更频繁的映射与回收可能增加 CPU 开销，应结合实际负载观察
-
-在 `deploy/config.yaml` 的 `services.app-runtime.environment` 中设置 `GLIBC_TUNABLES`，空字符串表示不启用额外调优：
-
-```yaml
-services:
-  app-runtime:
-    environment:
-      GLIBC_TUNABLES: 'glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072'
-```
-
-Compose 从 `services.app-runtime` 取得参数；不开启优化时保留该段并将值设为 `''`。
-PostgreSQL 和 Redis 的凭据桥接配置与该段并列，无需在 `compose.yaml` 重复填写参数
-
-校验并重建应用容器使配置生效；`docker compose restart` 不会更新容器环境变量：
-
-```bash
-docker compose -f deploy/compose.yaml config --quiet
-docker compose -f deploy/compose.yaml up -d --no-build --no-deps --force-recreate codex-proxy-rs
-```
-
-此配置将 glibc 的 mmap 与 trim 阈值固定为 128 KiB，关闭对应的动态阈值调整。
-如已有 `GLIBC_TUNABLES`，用冒号合并这两个参数，避免重复同名项；同时检查是否另设了 `MALLOC_MMAP_THRESHOLD_` 或 `MALLOC_TRIM_THRESHOLD_`，统一在一处维护。
-参数含义见 [glibc 文档](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)
-
-关闭时删除这两个参数；没有其他 tunable 时将值恢复为 `''`，然后再次重建应用容器。
-`services` 是 Compose 桥接区，直接运行二进制不会读取这一段。Linux/glibc 二进制部署需由启动器在进程启动前设置同一环境变量，例如：
-
-```bash
-GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072 ./codex-proxy-rs
-```
-
-该变量由 glibc 在进程启动时读取，不支持管理端热更新。
-它不设置内存上限，不释放仍被请求或连接持有的缓冲，也不处理容器文件缓存；观察时分别比较进程 RSS、cgroup 的 `anon` 与 `file`
 
 ## 部署结构
 
@@ -106,98 +25,98 @@ flowchart LR
   App -. 数据库备份 .-> Backup[S3 / R2]
 ```
 
-网关端口默认只绑定本机；PostgreSQL 和 Redis 不对公网开放。SQLite 数据文件保存在网关本地持久卷，只支持单副本。插件以网关同一系统身份运行，不能作为不可信代码沙箱
+网关端口默认只绑定本机；PostgreSQL 和 Redis 不对公网开放。两种模式都只支持单网关副本；SQLite 数据文件还必须保存在本地持久卷。插件以网关同一系统身份运行，不能作为不可信代码沙箱
 
 ## 手动安装
 
-本节适用于 Linux amd64/arm64，需准备 Docker Engine、Docker Compose Plugin、curl 和 OpenSSL，
-并确保当前用户能访问 Docker、可通过 `sudo` 或 root 设置目录权限。一键安装入口见
-[快速开始](../README.md#一键安装)，脚本会自动完成本节准备和服务启动
+以下命令适用于 Linux amd64/arm64，需要 Docker Engine、Docker Compose Plugin、curl 和 OpenSSL，以及访问 Docker 和设置目录权限的权限。新安装选择下列一种模式；已有部署按[升级说明](#镜像升级与源码构建)维护，不覆盖原配置
 
-下载同一正式 Release 的部署文件并设置目录权限：
+### 制品来源与模式选择
+
+| 入口 | 来源与用途 |
+| --- | --- |
+| 本文下载命令 | `zzwtsy/codex-proxy-rs` 的正式 Release |
+| 本仓库 Compose | 默认镜像和在线更新仓库为 `zzwtsy/codex-proxy-rs` |
+| `deploy/install.sh` | 下载仓库固定为上游 `zyycn/codex-proxy-rs`，不支持通过环境变量切换来源 |
+| 二进制在线更新 | 默认上游仓库；运行 fork 时显式设置 `CPR_UPDATE_REPOSITORY=zzwtsy/codex-proxy-rs` |
+
+源码版本和正式发行可能不同。下载时只解析一次 Release 标签，镜像、模板和 Compose 来自同一发行；不要从 `main` 下载模板搭配旧镜像。下列操作只在新的空安装目录执行
 
 ```bash
-mkdir -p codex-proxy-rs/deploy && cd codex-proxy-rs
-
-# 只解析一次最新正式版本，确保两个文件来自同一 Release。
-CPR_RELEASE_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/zyycn/codex-proxy-rs/releases/latest)"
+set -e
+mkdir -p codex-proxy-rs/deploy
+cd codex-proxy-rs
+test ! -e deploy/config.yaml
+test ! -e .env
+CPR_RELEASE_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/zzwtsy/codex-proxy-rs/releases/latest)"
 CPR_RELEASE_TAG="${CPR_RELEASE_URL##*/}"
-curl -fsSL "https://github.com/zyycn/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/compose.yaml" \
-  -o deploy/compose.yaml
-curl -fsSL "https://github.com/zyycn/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}/config.example.yaml" \
-  -o deploy/config.example.yaml
+CPR_RELEASE_BASE="https://github.com/zzwtsy/codex-proxy-rs/releases/download/${CPR_RELEASE_TAG}"
+curl -fsSL "$CPR_RELEASE_BASE/checksums.txt" -o deploy/checksums.txt
+```
 
+也可将 `CPR_RELEASE_TAG` 设为指定标签，再设置 `CPR_RELEASE_BASE`。然后按所选模式下载与校验文件
+
+### PostgreSQL + Redis 新安装
+
+```bash
+curl -fsSL "$CPR_RELEASE_BASE/compose.yaml" -o deploy/compose.yaml
+curl -fsSL "$CPR_RELEASE_BASE/config.example.yaml" -o deploy/config.example.yaml
+(
+  cd deploy
+  awk '$2 == "compose.yaml" || $2 == "config.example.yaml"' checksums.txt > selected-checksums.txt
+  test "$(wc -l < selected-checksums.txt)" -eq 2
+  sha256sum --check --strict selected-checksums.txt
+)
 install -d -m 0750 .runtime/postgres .runtime/redis
 sudo install -d -m 0770 -o "$(id -u)" -g 10001 .runtime/data .runtime/logs
 sudo install -m 0640 -o "$(id -u)" -g 10001 deploy/config.example.yaml deploy/config.yaml
+(umask 077; printf 'CPR_DATABASE_PASSWORD=%s\nCPR_REDIS_PASSWORD=%s\n' \
+  "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > .env)
 ```
 
-也可将 `CPR_RELEASE_TAG` 设置为指定的发布标签。Release 附带的 `compose.yaml` 默认使用该版本镜像，
-配置模板和部署文件均包含在 `checksums.txt` 中；不要混用 `main` 分支模板与已发布镜像
+在 `deploy/config.yaml` 填入 `admin.default_password`，至少 12 个字符，不含 `$`，不能使用常见弱口令，然后按[启动](#启动)执行
 
-默认 Compose 内置的 PostgreSQL 与 Redis 都启用密码认证，为它们分别生成密码：
-
-```bash
-openssl rand -hex 24
-openssl rand -hex 24
-```
-
-把两个结果分别写入安装目录根目录的 `.env`。安装器生成并接受 48 位十六进制密码：
-
-```dotenv
-CPR_DATABASE_PASSWORD=<第一个 48 位十六进制密码>
-CPR_REDIS_PASSWORD=<第二个 48 位十六进制密码>
-```
-
-设置文件权限：
-
-```bash
-chmod 0600 .env
-```
-
-另行设置 `admin.default_password`：至少 12 个字符，不能使用常见弱口令或包含 `$`
-
-| 会话配置 | 含义 | 配置模板 / 默认值 |
-| --- | --- | --- |
-| `admin.session_ttl_minutes` | 管理员不活动期限 | 模板为 10080 分钟（7 天） |
-| `admin.session_absolute_ttl_minutes` | 从登录起计算的最长有效期 | 模板及省略时均为 43200 分钟（30 天） |
-| `client.session_ttl_minutes` | 密钥身份固定有效期，不随活动续期 | 默认 1440 分钟（1 天） |
-
-修改配置需重启，不能延长已建立会话的最长有效期。浏览器会话与续期规则见[认证 API](../docs/api.md#统一登录与会话)，独立于 `/v1/*` 鉴权和限额
-
-应用要求 PostgreSQL 密码非空，接受任意字符串；Redis 密码可留空或省略，留空时连接 URL 不包含密码认证。
-默认 Compose 的内置 PostgreSQL 与 Redis 仍要求密码，安装器为它们生成 48 位十六进制值并据此校验
-`.env`；数据库与 Redis 密码不能嵌入连接 URL。直接运行二进制时，可在 `config.yaml` 或进程环境中设置数据库密码；
-无密码 Redis 无需设置 `store.redis.password` 或 `CPR_REDIS_PASSWORD`
+应用要求 PostgreSQL 密码非空，支持任意字符串；Redis 可以不启用认证，但默认 Compose 的两个服务均要求密码。上述命令为它们生成 48 位十六进制值，Compose 通过 `.env` 传递，密码不要嵌入连接 URL。原生进程使用 YAML 或环境变量，不自动读取 `.env`
 
 ### SQLite 新安装
 
-一键安装器的新安装可通过 `CPR_STORAGE_BACKEND=sqlite` 选择 SQLite：
+先执行[制品来源与模式选择](#制品来源与模式选择)中的公共下载准备，再运行：
 
 ```bash
-CPR_STORAGE_BACKEND=sqlite bash install.sh
-```
-
-手动安装时从同一 Release 下载 `compose.sqlite.yaml` 和 `config.example.sqlite.yaml`，分别保存为
-`deploy/compose.yaml` 与 `deploy/config.example.sqlite.yaml`，再复制配置模板为 `deploy/config.yaml`。
-SQLite Compose 只启动网关，数据库缺省为 `.runtime/data/codex-proxy.sqlite3`；无需生成数据库或 Redis 密码。
-配置中的 `store.sqlite.path` 相对于 `host.runtime_data_dir` 解析。Compose 透传可选的 `CPR_SQLITE_PATH`；该环境变量只能指定 `.runtime/data` 下的相对路径，未设置时使用默认数据库路径
-
-手动使用 SQLite 时，Compose 启动命令仍需根目录 `.env` 文件。创建权限为 `0600` 的空文件后再启动：
-
-```bash
-touch .env
+curl -fsSL "$CPR_RELEASE_BASE/compose.sqlite.yaml" -o deploy/compose.sqlite.yaml
+curl -fsSL "$CPR_RELEASE_BASE/config.example.sqlite.yaml" -o deploy/config.example.sqlite.yaml
+(
+  cd deploy
+  awk '$2 == "compose.sqlite.yaml" || $2 == "config.example.sqlite.yaml"' checksums.txt > selected-checksums.txt
+  test "$(wc -l < selected-checksums.txt)" -eq 2
+  sha256sum --check --strict selected-checksums.txt
+)
+cp deploy/compose.sqlite.yaml deploy/compose.yaml
+sudo install -d -m 0770 -o "$(id -u)" -g 10001 .runtime/data .runtime/logs
+sudo install -m 0640 -o "$(id -u)" -g 10001 deploy/config.example.sqlite.yaml deploy/config.yaml
+(umask 077; touch .env)
 chmod 0600 .env
 ```
 
-Unix 下可写启动会在打开数据库前，将主库及已有 WAL/SHM 自动收紧为 `0600`；无法设置权限时停止启动，新建伴随文件继承主库权限。服务与 CLI 必须使用同一运行用户，原有跨用户或组共享读取权限会被移除。只读检查不会修改权限；非 Unix 平台仍需部署者配置适当的文件访问控制
+填写 `admin.default_password` 后按[启动](#启动)执行。此处将 SQLite Compose 保存为 `deploy/compose.yaml`，后文命令无需切换文件名。它只启动网关，不连接 PostgreSQL 或 Redis；`.env` 不需服务密码，但本文的 `--env-file .env` 命令需要该文件存在
 
-SQLite 模式用于单网关实例和本地持久卷。它创建独立空库，不导入 PostgreSQL 数据；切换模式会连接到另一份数据库，
-不会自动复制或覆盖原数据。恢复 PostgreSQL 部署前先停止网关，再按下文保留原数据库
+缺省数据库为 `.runtime/data/codex-proxy.sqlite3`。`store.sqlite.path` 相对于 `host.runtime_data_dir` 解析；Compose 的可选 `CPR_SQLITE_PATH` 只能指定运行数据目录下的相对路径
 
-Linux 上应用容器以 `10001:10001` 运行。应用数据和日志目录设为 `0770`，配置设为 `0640`，
-均由当前用户持有、容器组 `10001` 访问；`.env` 保持 `0600` 且不挂载进应用容器。
-`config.yaml` 通过 Compose `configs` 只读挂载，普通 Compose 保留宿主机文件的 UID/GID 和 mode
+Unix 下可写启动在打开数据库前将主库及已有 WAL/SHM 收紧为 `0600`，设置失败则停止启动，新建伴随文件继承主库权限。服务与 CLI 必须使用同一运行用户；只读检查不改变权限，非 Unix 平台须自行设置文件访问控制
+
+SQLite 创建独立空库，不导入 PostgreSQL 数据。切换模式只会连接另一份数据库，不执行数据迁移。两种模式都要求单网关副本；SQLite 还要求本地持久卷，恢复操作见[备份与恢复](#备份与恢复)
+
+### 文件权限与初始会话
+
+Linux 应用容器以 `10001:10001` 运行，应用数据和日志目录为 `0770`，配置为 `0640`，由当前用户持有、组 `10001` 访问。`.env` 为 `0600`，不挂载到容器；配置只读挂载，普通 Compose 保留宿主文件权限
+
+| 会话配置 | PostgreSQL 模板 | SQLite 模板 | 含义 |
+| --- | --- | --- | --- |
+| `admin.session_ttl_minutes` | 10080 分钟 | 1440 分钟 | 管理员不活动期限 |
+| `admin.session_absolute_ttl_minutes` | 43200 分钟 | 省略，默认 43200 分钟 | 登录起最长有效期 |
+| `client.session_ttl_minutes` | 1440 分钟 | 1440 分钟 | 密钥身份固定期限，不随活动续期 |
+
+以上为当前源码模板值，发行安装以同版本附件为准。修改需重启，不能延长已建立会话的最长有效期；浏览器会话独立于 `/v1/*` 鉴权与限额，见[认证 API](../docs/api.md#统一登录与会话)
 
 ### Redis ACL 用户
 
@@ -241,7 +160,7 @@ curl -i http://127.0.0.1:8080/healthz
 
 HTTP 在数据库迁移和初始化完成后才监听。PostgreSQL 迁移期间启动日志每 15 秒报告已等待时间，
 包含执行迁移和等待迁移锁的时间，不代表完成比例；不要因暂时无法访问而反复重启。
-镜像和 Compose 默认提供 5 分钟健康检查启动宽限期，探测成功后立即转为健康，无需等满宽限期。
+当前源码的 Compose 提供 5 分钟健康检查启动宽限期；发行版以同版本 Compose 为准，探测成功后立即转为健康，无需等满宽限期。
 历史数据较多时应提前延长 `healthcheck.start_period` 和部署工具的等待超时；只修改 Compose
 文件不会改变已创建容器的检查配置，需要在维护窗口重新创建容器
 
@@ -249,17 +168,7 @@ HTTP 在数据库迁移和初始化完成后才监听。PostgreSQL 迁移期间�
 
 ### 启动后的运行设置
 
-在管理端修改以下设置，保存后对新请求生效，重启不会覆盖已保存的选择：
-
-| 设置 | 入口与边界 |
-| --- | --- |
-| 上游客户端身份 | “系统设置 → 上游配置 → 客户端身份”；Key 可按 Provider 覆盖，支持自动或固定版本 |
-| 全局请求位置 | “系统设置 → 上游配置 → 请求位置覆盖”；默认关闭，不从 YAML 导入 |
-| 代理位置 | “代理管理”；优先于全局位置，全局关闭时仍可独立生效 |
-
-位置覆盖只影响 OpenAI 请求中受支持的位置、日期与时区信息，不改变真实出口 IP、epoch 时间戳或系统时区。
-`openai.residency` 是独立的部署约束。身份与位置字段见 [运行设置 API](../docs/api.md#8-运行设置)。
-后台账号操作使用 Provider 自己的官方画像；发布资料刷新不改写用户选择或 `config.yaml`
+按[使用指南](../docs/usage.md)依次添加账号、绑定分组和创建客户端密钥，再验证一次真实请求。调度、客户端身份、位置和隐私等[运行设置](../docs/usage.md#运行设置)由管理端保存到数据库，不从 YAML 导入，也不因重启覆盖
 
 ### 插件命令行
 
@@ -452,12 +361,6 @@ WebSocket 会话完成，进程退出时强制断开剩余连接。已入队的�
 Compose 的 `stop_grace_period` 为 75 秒，覆盖默认 30 秒后台收尾及进程清理余量。
 调大后台关闭预算时，也必须同步预留容器停止宽限期，否则 Docker 会在宽限期结束时 SIGKILL
 
-## 本地开发
-
-源码环境、前后端启动与组件库联调见 [开发与源码联调](../docs/development.md)
-
-本机开发可使用 Compose 提供 PostgreSQL 和 Redis，集成测试另用[专用测试库](../backend/migrations/postgres/README.md#本地测试库)
-
 ## 持久化与备份
 
 ### 数据目录
@@ -520,43 +423,6 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 
 完整运行时、Provider、revision 与恢复边界见 [架构文档](../docs/architecture.md)
 
-## 请求错误排查
-
-1. 先记录故障时间和时区、网关版本/提交、客户端名称与版本，以及 HTTP/SSE/WebSocket 传输。
-   区分“上游返回”“网关实际响应”和“客户端终端展示”，不要只凭终端的统一文案推断根因
-2. 收集响应中的 `x-gateway-request-id`、`x-request-id` / `x-oai-request-id`；配置了
-   `api.request_id_header` 时也记录该入口头。WebSocket 合成错误的关联头位于本条错误的 `headers`。
-   在管理端错误列表按 ID 和时间搜索；检查平台条件并主动刷新，翻页不会推进查询时间。
-   只有入口 ID 时，改用入口日志和时间定位
-3. 打开错误详情，核对上游/客户端状态、发送状态、attempt、失败阶段及后续恢复关联。
-   下载默认诊断包作为反馈材料，先看 `availability`、`attemptsComplete` 和淘汰计数；
-   该包不含原始错误正文或完整 trace data。分享前仍应检查关联 ID 等内部信息
-4. 需要更细上下文时，在 `codex-proxy-rs-application.*.log` 及 `.log.gz` 中按网关/上游 ID
-   和时间检索，结合 `attempt.started`、`attempt.failed`、`request.finished` 与 transport 阶段判断。
-   **开启 `host.logging.file.enabled` 时，stdout 仅保留 `gateway_startup` 通道**；
-   `docker logs` 看不到业务错误不代表没有错误。关闭普通文件日志且开启 `host.logging.stdout`
-   时，普通日志才按级别输出到 stdout；专用 dump/OAuth 恢复通道不会混入
-5. 查不到请求记录时，先用模型执行 ID 在“全部平台”下搜索：已进入执行会话的建流前失败也会记录，
-   但其 attempt 为零，尚未确认的 Provider/账号/传输为空，不会命中具体平台或账号筛选。
-   再检查观测队列丢弃/写入失败告警及 `file_logging` 健康状态。鉴权、解析、路由和准入等入口拒绝
-   仍不保证进入错误列表；应结合入口状态与日志，不能据此认定请求未发生。异步投影有延迟，
-   刷新后仍需核对缺口，而不是反复重放可能已发送的请求
-6. 仅在上述信息不足且能够控制访问范围时临时开启 `host.logging.request_dump` 复现一次。
-   它会记录完整凭据与用户正文，应限定访问、摘取最小片段并人工脱敏；复现后关闭开关，
-   按配置的保留窗口及组织的数据处理要求管理已生成文件。不要为普通请求排查开启 OAuth 恢复记录，
-   也不要直接上传整个日志目录或完整转储
-
-请求问题反馈使用 [接口问题反馈表单](../.github/ISSUE_TEMPLATE/api-bug-report.yml)；错误诊断与查询合同见
-[API 文档](../docs/api.md#10-dashboard用量与错误)
-
-### 插件取文与 DNS
-
-插件受管 HTTP 由实际运行网关的主机或容器解析 DNS，再通过直连或账号代理访问目标。插件拥有完整网络访问能力，宿主不按插件身份限制私网、回环或保留地址
-
-域名解析失败时先核对网关运行环境的 DNS。Clash / Mihomo 的 Fake-IP 地址需要相应代理接管；无法连通时可让目标域名返回真实地址，并检查所选代理。代理失败不会自动回退直连
-
-排障区分域名解析失败、超时、连接失败和响应读取失败，避免在日志或截图中输出真实请求头、正文及凭据
-
 ## 密码语义
 
 - `admin.default_password` 只在首次创建管理员时使用
@@ -571,7 +437,7 @@ Redis 和应用容器，不需要删除 Redis 数据目录。
 
 ## 镜像升级与源码构建
 
-每个 Release 提供 PostgreSQL + Redis 的 `compose.yaml` / `config.example.yaml`，以及 SQLite 的
+本 fork 的发行附件提供 PostgreSQL + Redis 的 `compose.yaml` / `config.example.yaml`，以及 SQLite 的
 `compose.sqlite.yaml` / `config.example.sqlite.yaml`，并附带校验和。Compose 镜像固定到该版本；各平台归档包含两种配置模板。配置模板来自构建该版本的同一提交。
 使用二进制归档手动部署时，将模板中的 `api.asset_directory` 改为 `../web/dist`，指向归档内的静态资源。
 在线更新默认使用同一目录；如显式设置 `host.system_update.web_dist_dir`，应确保它指向实际提供页面的目录。
@@ -581,7 +447,7 @@ Redis 和应用容器，不需要删除 Redis 数据目录。
 从旧版 Compose 凭据桥接配置升级时，先把 `config.yaml` 中现有的数据库和 Redis 密码原样迁到根目录
 `.env` 的 `CPR_DATABASE_PASSWORD`、`CPR_REDIS_PASSWORD`，再将 YAML 密码字段清空，并把 `.env`
 权限设为 `0600`。保持密码值不变，不需要修改 PostgreSQL 用户密码或删除 Redis 数据。
-一键安装器遇到已有 `config.yaml` 会保留旧部署文件，不执行此迁移；请按本节手动升级步骤操作。
+仓库安装器遇到已有 `config.yaml` 会保留旧部署文件，不执行此迁移；请按本节手动升级步骤操作。
 
 更新部署文件后，从安装目录拉取目标版本镜像并重建应用容器：
 
@@ -787,3 +653,125 @@ pg_restore --no-owner --no-privileges --password \
 
 只关闭计划备份不会停止 Worker 的任务恢复和到期删除。无法确认这些记录的影响时，
 不要把恢复后的数据库直接接入运行中的应用。具体处理应根据目标库数据制定，不提供清空生产记录的通用命令
+## 请求错误排查
+
+1. 先记录故障时间和时区、网关版本/提交、客户端名称与版本，以及 HTTP/SSE/WebSocket 传输。
+   区分“上游返回”“网关实际响应”和“客户端终端展示”，不要只凭终端的统一文案推断根因
+2. 收集响应中的 `x-gateway-request-id`、`x-request-id` / `x-oai-request-id`；配置了
+   `api.request_id_header` 时也记录该入口头。WebSocket 合成错误的关联头位于本条错误的 `headers`。
+   在管理端错误列表按 ID 和时间搜索；检查平台条件并主动刷新，翻页不会推进查询时间。
+   只有入口 ID 时，改用入口日志和时间定位
+3. 打开错误详情，核对上游/客户端状态、发送状态、attempt、失败阶段及后续恢复关联。
+   下载默认诊断包作为反馈材料，先看 `availability`、`attemptsComplete` 和淘汰计数；
+   该包不含原始错误正文或完整 trace data。分享前仍应检查关联 ID 等内部信息
+4. 需要更细上下文时，在 `codex-proxy-rs-application.*.log` 及 `.log.gz` 中按网关/上游 ID
+   和时间检索，结合 `attempt.started`、`attempt.failed`、`request.finished` 与 transport 阶段判断。
+   **开启 `host.logging.file.enabled` 时，stdout 仅保留 `gateway_startup` 通道**；
+   `docker logs` 看不到业务错误不代表没有错误。关闭普通文件日志且开启 `host.logging.stdout`
+   时，普通日志才按级别输出到 stdout；专用 dump/OAuth 恢复通道不会混入
+5. 查不到请求记录时，先用模型执行 ID 在“全部平台”下搜索：已进入执行会话的建流前失败也会记录，
+   但其 attempt 为零，尚未确认的 Provider/账号/传输为空，不会命中具体平台或账号筛选。
+   再检查观测队列丢弃/写入失败告警及 `file_logging` 健康状态。鉴权、解析、路由和准入等入口拒绝
+   仍不保证进入错误列表；应结合入口状态与日志，不能据此认定请求未发生。异步投影有延迟，
+   刷新后仍需核对缺口，而不是反复重放可能已发送的请求
+6. 仅在上述信息不足且能够控制访问范围时临时开启 `host.logging.request_dump` 复现一次。
+   它会记录完整凭据与用户正文，应限定访问、摘取最小片段并人工脱敏；复现后关闭开关，
+   按配置的保留窗口及组织的数据处理要求管理已生成文件。不要为普通请求排查开启 OAuth 恢复记录，
+   也不要直接上传整个日志目录或完整转储
+
+请求问题反馈使用 [接口问题反馈表单](../.github/ISSUE_TEMPLATE/api-bug-report.yml)；错误诊断与查询合同见
+[API 文档](../docs/api.md#10-dashboard用量与错误)
+
+### 插件取文与 DNS
+
+插件受管 HTTP 由实际运行网关的主机或容器解析 DNS，再通过直连或账号代理访问目标。插件拥有完整网络访问能力，宿主不按插件身份限制私网、回环或保留地址
+
+域名解析失败时先核对网关运行环境的 DNS。Clash / Mihomo 的 Fake-IP 地址需要相应代理接管；无法连通时可让目标域名返回真实地址，并检查所选代理。代理失败不会自动回退直连
+
+排障区分域名解析失败、超时、连接失败和响应读取失败，避免在日志或截图中输出真实请求头、正文及凭据
+
+## 配置归属
+
+配置按职责保存，不都在 YAML 中：
+
+| 位置 | 内容 | 修改方式 |
+| --- | --- | --- |
+| `deploy/config.yaml` | 存储 backend、对应连接选项、管理员初始密码、时区与日志等启动配置 | 从匹配的模板创建，已有部署合并修改，不覆盖原文件 |
+| `.env` | PostgreSQL + Redis Compose 的两个服务密码；SQLite 使用空文件以兼容本文命令 | PostgreSQL 安装器生成；手动安装设为 `0600` |
+| `deploy/compose.yaml` / `deploy/compose.sqlite.yaml` | PostgreSQL + Redis 或 SQLite 单服务的镜像、网络、端口、挂载与资源限制 | 新安装选择；已有部署修改 Compose 并重建受影响容器 |
+| PostgreSQL 或 SQLite 文件 | 账号、Key、运行设置、上游身份、插件配置等业务数据 | 管理端或管理 API |
+| 浏览器本地 | 主题和界面偏好 | 当前浏览器的主题设置 |
+
+Compose 命令从安装目录运行，并通过 `--env-file .env` 显式加载 Compose 插值。PostgreSQL + Redis 模式将服务密码传给应用和基础设施容器；SQLite 模式不读取数据库或 Redis 密码，也不声明这些服务。后端进程本身不读取 `.env`。
+PostgreSQL 模式的密码从 `store.database.password` 或 `CPR_DATABASE_PASSWORD` 读取；Redis 密码可留空、省略，或将 `CPR_REDIS_PASSWORD` 设为空以关闭认证。镜像、构建与发布选项仍通过 Compose 环境变量配置。配置加载会忽略未知字段，并在启动控制台提示字段名；
+不输出对应值。缺少必填字段时会指出缺项并停止启动，已知字段的类型和取值仍需合法；可选字段省略时使用默认值
+
+可选的 Linux/glibc 内存分配策略通过 `config.yaml` 的 `services.app-runtime` 桥接到应用容器；默认关闭，配置和重建方式见[小内存优化](#小内存优化)
+
+后端从当前目录向上查找 `deploy/config.yaml`，相对数据、日志和静态资源路径以该文件所在目录解析
+
+Compose 通过环境变量将监听和数据库地址设为容器内地址，并指定镜像中的静态资源目录
+
+### 部署时区
+
+在 `deploy/config.yaml` 设置统一的 IANA 时区，省略时默认 `Asia/Shanghai`：
+
+```yaml
+host:
+  timezone: 'Asia/Shanghai'
+```
+
+支持 `UTC`、`America/New_York`、`Asia/Kathmandu` 等名称；空值、未知名称和错误类型会阻止启动，
+错误指出 `host.timezone`，不输出配置值。修改后重启网关生效，二进制与 Compose 使用同一配置
+
+管理端与 Key 用量页的时间文本由后端生成；自然日筛选、日统计、Key 限额、账号预热和备份 Cron 使用该时区。
+浏览器、进程 `TZ` 和 PostgreSQL 会话时区不覆盖业务配置；Compose 的基础设施时间基准为 UTC。
+上游请求身份中的位置时区仍由对应运行设置或代理配置控制，与部署时区独立
+
+切换时区保留已打开限额窗口的 UTC 边界与用量，到期后按新时区续接；不会因重启立即清零。
+备份调度从切换后的当前时刻计算未来执行点，不补跑旧时区漏过的任务，已入队任务保持原状态。
+夏令时中不存在的预热或 Cron 时刻跳过，重复时刻只选较早一次。日志日期与保留规则见[日志与保留窗口](#日志与保留窗口)
+
+### 小内存优化
+
+Linux/glibc 部署可选择更积极地归还请求结束后的空闲内存，适合内存紧张且请求后 RSS 长时间偏高的机器。
+该选项默认关闭，官方 Linux 镜像支持；更频繁的映射与回收可能增加 CPU 开销，应结合实际负载观察
+
+在 `deploy/config.yaml` 的 `services.app-runtime.environment` 中设置 `GLIBC_TUNABLES`，空字符串表示不启用额外调优：
+
+```yaml
+services:
+  app-runtime:
+    environment:
+      GLIBC_TUNABLES: 'glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072'
+```
+
+Compose 从 `services.app-runtime` 取得参数；不开启优化时保留该段并将值设为 `''`。
+PostgreSQL 和 Redis 的凭据桥接配置与该段并列，无需在 `compose.yaml` 重复填写参数
+
+校验并重建应用容器使配置生效；`docker compose restart` 不会更新容器环境变量：
+
+```bash
+docker compose --env-file .env -f deploy/compose.yaml config --quiet
+docker compose --env-file .env -f deploy/compose.yaml up -d --no-build --no-deps --force-recreate codex-proxy-rs
+```
+
+此配置将 glibc 的 mmap 与 trim 阈值固定为 128 KiB，关闭对应的动态阈值调整。
+如已有 `GLIBC_TUNABLES`，用冒号合并这两个参数，避免重复同名项；同时检查是否另设了 `MALLOC_MMAP_THRESHOLD_` 或 `MALLOC_TRIM_THRESHOLD_`，统一在一处维护。
+参数含义见 [glibc 文档](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)
+
+关闭时删除这两个参数；没有其他 tunable 时将值恢复为 `''`，然后再次重建应用容器。
+`services` 是 Compose 桥接区，直接运行二进制不会读取这一段。Linux/glibc 二进制部署需由启动器在进程启动前设置同一环境变量，例如：
+
+```bash
+GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072 ./codex-proxy-rs
+```
+
+该变量由 glibc 在进程启动时读取，不支持管理端热更新。
+它不设置内存上限，不释放仍被请求或连接持有的缓冲，也不处理容器文件缓存；观察时分别比较进程 RSS、cgroup 的 `anon` 与 `file`
+
+## 本地开发
+
+源码环境、前后端启动与组件库联调见 [开发与源码联调](../docs/development.md)
+
+本机开发可使用 Compose 提供 PostgreSQL 和 Redis，集成测试另用[专用测试库](../backend/migrations/postgres/README.md#本地测试库)

@@ -62,6 +62,8 @@ flowchart TB
 
 PostgreSQL 不配 Redis、SQLite 再配 Redis 都属于无效配置。SQLite 的 Provider lease、cooldown、刷新退避、会话亲和和排除状态由文件中的带期限记录跨进程共享；准入、continuation、认证会话和可重建缓存仅在当前服务或命令进程内有效。SQLite 文件不能由多个网关副本并发写入
 
+不同模式的状态与失效边界见[状态所有权](#8-状态所有权)，启动与关闭见[生命周期](#11-生命周期安全与恢复)
+
 ## 3. Workspace 边界
 
 | 路径 | 责任 |
@@ -298,7 +300,7 @@ Provider 可为模型提供来源账号集合；Core 在公开目录查询时结
 不解析上游字段；API 负责协议输出，不直接依赖具体 Provider。原生目录失败不会退回通用画像，只有不提供
 该协议原生目录的 Provider（如 xAI 的 Codex 适配）才走画像转换。目录读取不创建计量请求或推理 attempt。
 OpenAI 的账号/凭据 revision/客户端版本隔离、并发合并、TTL、容量与失效均归属 credential catalog
-service；客户端原生对象保存在有界进程缓存中，与套餐 Redis 模型 ID 缓存分开管理
+service；客户端原生对象保存在有界进程缓存中，与套餐模型 ID 的运行缓存分开管理
 
 全局请求位置及开关由运行设置持久化；快照仅在开关开启时生成全局覆盖，并随
 `RuntimeSnapshot → RoutingPlan → AttemptContext` 冻结传递，关闭时保留客户端原有字段；
@@ -377,7 +379,7 @@ sequenceDiagram
 
 模型请求默认不限制总执行时长；插件显式设置的总时限从请求开始计时，Provider 的传输空闲超时独立生效。
 Client Key 并发占用、账号调度槽位与请求恢复记录使用可续期租约，不把租约 TTL 当作总执行预算。
-会话结束或 Drop 后停止续期；Redis 并发租约丢失或无法在有效期内续期时取消请求，避免失去并发约束后继续执行
+会话结束或 Drop 后停止续期；并发租约丢失或无法在有效期内续期时取消请求，避免失去并发约束后继续执行
 
 Client Key 鉴权完成后，API adapter 从有界请求头识别客户端，Core 使用请求冻结的 `RuntimeSnapshot`
 检查最低版本，在进入 Provider 前完成门禁。请求头优先级、远程客户端识别与 `426` 错误合同见[鉴权约定](api.md#1-鉴权与公共约定)
@@ -442,11 +444,11 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
 - xAI 是翻译边界。Provider 把 Grok wire 转换为 Responses wire；上游结构化错误的 message/code/type
   可以透出，但账号指纹会先脱敏
 - response ID 是不透明 UTF-8 bytes，不假设 UUID、固定长度或跨 Provider 可复用
-- OpenAI 与 xAI 用户身份选择由 PostgreSQL 保存，Core 在 `FrozenAccountScope` 中按 Key 整体覆盖通用选择，
+- OpenAI 与 xAI 用户身份选择由所选持久数据库保存，Core 在 `FrozenAccountScope` 中按 Key 整体覆盖通用选择，
   以 Provider-owned 不透明对象沿路由计划传递；执行会话复用首次解析结果，使重试不受发布更新影响。
   各 Provider 唯一负责默认值、校验、版本来源及 UA 生成，Admin 提供管理和生效预览。
   首次初始化只写入内置默认选择；YAML 不定义客户端身份，也不作为数据库初始化或请求解析的来源。
-  官方发布资料与用户选择分开：OpenAI 在 Redis 按 Provider、客户端、平台、架构隔离可重建版本缓存，
+  官方发布资料与用户选择分开：OpenAI 按 Provider、客户端、平台、架构隔离可重建版本缓存（PostgreSQL 模式存于 Redis，SQLite 模式存于进程内），
   Desktop 完整制品元组原子更新。CLI 的 TUI/Exec 入口共用官方 CLI 版本资料，Provider 在一次身份解析中
   生成一致的 UA、入口后缀与配套请求头，后台更新不修改用户选择的运行环境。
   完整自定义 UA 经 Provider 校验后原样传递，配套头统一解析；固定和自定义配置不受后台更新影响。
@@ -465,7 +467,7 @@ Admin 拥有进程内导入任务、管理员归属、条目状态与有界队�
 API 只校验任务信封、生成完整输入摘要并投影安全结果，不解释 Provider 文档；每个执行条目复用已有
 OpenAI / xAI 导入用例。并发槽位由单个 Worker 统一管理，条目状态是进度统计的唯一来源。
 停止只跳过待执行输入；Host 关闭时停止接收新任务并在关闭预算内等待已开始条目完成。
-完成或跳过即释放原始输入，终态记录有时限和数量上限，不写 PostgreSQL 或 Redis。
+完成或跳过即释放原始输入，终态记录有时限和数量上限，不写持久数据库或协调存储。
 前端通过当前管理员的任务列表恢复视图，轮询与任务执行互不拥有生命周期。接口、限额与重启语义见
 [后台导入任务](api.md#后台导入任务)
 
@@ -492,10 +494,12 @@ client，OIDC 的 JWKS 缓存与单飞归属对应出口状态。自动刷新提
 保留账号其他设置；提交配置版本与审计后复用快照发布流程，使后续请求使用直连。
 代理目录只携带关联数量；账号明细通过独立分页读端口按需查询，
 在同一个只读快照中统计并读取有界页面，不在目录中聚合完整账号数组。
-文件及 AT/RT 导入在上游凭据交换前取得 PostgreSQL 会话级共享咨询锁，直到凭据提交后释放。
-代理修改、删除和测试结果写入通过同一资源的事务级独占锁检查，导入期间直接返回冲突。
-导入保护连接数量有界，不占用提交所需的连接池槽位，也不持有空闲事务。
-请求取消或进程退出时关闭会话并释放锁。探测器由组合根注入 OpenAI 的 HTTP 客户端构建函数，
+文件及 AT/RT 导入在上游凭据交换前取得代理导入保护，直到凭据提交后释放。
+PostgreSQL 使用会话级共享咨询锁，代理修改、删除和测试结果写入通过事务级独占锁检查；
+保护连接数量有界，不占用提交连接池槽位，也不持有空闲事务，取消或退出关闭会话释放锁。
+SQLite 使用代理仓库的进程内导入集合与 Drop guard，相关修改检查同一集合；它不提供跨网关进程保护，依赖单副本部署边界。
+导入保护冲突直接返回错误。
+探测器由组合根注入 OpenAI 的 HTTP 客户端构建函数，
 复用其自定义 CA 加载与证书校验规则，Host 不依赖具体 Provider 包
 
 导入器在认证交换前解析并校验账号出口。sub2api 的代理引用按完整 URL 登记为共享代理并绑定账号；
@@ -582,7 +586,7 @@ Vue 普通管理请求的错误提示由 `api/request/` 请求封装统一负责
 
 ### 登录与查询身份
 
-管理员和密钥登录共用 `/api/auth/*`、AuthService、Redis 会话结构和 `cpr_session` Cookie。
+管理员和密钥登录共用 `/api/auth/*`、AuthService 和 `cpr_session` Cookie。PostgreSQL 模式在 Redis 保存会话与限流桶，SQLite 模式使用进程内状态，重启后需重新登录。
 登录类型只选择凭据校验方式，权限来自服务端保存的身份。管理入口只接受管理员身份或部署级管理 API Key；
 AuthService 每次恢复 Key 会话时重新检查 Key 是否存在且启用；Key 会话不能访问管理员页面和管理接口。
 前端只维护一份 Auth Store，不在每个 API 请求上标记身份；401 会话失效、403 权限不足和 503 依赖故障分别处理。
@@ -596,9 +600,9 @@ AuthService 每次恢复 Key 会话时重新检查 Key 是否存在且启用；K
 读取请求和明确幂等的续期请求遇到临时网络或服务故障时有限重试，写操作不默认执行此类重试。
 首次恢复由路由守卫等待校验后放行；临时故障阻止导航，恢复联网或重新聚焦时再次校验，不增加恢复页面。
 已有页面遇到临时故障不清除身份
-管理员会话保存由已加盐密码哈希派生的指纹，每次恢复时与 PostgreSQL 当前密码核对；普通设置变更不影响该绑定。
-改密在 AuthService 验证当前密码和新密码策略，Store 以旧哈希条件更新密码并在同一 PostgreSQL 事务记录审计。
-事务提交后旧管理员会话的指纹失配，不依赖 Redis 批量删除完成撤销；原始密码及密码哈希不进入 Redis。
+管理员会话保存由已加盐密码哈希派生的指纹，每次恢复时与所选数据库的当前密码核对；普通设置变更不影响该绑定。
+改密在 AuthService 验证当前密码和新密码策略，Store 以旧哈希条件更新密码并在同一数据库事务记录审计。
+事务提交后旧管理员会话的指纹失配，不依赖批量删除会话完成撤销；会话存储不保存原始密码及密码哈希。
 KeyUsageService 从 AuthService 的服务端身份或 Core 的入口认证结果确定唯一查询范围，复用 ClientKeyStore 的额度账本投影和
 ObservabilityStore 的范围查询；数据面额度查询不执行推理准入或开启窗口，入口认证和适用的请求中间件仍会执行。
 API 只输出各入口所需的字段白名单，不复用管理员的宽响应。
@@ -615,7 +619,7 @@ Client Key 与账号分组形成授权范围：
 - 已绑定分组为空或全部禁用时得到空池，绝不回退为全部账号
 - 分组可以包含多个 Provider，账号也可以属于多个分组
 
-账号选择综合启停状态、credential/quota 事实、Redis cooldown、并发上限、权重、请求间隔和会话亲和。
+账号选择综合启停状态、credential/quota 事实、协调存储中的 cooldown、并发上限、权重、请求间隔和会话亲和。
 默认账号并发上限为 `0` 时表示无限；账号独立正数上限仍优先，未设置则继承默认值。
 无限并发只跳过并发上限判断，保留在途租约计数、请求间隔及其他准入约束；含无限账号的容量不投影有限占用比例。
 `account::AccountModelAccess` 拥有管理员模型政策的校验与精确匹配语义，存入账号行的 `model_access_json`，
@@ -685,7 +689,7 @@ Store 只保存带版本的绑定事实，Provider 在取得租约后、发送�
 
 Core 的 `concurrency` 拥有中立的有界等待位置、优先级与同级 FIFO 唤醒，不依赖账号、路由或执行会话；
 账号策略仅引用其中的等待配置值。执行准入与各 Provider 选择器分别持有等待队列，按 Key/账号隔离。
-运行并发仍由 Redis 原子准入与账号租约裁决，等待队列只保存当前进程中的等待位置，不复制运行计数，
+PostgreSQL 模式由 Redis 裁决 Key 原子准入与账号租约；SQLite 模式的 Key 准入在进程内，账号租约保存在 SQLite。运行并发由对应端口裁决，等待队列只保存当前进程中的等待位置，不复制运行计数，
 也不持久化正文或在重启后重放请求。每个等待 owner 最多容纳 1,024 个等待者作为资源兜底
 
 新请求不能越过同级或更高优先级的等待者；队首短周期重读容量，取消/完成等待通过 Drop 回收位置并唤醒后继。
@@ -749,7 +753,7 @@ Admin 的手动重置复用同一账本与 Key 行锁，在一个事务中清零
 请求日志继续保留真实错误、用量与费用来源，账本按零累计不表示上游实际免费
 
 结算写入失败时，进程内保留精确费用，在同一 Key 下次请求前重试；进程退出后无法恢复的费用不会形成欠账。
-PostgreSQL 不可用时拒绝所有新的计费请求，Redis 继续管理并发/RPM 租约。
+所选持久数据库不可用时拒绝新的计费请求。PostgreSQL 模式的 Redis 仍管理并发/RPM 租约；SQLite 模式的 Key 准入是进程内状态，账号租约依赖 SQLite，不能在数据库故障时视为可用。
 账本独立于可丢弃的请求观测日志，日志清理不重置金额；费用事件保留至删除 Key，已有日志不会回填为账本费用。
 字段与错误合同见 [Client Key API](api.md#7-client-key)
 
@@ -806,13 +810,15 @@ revision；credential 轮换只推进账号自己的 `credential_revision`。Pos
 | 账号、credential、分组、Client Key、设置、审计、请求与备份记录 | 当前 backend 的持久数据库 | PostgreSQL + Redis 模式使用 PostgreSQL；SQLite 模式使用本地 SQLite 文件 |
 | Client Key 金额窗口与费用事件 | 当前 backend 的持久数据库 | 准入与幂等结算的权威账本，独立于请求观测与日志保留策略 |
 | 插件包体、安装来源、制品接受事实、实例配置与私有状态 | 当前 backend 的持久数据库 | 完整信任决定绑定已接受摘要；进程内发布集合由持久化事实构建 |
-| admission、continuation、认证会话、Provider 目录与制品画像缓存 | 当前服务或命令进程 | 可丢失或可重建状态；进程退出后失效 |
+| Client Key 并发与 RPM 准入 | Redis 或当前进程 | PostgreSQL 模式使用 Redis，SQLite 模式使用进程内准入，重启后不恢复在途请求 |
+| continuation | 当前服务或命令进程 | 连接与执行续接状态随进程退出失效，不持久化或重放请求 |
+| 代理导入保护 | PostgreSQL 咨询锁或当前进程 | PostgreSQL 使用咨询锁，SQLite 使用导入集合与 Drop guard，均由导入生命周期释放 |
 | Provider lease、cooldown、刷新退避、会话亲和与排除 | Redis 或 SQLite | Redis 用于 PostgreSQL 组合；SQLite 模式在数据库中共享并按到期时间清理 |
 | 控制面统一登录会话与登录限流桶 | Redis 或当前进程 | PostgreSQL + Redis 模式使用 Redis；SQLite 模式只供本服务或 CLI 进程使用 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
 | 重置卡库存与消费结果 | 对应 Provider 的上游 | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
-| Provider 公开模型与官方发布资料 | Provider/runtime cache | 由官方目录或发布源刷新，与 PostgreSQL 中的用户身份选择分别管理 |
-| Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
+| Provider 公开模型与官方发布资料 | Provider/runtime cache | OpenAI 缓存按存储模式使用 Redis 或进程内状态；xAI 发布资料在进程内，与持久数据库的用户身份选择分别管理 |
+| Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写持久数据库或协调存储，也不代理包字节 |
 
 账号对外状态不是独立列，而是所选数据库中的 credential/quota 事实与运行时 cooldown 的统一投影：
 `normal`、`quota_exhausted`、`rate_limited`、`disabled`、`error`。只有明确上游证据才能恢复或终态化账号，
@@ -851,7 +857,7 @@ OpenAI 订阅周期属于按需个人信息，不是额度事实。Admin 账号�
 刷新信息时请求，关闭后取消等待，不维护两套请求状态
 
 主动额度重置是 OpenAI Provider 的不可逆上游操作：列表查询和消费都直接使用当前 Desktop 请求画像；
-卡片不写 PostgreSQL/Redis。消费请求携带调用方生成的 UUIDv4 幂等键，同一账号的消费在进程内串行；
+卡片不写持久数据库或协调存储。消费请求携带调用方生成的 UUIDv4 幂等键，同一账号的消费在进程内串行；
 发送结果不明确时必须复用原键。确认成功后管理端再显式刷新卡片与 quota，不能直接改本地重置时间
 
 ## 10. 观测与后台任务
@@ -930,7 +936,7 @@ Worker 由各 Bundle 贡献、由 Host 统一监督：
 
 - Store：过期请求恢复和持久数据库／协调依赖的观测队列
 - Host：历史保留任务，持有每小时调度、单轮行数/批数/时长预算、取消和日志；Admin 校验保留窗口，Store 执行有界批量删除
-- Core：`runtime` owner 的 RuntimeSnapshot 周期对账和 Redis change 订阅
+- Core：`runtime` owner 的 RuntimeSnapshot 周期对账，以及所选模式的变更通知
 - Admin：S3/R2 备份 daemon，负责调度、执行、删除收敛与保留清理；
   以及账号冻结恢复 worker（容量熔断的自适应并发下调与到期探测解冻）
 - Provider：credential refresh、quota/catalog 健康、账号预热和官方版本/etag 检查
@@ -945,8 +951,8 @@ Worker 由各 Bundle 贡献、由 Host 统一监督：
 或结构化错误中的明确过载提示）按滑动窗口计数，并把当时观测到的在途并发并入峰值证据；
 普通 5xx、未识别的上游错误、本地连接保护与诊断探测不参与容量计数或峰值采样。
 这些错误不证明凭据或配额失效，不进入账号失败状态。达到阈值后写入
-账号级 Redis 容量冷却，调度立即跳过该账号；管理端沿用限流状态，通过原因区分容量冻结与上游限流。
-冻结与计数由 Redis 保存，不改变 PostgreSQL 账号状态。需要探测的冻结在到期后仍阻止调度，恢复
+账号级容量冷却，调度立即跳过该账号；管理端沿用限流状态，通过原因区分容量冻结与上游限流。
+冻结与计数由对应协调存储保存（Redis 或 SQLite），不改变持久账号的启停与凭据状态。需要探测的冻结在到期后仍阻止调度，恢复
 worker 复用连接测试探针执行真实上游调用，并按冻结代次处理结果：成功清除，失败按配置时长顺延，
 过期探测结果不得覆盖更新的冻结或管理员操作，普通推理成功不能解除需要探测的冻结。关闭自动冻结或探测后，已有冻结在冷却到期后恢复。
 自适应并发下调通过管理事务与快照发布，按观测峰值的 80%（下限 2）原子更新最新有效账号上限，只降不升，不覆盖其他账号
@@ -1033,26 +1039,6 @@ Admin/API 只转发策略事实，前端分别展示运行版本、通道候选�
 
 ### 验证命令
 
-后端验证从 `backend/Cargo.toml` 执行，仓库根目录没有 Cargo manifest：
-
-```bash
-cargo +1.97.0 fmt --all --manifest-path backend/Cargo.toml -- --check
-RUST_MIN_STACK=16777216 cargo +1.97.0 clippy --manifest-path backend/Cargo.toml --all-targets --all-features --locked -- -D warnings
-RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml --test main --locked
-```
-
-线程栈设置与当前 CI 一致。PostgreSQL/Redis 集成测试需按
-[PostgreSQL 迁移文档](../backend/migrations/postgres/README.md#本地测试库) 配置专用测试库；未设置环境变量时，本地相关测试会跳过。
-其他检查与界面验证按 [贡献与审查](../CONTRIBUTING.md#验证) 执行
-
-插件 Runtime 的真实子进程与持久化测试使用 `CPR_PLUGIN_TEST_DATABASE_URL` 和
-`CPR_PLUGIN_TEST_REDIS_URL` 指向专用实例；未提供插件专用变量时复用 `CPR_TEST_DATABASE_URL` 与 `CPR_TEST_REDIS_URL`。
-密码及隔离要求与上述 Store 测试一致，CI 缺少服务配置时直接失败。
-
-测试归档缓存在 Cargo 测试临时目录的 `plugin-packages-v1/`，按含 worker 摘要的清单跨进程复用；
-每项测试独立校验、解包并创建会话、子进程与 Store，缓存不承载可变运行状态
-
-独立插件包的构建、安装与功能验证说明位于 `codex-proxy-plugins` 仓库的 `examples/workbench/README.md`。
-功能测试与性能、隔离和平台实测分别记录，不相互替代
+工具链、后端与前端检查、专用测试库和跨仓库联调命令统一见[开发指南](development.md#验证命令)。按变更范围选择检查，缺少服务配置而跳过的测试不算通过，功能、性能、平台和界面验收分别记录
 
 文档更新条件、内容归属与行文要求见[文档职责](../CONTRIBUTING.md#文档职责与更新条件)
