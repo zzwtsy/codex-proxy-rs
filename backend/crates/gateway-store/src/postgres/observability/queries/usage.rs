@@ -138,12 +138,13 @@ pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
             mr.total_tokens, mr.billing_snapshot_json, mr.cost_source, mr.cost_amount::text, mr.cost_currency,
             mr.transport_decision_wait_ms, mr.connect_ms, mr.headers_ms,
             mr.first_event_ms, mr.first_reasoning_ms, mr.first_text_ms, mr.first_token_ms,
-            mr.provider_processing_ms, mr.latency_ms, mr.admission_decision_ms,
+            mr.provider_processing_ms, mr.upstream_response_ms,
+            mr.upstream_api_overhead_ms, mr.upstream_engine_ms, mr.upstream_engine_iapi_ttft_ms, mr.upstream_engine_service_ttft_ms, mr.upstream_engine_iapi_tbt_ms, mr.upstream_engine_service_tbt_ms, mr.latency_ms, mr.admission_decision_ms,
             mr.account_selection_wait_ms, mr.capacity_used_slots, mr.capacity_total_slots,
             host(mr.client_ip) as client_ip, mr.user_agent,
             mr.reasoning_effort, mr.reasoning_preset, mr.subagent_kind, mr.compact,
             mr.started_at
-     from model_requests mr
+     from model_request_observations mr
      left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
      left join provider_accounts account on account.id = mr.provider_account_ref";
 
@@ -168,13 +169,14 @@ pub(crate) const USAGE_RECORD_DETAIL_SELECT: &str =
             mr.total_tokens, mr.billing_snapshot_json, mr.cost_source, mr.cost_amount::text,
             mr.cost_currency, mr.transport_decision_wait_ms, mr.connect_ms, mr.headers_ms,
             mr.first_event_ms, mr.first_reasoning_ms, mr.first_text_ms, mr.first_token_ms,
-            mr.provider_processing_ms, mr.latency_ms, mr.admission_decision_ms,
+            mr.provider_processing_ms, mr.upstream_response_ms,
+            mr.upstream_api_overhead_ms, mr.upstream_engine_ms, mr.upstream_engine_iapi_ttft_ms, mr.upstream_engine_service_ttft_ms, mr.upstream_engine_iapi_tbt_ms, mr.upstream_engine_service_tbt_ms, mr.latency_ms, mr.admission_decision_ms,
             mr.account_selection_wait_ms, mr.capacity_used_slots, mr.capacity_total_slots,
             host(mr.client_ip) as client_ip,
             mr.user_agent, mr.reasoning_effort, mr.reasoning_preset, mr.request_kind,
             mr.subagent_kind, mr.compact, mr.image_generation_requested,
             mr.image_generation_succeeded, mr.started_at, mr.deadline_at, mr.completed_at
-     from model_requests mr";
+     from model_request_observations mr";
 
 pub(crate) async fn list_usage_records(
     pool: &PgPool,
@@ -226,7 +228,7 @@ pub(crate) async fn count_usage_records(
     filter: &UsageRecordFilter,
 ) -> StoreResult<u64> {
     let mut statement = QueryBuilder::<Postgres>::new(
-        "select count(*)::bigint from model_requests mr where mr.started_at >= ",
+        "select count(*)::bigint from model_request_observations mr where mr.started_at >= ",
     );
     statement.push_bind(range.start);
     statement.push(" and mr.started_at < ");
@@ -292,7 +294,7 @@ pub(crate) async fn usage_record_detail(
         "select jsonb_build_object('requestId', related.id, 'outcome', related.outcome,
              'relation', case when related.id = current.recovery_request_id then 'recovered_by' else 'recovers' end,
              'completedAt', related.completed_at)
-         from model_requests current join model_requests related
+         from model_request_observations current join model_request_observations related
            on related.id = current.recovery_request_id or related.recovery_request_id = current.id
          where current.id = $1 order by related.started_at limit 20"
     ).bind(request_id).fetch_all(pool).await
@@ -401,7 +403,7 @@ pub(crate) async fn usage_diagnostics(
                 mr.latency_ms, mr.first_token_ms, mr.cost_source, mr.cost_amount,
                 mr.cost_currency, mr.downstream_committed_at, mr.client_transport,
                 mr.client_status_code, ({completed_usage}) as is_completed_usage
-         from model_requests mr where mr.started_at >= ",
+         from model_request_observations mr where mr.started_at >= ",
     ));
     statement.push_bind(range.start);
     statement.push(" and mr.started_at < ");
@@ -636,7 +638,7 @@ pub(crate) async fn diagnostic_account_display_names(
                 coalesce(
                   (
                     select request.provider_account_email_snapshot
-                    from model_requests request
+                    from model_request_observations request
                     where request.provider_account_ref = requested.account_id
                       and request.provider_account_email_snapshot is not null
                     order by request.started_at desc, request.id desc
@@ -644,7 +646,7 @@ pub(crate) async fn diagnostic_account_display_names(
                   ),
                   (
                     select request.provider_account_name_snapshot
-                    from model_requests request
+                    from model_request_observations request
                     where request.provider_account_ref = requested.account_id
                       and request.provider_account_name_snapshot is not null
                     order by request.started_at desc, request.id desc

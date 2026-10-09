@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { ApiKeyFormValue } from '../composables/useApiKeyEditor'
-import type { AccountGroup } from '@/api'
+import type { AccountGroupRef } from '@/api'
 import { BaseButton, BaseForm, BaseFormItem, BaseInput, BaseModal } from '@codex-proxy/ui'
 
 import { DollarSign, KeyRound } from '@lucide/vue'
@@ -9,7 +9,7 @@ import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import ProviderRequestProfilesEditor from '@/components/client-profile/ProviderRequestProfilesEditor.vue'
 
 const props = defineProps<{
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
   groupLoading: boolean
   editing: boolean
   saving: boolean

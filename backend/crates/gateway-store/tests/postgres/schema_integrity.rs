@@ -7,7 +7,7 @@ async fn error_details_migration_preserves_existing_request_and_event_text() {
     let Some(db) = TestDatabase::create_through("error_details_upgrade", 22).await else {
         return;
     };
-    seed_request(&db.pool).await;
+    seed_legacy_request(&db.pool).await;
     let raw = "{ \"error\": {\"code\":\"Vendor.Unknown\",\"message\":\"原始错误\"} }";
     sqlx::query("update model_requests set raw_upstream_error = $1 where id = 'req_integrity'")
         .bind(raw)
@@ -40,7 +40,7 @@ async fn error_details_migration_preserves_existing_request_and_event_text() {
     db.close().await;
 }
 
-async fn seed_request(pool: &sqlx::PgPool) {
+async fn seed_legacy_request(pool: &sqlx::PgPool) {
     sqlx::query(
         "insert into model_requests (
            id, client_api_key_ref, config_revision, protocol, operation, endpoint,
@@ -48,6 +48,29 @@ async fn seed_request(pool: &sqlx::PgPool) {
          ) values (
            'req_integrity', 'deleted_key', 1, 'openai', 'responses', '/v1/responses',
            'http_sse', now(), now() + interval '1 hour', 'failed', now(), 'all'
+         )",
+    )
+    .execute(pool)
+    .await
+    .expect("seed request without optional facts");
+}
+
+async fn seed_request(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "insert into model_requests (
+           id, client_api_key_ref, operation, client_transport, started_at, deadline_at, outcome, completed_at, request_observation_json
+         ) values (
+           'req_integrity', 'deleted_key', 'responses', 'http_sse', now(), now() + interval '1 hour', 'failed', now(),
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .execute(pool)
@@ -73,13 +96,38 @@ async fn request_fact_groups_reject_partial_writes_and_accept_complete_observati
     seed_request(&db.pool).await;
     for assignments in [
         "cost_source = 'calculated', cost_amount = 1",
-        "capacity_used_slots = 1",
-        "capacity_total_slots = 2",
-        "upstream_connection_id = 'connection'",
-        "upstream_connection_id = 'connection', upstream_connection_exit_reason = 'peer_closed', upstream_connection_age_ms = 10",
+        "request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'scheduling', coalesce(request_observation_json #> '{scheduling}', '{}'::jsonb) || jsonb_build_object(
+             'capacityUsedSlots', 1)))",
+        "request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'scheduling', coalesce(request_observation_json #> '{scheduling}', '{}'::jsonb) || jsonb_build_object(
+             'capacityTotalSlots', 2)))",
+        "request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'transport', coalesce(request_observation_json #> '{transport}', '{}'::jsonb) || jsonb_build_object(
+             'connection', coalesce(request_observation_json #> '{transport,connection}', '{}'::jsonb) || jsonb_build_object(
+               'id', 'connection'))))",
+        "request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'transport', coalesce(request_observation_json #> '{transport}', '{}'::jsonb) || jsonb_build_object(
+             'connection', coalesce(request_observation_json #> '{transport,connection}', '{}'::jsonb) || jsonb_build_object(
+               'id', 'connection',
+               'exitReason', 'peer_closed',
+               'ageMs', 10))))",
         "recovery_request_id = 'req_recovery', recovered_at = completed_at, recovery_attempt_count = 1",
-        "recovery_request_id = 'req_recovery', recovered_at = completed_at, recovery_attempt_count = 1, recovery_retry_delay_ms = 0",
-        "outcome = 'running', completed_at = null, recovered_at = now(), recovery_request_id = 'req_recovery', recovery_attempt_count = 1, recovery_retry_delay_ms = 0, recovery_total_latency_ms = 1",
+        "recovery_request_id = 'req_recovery',
+           recovered_at = completed_at,
+           recovery_attempt_count = 1,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'recovery', coalesce(request_observation_json #> '{recovery}', '{}'::jsonb) || jsonb_build_object(
+             'retryDelayMs', 0)))",
+        "outcome = 'running',
+           completed_at = null,
+           recovered_at = now(),
+           recovery_request_id = 'req_recovery',
+           recovery_attempt_count = 1,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'recovery', coalesce(request_observation_json #> '{recovery}', '{}'::jsonb) || jsonb_build_object(
+             'retryDelayMs', 0,
+             'totalLatencyMs', 1)))",
     ] {
         let error = sqlx::query(sqlx::AssertSqlSafe(format!(
             "update model_requests set {assignments} where id = 'req_integrity'"
@@ -90,12 +138,25 @@ async fn request_fact_groups_reject_partial_writes_and_accept_complete_observati
         assert_check_rejected(&error);
     }
     sqlx::query(
-        "update model_requests set cost_source = 'calculated', cost_amount = 1,
-           cost_currency = 'USD', capacity_used_slots = 1, capacity_total_slots = 2,
-           upstream_connection_id = 'connection', upstream_connection_exit_reason = 'peer_closed',
-           upstream_connection_age_ms = 10, upstream_connection_idle_ms = 2,
-           recovery_request_id = 'req_recovery', recovered_at = completed_at,
-           recovery_attempt_count = 1, recovery_retry_delay_ms = 0, recovery_total_latency_ms = 1
+        "update model_requests set cost_source = 'calculated',
+           cost_amount = 1,
+           cost_currency = 'USD',
+           recovery_request_id = 'req_recovery',
+           recovered_at = completed_at,
+           recovery_attempt_count = 1,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'scheduling', coalesce(request_observation_json #> '{scheduling}', '{}'::jsonb) || jsonb_build_object(
+             'capacityUsedSlots', 1,
+             'capacityTotalSlots', 2),
+           'transport', coalesce(request_observation_json #> '{transport}', '{}'::jsonb) || jsonb_build_object(
+             'connection', coalesce(request_observation_json #> '{transport,connection}', '{}'::jsonb) || jsonb_build_object(
+               'id', 'connection',
+               'exitReason', 'peer_closed',
+               'ageMs', 10,
+               'idleMs', 2)),
+           'recovery', coalesce(request_observation_json #> '{recovery}', '{}'::jsonb) || jsonb_build_object(
+             'retryDelayMs', 0,
+             'totalLatencyMs', 1)))
          where id = 'req_integrity'",
     )
     .execute(&db.pool)
@@ -190,5 +251,160 @@ async fn backup_completion_cannot_precede_its_start() {
     .await
     .expect_err("completed backup must not end before it starts");
     assert_check_rejected(&error);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn request_observation_migration_preserves_every_historical_field() {
+    let Some(db) = TestDatabase::create_through("request_observation_upgrade", 24).await else {
+        return;
+    };
+    seed_legacy_request(&db.pool).await;
+    sqlx::raw_sql(
+        "insert into model_requests
+           select (jsonb_populate_record(null::model_requests,
+             to_jsonb(mr) || jsonb_build_object('id', 'req_empty'))).*
+           from model_requests mr;
+         update model_requests set config_revision = 7,
+           provider_account_name_snapshot = 'historical account',
+           provider_account_email_snapshot = 'history@example.invalid',
+           provider_account_authentication_kind_snapshot = 'oauth',
+           routing_scope = 'groups', routing_group_refs = array['deleted_group'],
+           routing_group_names_snapshot = '[\"历史组\"]',
+           provider_error_code = 'rate_limit', error_message = 'safe error', retry_after_ms = 0,
+           client_ip = '192.0.2.10/24', user_agent = 'fixture', reasoning_effort = 'high',
+           reasoning_preset = 'balanced', subagent_kind = 'review', compact = true,
+           transport_decision_wait_ms = 0, connect_ms = 2, headers_ms = 3,
+           first_event_ms = 4, first_reasoning_ms = 5, first_text_ms = 6,
+           first_token_ms = 5, latency_ms = 1000, provider_processing_ms = 7,
+           admission_decision_ms = 0, account_selection_wait_ms = 8,
+           capacity_used_slots = 0, capacity_total_slots = 20,
+           http_version = 'HTTP/2', websocket_pool = 'reuse',
+           upstream_connection_id = 'connection', upstream_connection_exit_reason = 'peer_closed',
+           upstream_connection_age_ms = 10, upstream_connection_idle_ms = 0,
+           upstream_response_model = 'response-model', continuation_requested = true,
+           continuation_previous_response_id_hash = repeat('a', 64),
+           continuation_unavailable_reason = 'missing_response',
+           recovery_request_id = 'recovery', recovered_at = completed_at + interval '1 second',
+           recovery_attempt_count = 1, recovery_retry_delay_ms = 0, recovery_total_latency_ms = 1000,
+           input_tokens = 10, output_tokens = 20, total_tokens = 30,
+           cost_source = 'provider_reported', cost_amount = 0.0123456789, cost_currency = 'USD',
+           error_details = '{ \"opaque\": true }', provider_observation_json = '{\"vendor\":true}',
+           diagnostic_trace_json = '{\"attempts\":[]}'
+         where id = 'req_integrity'",
+    ).execute(&db.pool).await.expect("populate all moved fields in the released schema");
+    let before: Vec<serde_json::Value> =
+        sqlx::query_scalar("select to_jsonb(mr) from model_requests mr order by id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    super::TEST_MIGRATOR.run(&db.pool).await.unwrap();
+    let after: Vec<serde_json::Value> = sqlx::query_scalar(
+        "select to_jsonb(mr) - 'request_observation_json' - 'upstream_response_ms' - 'upstream_api_overhead_ms' - 'upstream_engine_ms' - 'upstream_engine_iapi_ttft_ms' - 'upstream_engine_service_ttft_ms' - 'upstream_engine_iapi_tbt_ms' - 'upstream_engine_service_tbt_ms'
+         from model_request_observations mr order by id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "all 90 historical facts survive the migration"
+    );
+    let columns: i64 = sqlx::query_scalar(
+        "select count(*) from information_schema.columns
+         where table_schema = current_schema() and table_name = 'model_requests'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, 49);
+    let observation: serde_json::Value = sqlx::query_scalar(
+        "select request_observation_json from model_requests where id = 'req_integrity'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        observation["timings"]["local"]["transportDecisionWaitMs"],
+        0
+    );
+    assert_eq!(observation["scheduling"]["capacityUsedSlots"], 0);
+    assert!(
+        observation["timings"]["upstream"]
+            .get("responseMs")
+            .is_none()
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn request_observation_reject_malformed_documents_and_keep_upstream_clock_independent() {
+    use serde_json::json;
+
+    let Some(db) = TestDatabase::create("request_observation_shape").await else {
+        return;
+    };
+    seed_request(&db.pool).await;
+    let original: serde_json::Value =
+        sqlx::query_scalar("select request_observation_json from model_requests")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    for patch in [
+        json!({"unknown": {}}),
+        json!({"timings": []}),
+        json!({"request": {}}),
+        json!({"request": null}),
+        json!({"routing": {"scope": "all", "groupRefs": [null], "groupNamesSnapshot": []}}),
+        json!({"timings": {"local": {"latencyMs": -1}}}),
+        json!({"timings": {"local": {"latencyMs": 1.0}}}),
+        json!({"timings": {"local": {"latencyMs": "1"}}}),
+        json!({"timings": {"local": {"latencyMs": u64::MAX}}}),
+        json!({"timings": {"upstream": {"responseMs": 0}}}),
+        json!({"timings": {"upstream": {"engineMs": -0.5}}}),
+        json!({"timings": {"upstream": {"engineIapiTbtMs": "1.5"}}}),
+        json!({"timings": {"upstream": {"engineServiceTbtMs": 1e99}}}),
+        json!({"transport": {"websocketPool": "invalid"}}),
+        json!({"continuation": {"unavailableReason": "invalid reason"}}),
+        json!({"error": {"message": "x".repeat(1024 * 1024)}}),
+    ] {
+        let mut document = original.clone();
+        document
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        sqlx::query("update model_requests set request_observation_json = $1")
+            .bind(sqlx::types::Json(document))
+            .execute(&db.pool)
+            .await
+            .expect_err("invalid JSON must not enter the query projection");
+    }
+    let mut invalid_ip = original.clone();
+    invalid_ip["request"]["clientIp"] = json!("not an IP address");
+    sqlx::query("update model_requests set request_observation_json = $1")
+        .bind(sqlx::types::Json(invalid_ip))
+        .execute(&db.pool)
+        .await
+        .expect_err("invalid IP");
+    sqlx::query("update model_requests set request_observation_json = request_observation_json || $1::jsonb")
+        .bind(sqlx::types::Json(json!({"timings": {
+            "local": {"latencyMs": 1, "firstTokenMs": 0},
+            "upstream": {"processingMs": 500, "responseMs": 1000, "engineIapiTbtMs": 2.450638, "apiOverheadMs": 0.0}
+        }})))
+        .execute(&db.pool)
+        .await
+        .expect("upstream has an independent clock");
+    let timing: (i64, i64, i64, Option<i64>) = sqlx::query_as(
+        "select first_token_ms, provider_processing_ms, upstream_response_ms, connect_ms
+         from model_request_observations",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(timing, (0, 500, 1000, None));
+    let metrics: (f64, f64, Option<f64>) = sqlx::query_as(
+        "select upstream_engine_iapi_tbt_ms, upstream_api_overhead_ms, upstream_engine_ms from model_request_observations",
+    ).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(metrics, (2.450638, 0.0, None));
     db.close().await;
 }

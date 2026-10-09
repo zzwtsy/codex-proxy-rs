@@ -287,6 +287,7 @@ pub struct RequestAttemptContext {
     request_profile: Option<crate::account::OpaqueProviderData>,
     fast_mode: FastMode,
     request_location: Option<crate::account::RequestLocation>,
+    privacy: Option<Arc<dyn crate::settings::privacy::CompiledPrivacyPolicy>>,
     request_id: ModelRequestId,
     client_api_key_ref: ClientApiKeyId,
     timing_started_at: Instant,
@@ -351,6 +352,15 @@ impl RequestAttemptContext {
     }
 
     #[must_use]
+    pub fn with_privacy(
+        mut self,
+        privacy: Option<Arc<dyn crate::settings::privacy::CompiledPrivacyPolicy>>,
+    ) -> Self {
+        self.privacy = privacy;
+        self
+    }
+
+    #[must_use]
     pub fn with_request_location(
         mut self,
         location: Option<crate::account::RequestLocation>,
@@ -369,6 +379,7 @@ impl RequestAttemptContext {
             pricing: Arc::default(),
             fast_mode: FastMode::Default,
             request_location: None,
+            privacy: None,
             timing_started_at: Instant::now(),
             trace: crate::diagnostics::TraceContext::default(),
             concurrency_wait_budget: crate::concurrency::ConcurrencyWaitBudget::default(),
@@ -567,6 +578,11 @@ impl AttemptContext {
     #[must_use]
     pub const fn fast_mode(&self) -> FastMode {
         self.request.fast_mode
+    }
+
+    #[must_use]
+    pub fn privacy(&self) -> Option<Arc<dyn crate::settings::privacy::CompiledPrivacyPolicy>> {
+        self.request.privacy.clone()
     }
 
     #[must_use]
@@ -878,8 +894,8 @@ pub struct ProbeFailure {
     pub latency: Duration,
 }
 
-/// `model_requests` 可用的毫秒级阶段耗时
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// 请求与上游响应的耗时事实，统一以毫秒保存但不提高来源精度
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelRequestTimings {
     pub transport_decision_wait_ms: Option<u64>,
     pub connect_ms: Option<u64>,
@@ -889,6 +905,13 @@ pub struct ModelRequestTimings {
     pub first_text_ms: Option<u64>,
     pub first_token_ms: Option<u64>,
     pub provider_processing_ms: Option<u64>,
+    pub upstream_response_ms: Option<u64>,
+    pub upstream_api_overhead_ms: Option<f64>,
+    pub upstream_engine_ms: Option<f64>,
+    pub upstream_engine_iapi_ttft_ms: Option<f64>,
+    pub upstream_engine_service_ttft_ms: Option<f64>,
+    pub upstream_engine_iapi_tbt_ms: Option<f64>,
+    pub upstream_engine_service_tbt_ms: Option<f64>,
     pub latency_ms: Option<u64>,
 }
 

@@ -1,6 +1,6 @@
 //! 验证账号分组聚合、Key 绑定与分组策略的持久化
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use gateway_admin::{
     model::{
@@ -289,6 +289,88 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
 }
 
 #[tokio::test]
+async fn group_options_should_avoid_aggregate_tables_and_page_filtered_empty_groups() {
+    let Some(database) = TestDatabase::create("account_group_options").await else {
+        return;
+    };
+    for (id, name, enabled, created_at) in [
+        (MIXED_GROUP, "Production Pool", true, "2026-01-01T00:00:00Z"),
+        (EMPTY_GROUP, "Disabled Pool", false, "2026-01-02T00:00:00Z"),
+        (
+            "grp_00000000000000000000000000000003",
+            "Unrelated",
+            true,
+            "2026-01-03T00:00:00Z",
+        ),
+    ] {
+        sqlx::query(
+            "insert into account_groups (id, name, color, enabled, created_at, updated_at)
+             values ($1, $2, '#2563EBFF', $3, $4::text::timestamptz, $4::text::timestamptz)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(enabled)
+        .bind(created_at)
+        .execute(&database.pool)
+        .await
+        .expect("seed account group option");
+    }
+    let groups = PgAccountGroupRepository::new(database.pool.clone());
+
+    let mut locked_tables = database.pool.begin().await.expect("begin table lock");
+    sqlx::query(
+        "lock table account_group_accounts, client_api_key_groups, model_requests
+         in access exclusive mode",
+    )
+    .execute(&mut *locked_tables)
+    .await
+    .expect("lock aggregate source tables");
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(1),
+        groups.list_account_group_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(1).expect("page size"),
+            search: Some("pool".to_owned()),
+            enabled: None,
+        }),
+    )
+    .await
+    .expect("options query must not wait for aggregate source tables")
+    .expect("list first account group option page");
+    assert_eq!(first.total, 2);
+    assert_eq!(first.items[0].id.as_str(), EMPTY_GROUP);
+    assert!(!first.items[0].enabled);
+
+    let second = groups
+        .list_account_group_options(AccountGroupListQuery {
+            page: 2,
+            page_size: PageSize::new(1).expect("page size"),
+            search: Some("POOL".to_owned()),
+            enabled: None,
+        })
+        .await
+        .expect("list second account group option page");
+    assert_eq!(second.items[0].id.as_str(), MIXED_GROUP);
+
+    let disabled = groups
+        .list_account_group_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: Some(false),
+        })
+        .await
+        .expect("list disabled account group options");
+    assert_eq!(disabled.total, 1);
+    assert_eq!(disabled.items[0].id.as_str(), EMPTY_GROUP);
+
+    locked_tables.rollback().await.expect("release table locks");
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn group_costs_should_include_statusless_websocket_but_reject_statusless_http() {
     let Some(database) = TestDatabase::create("account_group_statusless_websocket_cost").await
     else {
@@ -446,20 +528,19 @@ async fn seed_group_cost_snapshot(
         .collect();
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport, attempt_count,
-           upstream_send_state, downstream_committed_at, outcome, client_status_code,
-           upstream_status_code, total_tokens, cost_source, cost_amount, cost_currency,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_id, provider_account_ref, upstream_model_id, upstream_transport, attempt_count, upstream_send_state, downstream_committed_at, outcome, client_status_code, upstream_status_code, total_tokens, cost_source, cost_amount, cost_currency, started_at, deadline_at, completed_at, request_observation_json
          ) values (
-           $1, 'key-group-history', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'gpt-group', 'openai', $2, $2, 'gpt-group', 'http_sse', 1,
-           'sent', now(), 'succeeded', 200, 200, 10,
-           'provider_reported', $4::numeric, 'USD', now() - interval '1 minute',
-           now() + interval '5 minutes', now(),
-           'groups', $3::text[], to_jsonb($3::text[])
+           $1, 'key-group-history', 'responses', 'http_sse', 'gpt-group', 'openai', $2, $2, 'gpt-group', 'http_sse', 1, 'sent', now(), 'succeeded', 200, 200, 10, 'provider_reported', $4::numeric, 'USD', now() - interval '1 minute', now() + interval '5 minutes', now(),
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'routing', jsonb_build_object(
+             'scope', 'groups',
+             'groupRefs', $3::text[],
+             'groupNamesSnapshot', to_jsonb($3::text[]))))
          )",
     )
     .bind(request_id)

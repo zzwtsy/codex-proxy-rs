@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 use provider_xai::{GrokRequestEncodeError, GrokResponsesRequest};
 
 mod hosted_names;
+mod incremental_tools;
 mod model_identity;
 mod parameters;
 mod web_search;
@@ -713,14 +714,14 @@ fn explicit_session_should_add_x_search_after_codex_additional_tools_normalizati
 }
 
 #[test]
-fn additional_tools_should_keep_top_level_definition_and_drop_unsupported_types() {
+fn additional_tools_should_replace_earlier_definition_and_drop_unsupported_types() {
     let request = raw_request(json!({
         "model": "client",
         "tools": [
             {
                 "type": "function",
                 "name": "existing",
-                "description": "top-level wins",
+                "description": "initial definition",
                 "parameters": {"type": "object"}
             },
             {"type": "image_generation", "model": "gpt-image-2"}
@@ -733,7 +734,7 @@ fn additional_tools_should_keep_top_level_definition_and_drop_unsupported_types(
                     {
                         "type": "function",
                         "name": "existing",
-                        "description": "carrier duplicate",
+                        "description": "updated definition",
                         "parameters": {"type": "object"}
                     },
                     {"type": "function", "name": "wait"},
@@ -753,7 +754,7 @@ fn additional_tools_should_keep_top_level_definition_and_drop_unsupported_types(
     assert_eq!(body.pointer("/tools/0/name"), Some(&json!("existing")));
     assert_eq!(
         body.pointer("/tools/0/description"),
-        Some(&json!("top-level wins"))
+        Some(&json!("updated definition"))
     );
     assert_eq!(body.pointer("/tools/1/name"), Some(&json!("wait")));
     assert_eq!(body.pointer("/tools/2"), None);

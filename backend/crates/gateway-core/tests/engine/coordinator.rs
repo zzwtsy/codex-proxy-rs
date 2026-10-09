@@ -51,7 +51,7 @@ use gateway_core::routing::{
 use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
 use serde_json::{Map, Value, json};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct FinalState {
     error_kind: Option<GatewayErrorKind>,
     diagnostic_trace_json: Option<String>,
@@ -85,6 +85,13 @@ struct FinalState {
     first_text_ms: Option<u64>,
     first_token_ms: Option<u64>,
     provider_processing_ms: Option<u64>,
+    upstream_response_ms: Option<u64>,
+    upstream_api_overhead_ms: Option<f64>,
+    upstream_engine_ms: Option<f64>,
+    upstream_engine_iapi_ttft_ms: Option<f64>,
+    upstream_engine_service_ttft_ms: Option<f64>,
+    upstream_engine_iapi_tbt_ms: Option<f64>,
+    upstream_engine_service_tbt_ms: Option<f64>,
     provider_metadata_json: Option<String>,
     cost_source: CostSource,
     cost_ticks: Option<u128>,
@@ -253,6 +260,15 @@ impl ExecutionStore for FakeStore {
                 first_text_ms: finalization.timings.first_text_ms,
                 first_token_ms: finalization.timings.first_token_ms,
                 provider_processing_ms: finalization.timings.provider_processing_ms,
+                upstream_response_ms: finalization.timings.upstream_response_ms,
+                upstream_api_overhead_ms: finalization.timings.upstream_api_overhead_ms,
+                upstream_engine_ms: finalization.timings.upstream_engine_ms,
+                upstream_engine_iapi_ttft_ms: finalization.timings.upstream_engine_iapi_ttft_ms,
+                upstream_engine_service_ttft_ms: finalization
+                    .timings
+                    .upstream_engine_service_ttft_ms,
+                upstream_engine_iapi_tbt_ms: finalization.timings.upstream_engine_iapi_tbt_ms,
+                upstream_engine_service_tbt_ms: finalization.timings.upstream_engine_service_tbt_ms,
                 provider_metadata_json: finalization.provider_metadata_json,
                 cost_source: finalization.cost.source(),
                 cost_ticks: finalization
@@ -1510,7 +1526,7 @@ fn empty_tool_call_delta_should_not_preempt_provider_first_token_timing() {
 }
 
 #[test]
-fn empty_content_deltas_do_not_create_first_token_timings() {
+fn canonical_output_does_not_invent_missing_provider_timings() {
     let operation = generate_operation();
     let route_plan = plan(&operation);
     let mut items = complete_stream(None);
@@ -1523,7 +1539,7 @@ fn empty_content_deltas_do_not_create_first_token_timings() {
             ))),
             Ok(GatewayEvent::TextDelta(gateway_core::event::TextDelta {
                 content_index: 0,
-                text: String::new(),
+                text: "real content".to_owned(),
             })),
             Ok(GatewayEvent::ContentAdded(ContentItem::new(
                 1,
@@ -1532,7 +1548,7 @@ fn empty_content_deltas_do_not_create_first_token_timings() {
             Ok(GatewayEvent::ReasoningDelta(
                 gateway_core::event::ReasoningDelta {
                     content_index: 1,
-                    text: String::new(),
+                    text: "real content".to_owned(),
                 },
             )),
         ],
@@ -1555,7 +1571,7 @@ fn empty_content_deltas_do_not_create_first_token_timings() {
 
     let state = store.state.lock().unwrap();
     let timings = &state.finalizations[0];
-    assert!(timings.first_event_ms.is_some());
+    assert_eq!(timings.first_event_ms, None);
     assert_eq!(
         (
             timings.first_token_ms,
@@ -1629,6 +1645,13 @@ fn discarded_attempt_observation_does_not_leak_into_retry_result() {
         headers_ms: Some(13),
         first_event_ms: Some(987_654),
         provider_processing_ms: Some(41),
+        upstream_response_ms: Some(7_000),
+        upstream_api_overhead_ms: Some(120.25),
+        upstream_engine_ms: Some(6400.0),
+        upstream_engine_iapi_ttft_ms: Some(650.5),
+        upstream_engine_service_ttft_ms: Some(720.25),
+        upstream_engine_iapi_tbt_ms: Some(18.45),
+        upstream_engine_service_tbt_ms: Some(20.12),
         ..ProviderResponseTimings::default()
     });
     let second_observation = ProviderResponseObservation::new(
@@ -1719,17 +1742,20 @@ fn discarded_attempt_observation_does_not_leak_into_retry_result() {
     assert_eq!(finalization.connect_ms, None);
     assert_eq!(finalization.headers_ms, None);
     assert_eq!(finalization.provider_processing_ms, None);
+    assert_eq!(finalization.upstream_response_ms, None);
+    assert_eq!(finalization.upstream_api_overhead_ms, None);
+    assert_eq!(finalization.upstream_engine_ms, None);
+    assert_eq!(finalization.upstream_engine_iapi_ttft_ms, None);
+    assert_eq!(finalization.upstream_engine_service_ttft_ms, None);
+    assert_eq!(finalization.upstream_engine_iapi_tbt_ms, None);
+    assert_eq!(finalization.upstream_engine_service_tbt_ms, None);
     let contexts = provider.contexts.lock().unwrap();
     assert_eq!(contexts.len(), 2);
     assert_eq!(
         contexts[0].timing_started_at(),
         contexts[1].timing_started_at()
     );
-    assert!(
-        finalization
-            .first_event_ms
-            .is_some_and(|elapsed| elapsed < 987_654)
-    );
+    assert_eq!(finalization.first_event_ms, None);
     assert_eq!(state.intermediate_status_codes, vec![Some(504)]);
     assert_eq!(
         state.intermediate_request_ids,

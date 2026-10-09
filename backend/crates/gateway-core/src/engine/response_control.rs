@@ -1,14 +1,27 @@
-//! 当前执行的响应中断信号；只由持有活动响应的 Provider 注册，不查找其他执行或连接
+//! 原上游连接的控制消息端口；不解释协议类型、不创建执行或延长连接生命周期
 
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::lifecycle::CancellationToken;
+use async_trait::async_trait;
 
-/// 单次根执行的控制入口；重试不继承已结束响应的控制目标
+/// Provider 实现的连接控制通道，消息内容由上游协议解释
+#[async_trait]
+pub trait ResponseControlTransport: Send + Sync {
+    async fn send(&self, payload: &str) -> Result<(), ResponseControlUnavailable>;
+
+    /// 仅在响应正文已结束后读取，调用方必须先取消此读取再开始下一轮执行
+    async fn receive(&self) -> Result<String, ResponseControlUnavailable>;
+}
+
+/// 控制消息没有可用的原上游连接，不能通过重新选号或重试恢复
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseControlUnavailable;
+
+/// 单次根执行绑定的原连接；终态后仍可使用，连接销毁或重新绑定时失效
 #[derive(Clone, Default)]
 pub struct ResponseControl {
-    active: Arc<Mutex<Weak<InterruptTarget>>>,
+    target: Arc<Mutex<Option<Weak<dyn ResponseControlTransport>>>>,
 }
 
 impl fmt::Debug for ResponseControl {
@@ -17,64 +30,42 @@ impl fmt::Debug for ResponseControl {
     }
 }
 
-struct InterruptTarget {
-    response_id: String,
-    requested: CancellationToken,
-}
-
-/// Provider 持有的活动响应控制权；释放后客户端无法再向该响应发出中断
-pub struct ActiveResponseInterrupt(Arc<InterruptTarget>);
-
-/// 控制帧不能作用于当前执行时的稳定原因，不携带其他响应身份
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseInterruptError {
-    Unavailable,
-    ResponseMismatch,
-}
-
 impl ResponseControl {
-    /// 在上游确认响应 ID 后注册；同一执行只允许一个存活的响应 owner
-    pub fn activate(&self, response_id: String) -> Option<ActiveResponseInterrupt> {
-        let mut active = self
-            .active
+    /// Provider 在请求成功写入上游后绑定；连接 owner 持有强引用并负责撤销
+    pub fn bind(&self, transport: &Arc<dyn ResponseControlTransport>) {
+        *self
+            .target
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if active.upgrade().is_some() || response_id.is_empty() {
-            return None;
-        }
-        let target = Arc::new(InterruptTarget {
-            response_id,
-            requested: CancellationToken::new(),
-        });
-        *active = Arc::downgrade(&target);
-        Some(ActiveResponseInterrupt(target))
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(transport));
     }
 
-    /// 重复中断合并为一次信号；ID 必须匹配本执行当前的上游响应
-    pub fn interrupt(&self, response_id: &str) -> Result<(), ResponseInterruptError> {
-        let active = self
-            .active
+    pub fn clear(&self) {
+        *self
+            .target
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let target = active
-            .upgrade()
-            .ok_or(ResponseInterruptError::Unavailable)?;
-        if target.response_id != response_id {
-            return Err(ResponseInterruptError::ResponseMismatch);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn transport(&self) -> Option<Arc<dyn ResponseControlTransport>> {
+        self.target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    pub async fn send(&self, payload: &str) -> Result<(), ResponseControlUnavailable> {
+        self.transport()
+            .ok_or(ResponseControlUnavailable)?
+            .send(payload)
+            .await
+    }
+
+    /// 未绑定时保持等待，供连接空闲循环与客户端输入共同 select
+    pub async fn receive(&self) -> Result<String, ResponseControlUnavailable> {
+        match self.transport() {
+            Some(transport) => transport.receive().await,
+            None => std::future::pending().await,
         }
-        target.requested.cancel();
-        Ok(())
-    }
-}
-
-impl ActiveResponseInterrupt {
-    pub fn response_id(&self) -> &str {
-        &self.0.response_id
-    }
-
-    pub fn requested(&self) -> impl Future<Output = ()> + Send + 'static {
-        // 等待者只持有信号，不能延长活动响应 owner 的生命周期
-        let requested = self.0.requested.clone();
-        async move { requested.cancelled().await }
     }
 }

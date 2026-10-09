@@ -1,3 +1,5 @@
+//! 验证 SQLite 分组目录、轻量选择器与费用归属
+
 use gateway_admin::{
     model::{
         MutationActor, MutationContext, PageSize,
@@ -10,6 +12,60 @@ use gateway_admin::{
 };
 use gateway_core::{account::FastMode, routing::AccountGroupId};
 use gateway_store::{SqliteStoreConfig, sqlite, sqlite::SqliteAccountGroupRepository};
+
+#[tokio::test]
+async fn group_options_keep_filters_and_revision_without_usage_aggregation() {
+    let root = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect_and_migrate(
+        &root.path().join("options.sqlite3"),
+        &SqliteStoreConfig::default(),
+    )
+    .await
+    .unwrap();
+    let repository = SqliteAccountGroupRepository::new(pool.clone());
+    let id = AccountGroupId::new("grp_11111111111111111111111111111111").unwrap();
+    repository
+        .create_account_group(
+            NewAccountGroup {
+                id: id.clone(),
+                name: "Options".into(),
+                description: None,
+                color: AccountGroupColor::parse("#2563EBFF").unwrap(),
+                fast_mode: FastMode::Default,
+            },
+            &context("options-create"),
+        )
+        .await
+        .unwrap();
+    // 选择器只读取分组目录，即使统计视图不可用也不触发聚合
+    sqlx::query("drop view model_request_observations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let query = AccountGroupListQuery {
+        page: 1,
+        page_size: PageSize::new(20).unwrap(),
+        search: Some("option".into()),
+        enabled: Some(true),
+    };
+    let page = repository
+        .list_account_group_options(query.clone())
+        .await
+        .unwrap();
+    assert_eq!(page.config_revision.get(), 2);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].id, id);
+    let empty = repository
+        .list_account_group_options(AccountGroupListQuery {
+            enabled: Some(false),
+            ..query
+        })
+        .await
+        .unwrap();
+    assert!(empty.items.is_empty());
+    assert_eq!(empty.total, 0);
+    pool.close().await;
+}
 
 #[tokio::test]
 async fn sqlite_account_groups_preserve_cas_audit_membership_and_list_contracts() {
@@ -259,15 +315,10 @@ async fn sqlite_account_group_usage_includes_retained_costs_and_separates_today(
         );
         sqlx::query(
             "insert into model_requests (
-               id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-               client_transport, requested_model_id, outcome, client_status_code,
-               downstream_committed_at_us, cost_source, cost_amount, cost_currency,
-               started_at_us, deadline_at_us, completed_at_us, routing_scope,
-               provider_account_ref, provider_kind
+               id, client_api_key_ref, operation, client_transport, requested_model_id, outcome, client_status_code, downstream_committed_at_us, cost_source, cost_amount, cost_currency, started_at_us, deadline_at_us, completed_at_us, provider_account_ref, provider_kind, request_observation_json
              ) values (
-               ?1, 'key-group-usage', 1, 'openai', 'responses.create', '/v1/responses',
-               'http', 'gpt-5', 'succeeded', 200, ?2, 'calculated', ?3, 'USD',
-               ?4, ?5, ?6, 'legacy_provider', 'account-group-usage', 'openai'
+               ?1, 'key-group-usage', 'responses.create', 'http', 'gpt-5', 'succeeded', 200, ?2, 'calculated', ?3, 'USD', ?4, ?5, ?6, 'account-group-usage', 'openai',
+               json_object('request', json_object('configRevision', 1, 'protocol', 'openai', 'endpoint', '/v1/responses', 'compact', json('false')), 'routing', json_object('scope', 'legacy_provider', 'groupRefs', json('[]'), 'groupNamesSnapshot', json('[]')))
              )",
         )
         .bind(request_id)

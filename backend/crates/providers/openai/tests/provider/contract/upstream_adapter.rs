@@ -263,7 +263,7 @@ async fn selected_adapter_connection(
 
 #[tokio::test]
 async fn guardian_reservation_survives_upstream_adapters_and_metadata_precedence() {
-    // 上限 2、已有 1 个在途请求：预留启用时只有 Guardian 能继续取得租约
+    // 普通池上限 2 且已满，审批独立池仍有空位；关闭独立池后审批也受普通容量约束
     for (subagent, turn_kind, reserved, allowed) in [
         (Some("guardian"), None, 1, true),
         (None, Some("guardian"), 1, true),
@@ -271,7 +271,8 @@ async fn guardian_reservation_survives_upstream_adapters_and_metadata_precedence
         (Some("guardian"), Some("collab_spawn"), 1, false),
         (Some("collab_spawn"), None, 1, false),
         (None, None, 1, false),
-        (None, None, 0, true),
+        (None, None, 0, false),
+        (Some("guardian"), None, 0, false),
     ] {
         let store = Arc::new(MemoryAccountStore::default());
         create_account(&store, "acct_provider_contract").await;
@@ -279,7 +280,7 @@ async fn guardian_reservation_survives_upstream_adapters_and_metadata_precedence
         leases.signals.lock().unwrap().insert(
             ProviderAccountId::new("acct_provider_contract").unwrap(),
             AccountRuntimeSignals {
-                in_flight: 1,
+                in_flight: 2,
                 last_started_at: None,
                 quota_reset_at: None,
                 quota_remaining_rank: None,
@@ -355,7 +356,11 @@ async fn guardian_reservation_survives_upstream_adapters_and_metadata_precedence
             drop(receiver.await.unwrap());
             let requests = leases.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].max_concurrent().get(), 2);
+            assert_eq!(requests[0].max_concurrent().get(), 1);
+            assert_eq!(
+                requests[0].concurrency_pool(),
+                gateway_core::provider_ports::ProviderConcurrencyPool::Reserved
+            );
         } else {
             assert!(leases.requests.lock().unwrap().is_empty());
         }

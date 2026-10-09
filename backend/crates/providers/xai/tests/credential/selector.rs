@@ -59,6 +59,7 @@ impl ProviderLeasePort for SchedulingCoordinator {
         _: &'a ClientApiKeyId,
         _: &'a gateway_core::routing::ProviderKind,
         _: &'a [ProviderAccountId],
+        _pool: gateway_core::provider_ports::ProviderConcurrencyPool,
     ) -> futures::future::BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async move {
             Ok(ProviderSchedulingState::new(

@@ -1,7 +1,10 @@
 //! 插件运行时配置、端口装配与整体关闭；候选和调用均复用同一状态
 
 use super::super::restart_circuit::{PluginRestartCircuitConfig, RestartCircuits, RestartIdentity};
-use super::{diagnostics::PreparationDiagnostic, set::PreparedSet};
+use super::{
+    diagnostics::PreparationDiagnostic,
+    set::{PreparedInstance, PreparedSet},
+};
 use crate::{
     PackageLimits, RpcLimits, RpcSession,
     callback::{
@@ -54,6 +57,7 @@ pub struct PluginRuntime {
     pub(super) config: PluginRuntimeConfig,
     pub(super) prepare_lock: Mutex<()>,
     pub(super) prepared: Mutex<BTreeMap<String, Weak<PreparedSet>>>,
+    pub(super) prepared_instances: Mutex<BTreeMap<String, Weak<PreparedInstance>>>,
     pub(super) preparation_diagnostics: SyncMutex<BTreeMap<u64, PreparationDiagnostic>>,
     pub(super) restart_circuits: Arc<RestartCircuits>,
     pub(super) shutting_down: Arc<AtomicBool>,
@@ -95,6 +99,7 @@ impl PluginRuntime {
             config,
             prepare_lock: Mutex::new(()),
             prepared: Mutex::new(BTreeMap::new()),
+            prepared_instances: Mutex::new(BTreeMap::new()),
             preparation_diagnostics: SyncMutex::new(BTreeMap::new()),
             restart_circuits: RestartCircuits::new(restart_circuit),
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -177,6 +182,7 @@ impl PluginRuntime {
             prepared.clear();
             sets
         };
+        self.prepared_instances.lock().await.clear();
         let mut sessions = Vec::new();
         for set in &sets {
             for instance in &set.sessions {

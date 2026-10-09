@@ -21,8 +21,7 @@ impl PluginRuntime {
         &self,
         instance: PluginInstance,
         target_revision: Revision,
-    ) -> Result<PreparedContributions, AdminError> {
-        let mut sessions = Vec::new();
+    ) -> Result<Arc<PreparedInstance>, AdminError> {
         let mut observer_entries = Vec::new();
         let mut commands = Vec::new();
         let mut management = Vec::new();
@@ -68,6 +67,10 @@ impl PluginRuntime {
                     &instance.bindings,
                 )?;
                 crate::adapter::policy::validate_bindings(package.manifest(), &instance.bindings)?;
+                crate::adapter::middleware::validate_bindings(
+                    package.manifest(),
+                    &instance.bindings,
+                )?;
                 crate::adapter::upstream_adapter::validate_bindings(
                     package.manifest(),
                     &instance.bindings,
@@ -174,6 +177,17 @@ impl PluginRuntime {
             .await
             .map_err(|_| AdminError::unavailable("插件进程握手失败"))?,
         );
+        let mut prepared = PreparedInstance {
+            instance_id: instance_id.clone(),
+            artifact_sha256: instance.artifact_sha256.clone(),
+            revision: instance.revision,
+            session: session.clone(),
+            private_state: private_state.clone(),
+            maintenance: manifest
+                .contributes
+                .contains_key(&gateway_plugin_sdk::Capability::Maintenance),
+            contributions: PreparedContributions::default(),
+        };
         let registration = session
             .call(
                 "plugin.register",
@@ -234,6 +248,13 @@ impl PluginRuntime {
             session.clone(),
             callbacks.clone(),
         )?);
+        let middleware_entries = crate::adapter::middleware::compile_entries(
+            &manifest,
+            &instance_id,
+            &bindings,
+            session.clone(),
+            callbacks.clone(),
+        )?;
         let model_aliases =
             crate::adapter::catalog::prepare(&manifest, &instance, &session).await?;
         let upstream_entries = crate::adapter::upstream_adapter::prepare(
@@ -243,25 +264,16 @@ impl PluginRuntime {
             Arc::clone(&callbacks),
         )
         .await?;
-        sessions.push(PreparedInstance {
-            instance_id,
-            artifact_sha256: instance.artifact_sha256,
-            revision: instance.revision,
-            session,
-            private_state,
-            maintenance: manifest
-                .contributes
-                .contains_key(&gateway_plugin_sdk::Capability::Maintenance),
-        });
-        Ok(PreparedContributions {
-            sessions,
+        prepared.contributions = PreparedContributions {
             observer_entries,
             commands,
             management,
             policy_entries,
+            middleware_entries,
             upstream_entries,
             authentication_entries,
             model_aliases,
-        })
+        };
+        Ok(Arc::new(prepared))
     }
 }

@@ -2545,6 +2545,7 @@ mod errors {
             _: &'a ClientApiKeyId,
             _: &'a ProviderKind,
             _: &'a [ProviderAccountId],
+            _pool: gateway_core::provider_ports::ProviderConcurrencyPool,
         ) -> BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
             panic!("manual refresh does not use scheduling leases")
         }
@@ -2599,30 +2600,34 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         Some(&json!("https://first.example/v1"))
     );
     assert!(!configuration.contains_key("api_key"));
-    let prepared = admin
-        .prepare_rotation(PrepareCredentialRotation {
-            account: account_record(&account),
-            provider_material: ProviderDocument::new(OpaqueProviderData::new(
-                json!({"base_url":"https://second.example/root", "transport":"prefer_websocket"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )),
-        })
-        .await
-        .unwrap();
-    let material = prepared
-        .facts()
-        .provider_material
-        .expose_to_provider()
-        .expose_to_provider();
-    assert_eq!(material.get("api_key"), Some(&json!("sk-api-test-only")));
-    assert_eq!(
-        material.get("base_url"),
-        Some(&json!("https://second.example/root"))
-    );
-    assert!(!prepared.facts().has_refresh_token);
-    assert_eq!(prepared.facts().account_id, *account.id());
+    for base_url in [
+        "https://second.example/root",
+        "http://10.0.0.7:8080/v1",
+        "http://[fd00::7]:8080/v1",
+        "http://relay:8080/v1",
+    ] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"base_url":base_url, "transport":"prefer_websocket"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let material = prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        assert_eq!(material.get("api_key"), Some(&json!("sk-api-test-only")));
+        assert_eq!(material.get("base_url"), Some(&json!(base_url)));
+        assert!(!prepared.facts().has_refresh_token);
+        assert_eq!(prepared.facts().account_id, *account.id());
+    }
     assert_eq!(
         admin
             .prepare_refresh(PrepareCredentialRefresh {

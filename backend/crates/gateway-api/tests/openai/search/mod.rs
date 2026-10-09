@@ -7,6 +7,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::AUTHORIZATION},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use gateway_core::engine::ModelRequestId;
@@ -181,6 +182,11 @@ async fn search_route_should_preserve_request_and_success_response_bytes() {
                 .header("x-codex-turn-metadata", turn_metadata)
                 .header("session-id", "root-session")
                 .header("thread-id", "child-thread")
+                .header("x-future-business", "first")
+                .header("x-future-business", "second")
+                .header("cookie", "client-secret")
+                .header("connection", "x-private-hop")
+                .header("x-private-hop", "client-hop")
                 .body(Body::from(request_body.to_vec()))
                 .expect("search request"),
         )
@@ -213,8 +219,37 @@ async fn search_route_should_preserve_request_and_success_response_bytes() {
     assert_eq!(captured[0].endpoint, "/v1/alpha/search");
     assert_eq!(captured[0].transport, ClientTransport::HttpJson);
     assert_eq!(captured[0].body.as_ref(), request_body);
+    let mut context = captured[0].context.clone();
+    let headers = context
+        .as_object_mut()
+        .unwrap()
+        .remove("opaque_request_headers")
+        .unwrap();
+    let headers: Vec<_> = headers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry[0].as_str().unwrap(),
+                STANDARD.decode(entry[1].as_str().unwrap()).unwrap(),
+            )
+        })
+        .collect();
     assert_eq!(
-        captured[0].context,
+        headers
+            .iter()
+            .filter(|(name, _)| *name == "x-future-business")
+            .map(|(_, value)| value.as_slice())
+            .collect::<Vec<_>>(),
+        [b"first".as_slice(), b"second".as_slice()]
+    );
+    assert!(!headers.iter().any(|(name, _)| matches!(
+        *name,
+        "authorization" | "cookie" | "connection" | "x-private-hop"
+    )));
+    assert_eq!(
+        context,
         json!({"turn_metadata": turn_metadata, "session_id": "root-session", "thread_id": "child-thread"})
     );
     assert_eq!(

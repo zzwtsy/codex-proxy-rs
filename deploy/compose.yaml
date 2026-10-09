@@ -88,8 +88,7 @@ services:
     restart: unless-stopped
     user: '10001:10001'
     init: true
-    # 关闭是串行两段：HTTP drain（host.drain_timeout_seconds=30s）之后 worker join
-    # （host.worker_shutdown_timeout_seconds=30s），宽限期必须大于两者之和。
+    # 不等待存量会话；宽限期需覆盖后台收尾（默认 30s）及进程清理余量
     stop_grace_period: 75s
     depends_on:
       postgres:
@@ -124,7 +123,8 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      # 首次升级需回填历史请求，宽限期只容忍启动失败，探测成功后立即转为健康
+      start_period: 5m
     environment:
       HOME: /app
       CPR_SERVER_HOST: 0.0.0.0

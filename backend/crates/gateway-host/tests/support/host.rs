@@ -59,7 +59,6 @@ pub fn configuration(directory: &Path) -> HostConfig {
             request_dump_retention_days: 1,
         },
         system_update: Default::default(),
-        drain_timeout_seconds: 1,
         worker_shutdown_timeout_seconds: 1,
     }
 }

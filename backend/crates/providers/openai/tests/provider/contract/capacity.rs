@@ -1,4 +1,4 @@
-//! 验证 OpenAI 请求等待账号容量与 Guardian 预留槽位
+//! 验证 OpenAI 请求等待账号容量与 Guardian 独立容量池
 
 use futures::FutureExt;
 use gateway_core::account::AccountRuntimeSignals;
@@ -123,7 +123,11 @@ async fn queued_root_and_new_child_both_observe_the_same_account_capacity() {
     server.verify().await;
 }
 
-fn unqueued_context(request_id: &str, reserved: u32) -> AttemptContext {
+fn capacity_context(
+    request_id: &str,
+    reserved: u32,
+    queue: ConcurrencyQueuePolicy,
+) -> AttemptContext {
     AttemptContext::new(
         RequestAttemptContext::new(
             ModelRequestId::new(request_id).unwrap(),
@@ -131,7 +135,9 @@ fn unqueued_context(request_id: &str, reserved: u32) -> AttemptContext {
         ),
         NonZeroU32::new(1).unwrap(),
         SystemTime::now() + Duration::from_secs(5),
-        account_policy().with_openai_guardian_reserved_concurrency(reserved),
+        account_policy()
+            .with_openai_guardian_reserved_concurrency(reserved)
+            .with_queue(queue),
         AccountAttemptContext::new(BTreeSet::new(), None, None)
             .with_account_scope(contract_account_scope()),
         None,
@@ -158,7 +164,9 @@ fn subagent_operation(subagent: Option<&str>) -> Operation {
 }
 
 #[tokio::test]
-async fn guardian_requests_can_use_the_reserved_slot_that_normal_requests_cannot() {
+async fn guardian_and_normal_requests_use_independent_capacity_and_observations() {
+    use gateway_core::provider_ports::ProviderConcurrencyPool::{Reserved, Shared};
+
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_guardian").await;
     let account = ProviderAccountId::new("acct_guardian").unwrap();
@@ -171,90 +179,188 @@ async fn guardian_requests_can_use_the_reserved_slot_that_normal_requests_cannot
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(CAPTURE_COMPLETED_SSE),
         )
-        .expect(3)
+        .expect(4)
         .mount(&server)
         .await;
-    // 默认账号上限为 2、预留 1：普通请求只能使用 1 个名额，Guardian 可以用满 2 个
     let provider = provider_with_affinity_and_base_url_and_leases(
         &store,
         Arc::new(MemorySessionAffinity::default()),
         server.uri(),
         leases.clone(),
     );
-
-    let mut normal = provider
-        .clone()
-        .execute(
-            planned_request("openai", subagent_operation(Some("collab_spawn"))),
-            unqueued_context("req_guardian_normal_idle", 1),
-        )
-        .await
-        .unwrap();
-    while let Some(event) = normal.next().await {
-        event.unwrap();
-    }
-    drop(normal);
-    let limits = |leases: &TestLeaseCoordinator| {
+    let signals = |in_flight| AccountRuntimeSignals {
+        in_flight,
+        last_started_at: None,
+        quota_reset_at: None,
+        quota_remaining_rank: None,
+        cooldown: None,
+        failure_rate_basis_points: None,
+        first_output_latency_ms: None,
+    };
+    // 普通上限为 2，审批额度独立取配置值；关闭后新审批请求回到普通池
+    for (id, normal_count, reserved_count, reserve, subagent, expected) in [
+        (
+            "req_large_reserve_normal",
+            1,
+            10,
+            10,
+            None,
+            Some((Shared, 2)),
+        ),
+        ("req_normal_full", 2, 0, 1, None, None),
+        (
+            "req_guardian_independent",
+            2,
+            0,
+            1,
+            Some("guardian"),
+            Some((Reserved, 1)),
+        ),
+        ("req_guardian_full", 0, 1, 1, Some("guardian"), None),
+        (
+            "req_normal_independent",
+            1,
+            1,
+            1,
+            Some("collab_spawn"),
+            Some((Shared, 2)),
+        ),
+        (
+            "req_guardian_disabled",
+            1,
+            1,
+            0,
+            Some("guardian"),
+            Some((Shared, 2)),
+        ),
+    ] {
         leases
-            .requests
+            .signals
             .lock()
             .unwrap()
-            .iter()
-            .map(|request| request.max_concurrent().get())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(limits(&leases), [1]);
-
-    leases.signals.lock().unwrap().insert(
-        account.clone(),
-        AccountRuntimeSignals {
-            in_flight: 1,
-            last_started_at: None,
-            quota_reset_at: None,
-            quota_remaining_rank: None,
-            cooldown: None,
-            failure_rate_basis_points: None,
-            first_output_latency_ms: None,
-        },
-    );
-    assert!(
-        provider
+            .insert(account.clone(), signals(normal_count));
+        leases
+            .reserved_signals
+            .lock()
+            .unwrap()
+            .insert(account.clone(), signals(reserved_count));
+        leases.requests.lock().unwrap().clear();
+        let result = provider
             .clone()
             .execute(
-                planned_request("openai", subagent_operation(None)),
-                unqueued_context("req_guardian_normal_busy", 1),
+                planned_request("openai", subagent_operation(subagent)),
+                capacity_context(id, reserve, ConcurrencyQueuePolicy::default()),
+            )
+            .await;
+        let Some((pool, limit)) = expected else {
+            assert!(result.is_err(), "{id} should wait for its own capacity");
+            assert!(leases.requests.lock().unwrap().is_empty());
+            continue;
+        };
+        let mut stream = result.unwrap_or_else(|error| panic!("{id}: {error:?}"));
+        let capacity = stream
+            .metadata()
+            .selection_observation()
+            .unwrap()
+            .capacity()
+            .unwrap();
+        let count = if pool == Shared {
+            normal_count
+        } else {
+            reserved_count
+        };
+        assert_eq!(
+            (capacity.used_slots(), capacity.total_slots()),
+            (u64::from(count) + 1, limit)
+        );
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        drop(stream);
+        let requests = leases.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].concurrency_pool(), pool);
+        assert_eq!(u64::from(requests[0].max_concurrent().get()), limit);
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn a_full_capacity_pool_does_not_block_the_other_pools_queue() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_guardian").await;
+    let account = ProviderAccountId::new("acct_guardian").unwrap();
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(CAPTURE_COMPLETED_SSE),
+        )
+        .expect(4)
+        .mount(&server)
+        .await;
+    let provider = provider_with_affinity_and_base_url_and_leases(
+        &store,
+        Arc::new(MemorySessionAffinity::default()),
+        server.uri(),
+        leases.clone(),
+    );
+    let queue = ConcurrencyQueuePolicy {
+        max_waiting: 1,
+        timeout: Duration::from_secs(2),
+    };
+    for guardian_waits in [false, true] {
+        let blocked_signals = if guardian_waits {
+            &leases.reserved_signals
+        } else {
+            &leases.signals
+        };
+        blocked_signals.lock().unwrap().insert(
+            account.clone(),
+            AccountRuntimeSignals {
+                in_flight: if guardian_waits { 1 } else { 2 },
+                last_started_at: None,
+                quota_reset_at: None,
+                quota_remaining_rank: None,
+                cooldown: None,
+                failure_rate_basis_points: None,
+                first_output_latency_ms: None,
+            },
+        );
+        let mut waiting = Box::pin(provider.clone().execute(
+            planned_request(
+                "openai",
+                subagent_operation(guardian_waits.then_some("guardian")),
+            ),
+            capacity_context("req_pool_waiter", 1, queue),
+        ));
+        assert!(waiting.as_mut().now_or_never().is_none());
+
+        let mut available = provider
+            .clone()
+            .execute(
+                planned_request(
+                    "openai",
+                    subagent_operation((!guardian_waits).then_some("guardian")),
+                ),
+                capacity_context("req_other_pool", 1, queue),
             )
             .await
-            .is_err()
-    );
-    assert_eq!(limits(&leases), [1]);
+            .expect("the other pool has independent capacity and queue position");
+        while let Some(event) = available.next().await {
+            event.unwrap();
+        }
+        drop(available);
 
-    let mut guardian = provider
-        .clone()
-        .execute(
-            planned_request("openai", subagent_operation(Some("guardian"))),
-            unqueued_context("req_guardian_reserved", 1),
-        )
-        .await
-        .unwrap();
-    assert_eq!(guardian.metadata().provider_account_id(), &account);
-    while let Some(event) = guardian.next().await {
-        event.unwrap();
+        blocked_signals.lock().unwrap().clear();
+        let mut resumed = waiting.await.expect("own pool capacity was released");
+        while let Some(event) = resumed.next().await {
+            event.unwrap();
+        }
+        drop(resumed);
     }
-    assert_eq!(limits(&leases), [1, 2]);
-    drop(guardian);
-
-    // 同一个 Provider 的新请求读取关闭后的策略，不需要重新初始化选择器
-    let mut unreserved = provider
-        .execute(
-            planned_request("openai", subagent_operation(None)),
-            unqueued_context("req_guardian_reservation_disabled", 0),
-        )
-        .await
-        .unwrap();
-    while let Some(event) = unreserved.next().await {
-        event.unwrap();
-    }
-    assert_eq!(limits(&leases), [1, 2, 2]);
     server.verify().await;
 }

@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import type { AccountGroup, AccountModelAccess } from '@/api'
+import type { AccountGroupRef, AccountModelAccess } from '@/api'
 import { BaseFormItem, BaseInput, BaseSwitch } from '@codex-proxy/ui'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import AccountModelAccessField from './AccountModelAccessField.vue'
 import AccountProxyField from './AccountProxyField.vue'
 
 withDefaults(defineProps<{
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
   groupsLoading: boolean
   disabled: boolean
   endpoint?: string | null

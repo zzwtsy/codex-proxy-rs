@@ -1,17 +1,17 @@
-//! 验证旧中间件的 Fast 设置适配与不兼容插件的实例故障隔离
+//! 验证中间件 Fast 三态设置与不兼容插件的实例故障隔离
 
 use super::*;
 use gateway_core::{policy::ClientPolicy, routing::request_settings::RequestSettings};
 use serde_json::{Value, json};
 
 #[tokio::test]
-async fn legacy_middleware_preserves_three_state_fast_and_projects_sources() {
-    for (mode, write, expected) in [
-        (FastMode::Default, false, FastMode::Default),
-        (FastMode::Enabled, false, FastMode::Enabled),
-        (FastMode::Disabled, true, FastMode::Disabled),
-        (FastMode::Enabled, true, FastMode::Disabled),
-        (FastMode::Disabled, false, FastMode::Default),
+async fn middleware_preserves_three_state_fast_and_sources() {
+    for (mode, expected) in [
+        (FastMode::Default, FastMode::Default),
+        (FastMode::Enabled, FastMode::Enabled),
+        (FastMode::Disabled, FastMode::Disabled),
+        (FastMode::Enabled, FastMode::Disabled),
+        (FastMode::Disabled, FastMode::Default),
     ] {
         let snapshot = gateway_core::routing::RuntimeSnapshot::new(
             ConfigRevision::new(1).unwrap(),
@@ -46,34 +46,40 @@ async fn legacy_middleware_preserves_three_state_fast_and_projects_sources() {
         let mut seed = settings.execution_values().unwrap();
         seed.fast_mode = mode;
         let settings = settings.replace_execution(&seed, "seed").unwrap();
-        let mut wire = serde_json::to_value(&seed).unwrap();
-        wire.as_object_mut().unwrap().remove("fast_mode");
-        wire["disable_fast"] = json!(mode == FastMode::Disabled);
+        let wire = serde_json::to_value(&seed).unwrap();
         let mut updated = wire.clone();
-        updated["disable_fast"] = json!(write);
+        updated["fast_mode"] = json!(expected.as_str());
         updated["timeout_ms"] = json!(90_000);
-        let mut contribution = crate::support::contribution(
+        let contribution = crate::support::contribution(
             Capability::Middleware,
             vec![Stage::Request],
             vec!["openai".into()],
             vec!["openai".into()],
         );
-        contribution.1.version = 3;
         let worker = std::fs::read(env!("CARGO_BIN_EXE_gateway-plugin-test-middleware")).unwrap();
         let package = crate::support::package_with_contributions(
             &worker,
             Contributions::from([contribution]),
         );
-        let (cache, runtime) = setup_package(vec![InstanceFixture {
-            id: "legacy-settings",
-            configuration: json!({
-                "mode":"settings", "middleware_version":3, "expected_settings":wire, "settings":updated,
-                "expected_legacy_source": if mode == FastMode::Default { Value::Null } else {
-                    json!({"instance_id":"seed", "order":1, "value":mode == FastMode::Disabled})
-                },
-            }),
-            bindings: vec![binding(MIDDLEWARE_CONTRIBUTION,"request",0,PluginFailurePolicy::Reject)],
-        }], package).await;
+        let (cache, runtime) = setup_package(
+            vec![InstanceFixture {
+                id: "fast-settings",
+                configuration: json!({
+                    "mode":"settings", "expected_settings":wire, "settings":updated,
+                    "expected_fast_source": if mode == FastMode::Default { Value::Null } else {
+                        json!({"instance_id":"seed", "order":1, "value":mode.as_str()})
+                    },
+                }),
+                bindings: vec![binding(
+                    MIDDLEWARE_CONTRIBUTION,
+                    "request",
+                    0,
+                    PluginFailurePolicy::Reject,
+                )],
+            }],
+            package,
+        )
+        .await;
         let generation = prepare(&runtime).await;
         let plan = runtime
             .execution_registry()
@@ -105,7 +111,7 @@ async fn legacy_middleware_preserves_three_state_fast_and_projects_sources() {
                         );
                         let sources = settings.inspect();
                         assert!(sources["execution"].get("disable_fast").is_none());
-                        if mode == FastMode::Enabled && !write {
+                        if mode != FastMode::Default && mode == expected {
                             assert_eq!(sources["execution"]["fast_mode"]["instance_id"], "seed");
                         }
                         next.run(request).await

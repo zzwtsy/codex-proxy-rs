@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import type { AccountCreateForm } from '../../utils/accountCreate'
-import type { AccountGroup } from '@/api'
+import type { AccountGroupRef } from '@/api'
 import { BaseFormItem, BaseTextarea } from '@codex-proxy/ui'
 import AccountSettingsFields from '../AccountSettingsFields.vue'
 import AccountProviderChooser from './AccountProviderChooser.vue'
 
 defineProps<{
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
   groupsLoading: boolean
   disabled: boolean
   proxyError?: string

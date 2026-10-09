@@ -305,9 +305,20 @@ async fn records_keep_pagination_and_hide_admin_and_upstream_data() {
             assert_eq!(record["firstTokenLatencyMs"], 210);
             assert_fields(
                 &record["latencyDetails"],
-                &["firstEventMs", "firstReasoningMs", "firstTextMs"],
+                &[
+                    "upstreamResponseMs",
+                    "upstreamEngineIapiTbtMs",
+                    "firstEventMs",
+                    "firstReasoningMs",
+                    "firstTextMs",
+                ],
             );
             assert_eq!(record["latencyDetails"]["firstEventMs"], 100);
+            assert_eq!(record["latencyDetails"]["upstreamResponseMs"], 1000);
+            assert_eq!(
+                record["latencyDetails"]["upstreamEngineIapiTbtMs"],
+                2.450638
+            );
             assert!(record["statusCode"].is_null());
         } else {
             assert_eq!(record["statusCode"], 502);

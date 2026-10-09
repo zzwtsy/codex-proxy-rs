@@ -85,9 +85,10 @@ impl gateway_admin::ports::plugins::PluginPackageInspector for LifecycleFixture 
     }
     async fn compatibility_warning(
         &self,
-        _: Arc<[u8]>,
-        _: String,
+        archive: Arc<[u8]>,
+        digest: String,
     ) -> Result<Option<String>, AdminError> {
+        self.inspect(archive, Some(digest)).await?;
         Ok(self.data.lock().unwrap().compatibility_warning.clone())
     }
     async fn inspect(
@@ -130,6 +131,9 @@ struct FixtureData {
     saves: Vec<SavedInstance>,
     history: BTreeMap<String, PluginVersionConfiguration>,
     aborted: usize,
+    transition_active: bool,
+    fail_reload_after_migration: bool,
+    fail_next_load: bool,
     activated: usize,
     quiesced: usize,
     diagnostics: Option<BTreeMap<String, PluginInstanceRuntime>>,
@@ -183,6 +187,9 @@ impl LifecycleFixture {
                     },
                 )]),
                 aborted: 0,
+                transition_active: false,
+                fail_reload_after_migration: false,
+                fail_next_load: false,
                 activated: 0,
                 quiesced: 0,
                 diagnostics: None,
@@ -235,6 +242,9 @@ impl LifecycleFixture {
             .instances
             .retain(|current| current.id != instance.id);
         data.snapshot.instances.push(instance.clone());
+        if transition_id.is_some() {
+            data.transition_active = false;
+        }
         data.saves.push(SavedInstance {
             artifact_sha256: instance.artifact_sha256.clone(),
             enabled: instance.enabled,
@@ -334,7 +344,11 @@ impl gateway_admin::ports::plugins::PluginStateLifecycle for LifecycleFixture {
         _: PluginStateTransition,
     ) -> Result<(), AdminError> {
         match self.behavior {
-            MigrationBehavior::Succeed => Ok(()),
+            MigrationBehavior::Succeed => {
+                let mut data = self.data.lock().unwrap();
+                data.fail_next_load = std::mem::take(&mut data.fail_reload_after_migration);
+                Ok(())
+            }
             MigrationBehavior::Fail => Err(AdminError::invalid("migration fixture failed")),
             MigrationBehavior::ConcurrentChangeThenFail => {
                 let mut data = self.data.lock().unwrap();
@@ -398,9 +412,10 @@ impl PluginStateStore for LifecycleFixture {
         artifact_sha256: &str,
         _: PluginStateConfiguration,
     ) -> PluginStateStoreResult<PluginStateTransition> {
-        let data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap();
         let current = &data.snapshot.instances[0];
-        if current.enabled
+        if data.transition_active
+            || current.enabled
             || current.id != instance_id
             || current.revision != expected_instance_revision
             || artifact_sha256 != NEW_ARTIFACT
@@ -409,6 +424,7 @@ impl PluginStateStore for LifecycleFixture {
                 PluginStateStoreErrorKind::Conflict,
             ));
         }
+        data.transition_active = true;
         Ok(PluginStateTransition {
             id: "00000000-0000-7000-8000-000000000002".into(),
             instance_id: instance_id.into(),
@@ -438,7 +454,9 @@ impl PluginStateStore for LifecycleFixture {
     }
 
     async fn abort_transition(&self, _: &str) -> PluginStateStoreResult<()> {
-        self.data.lock().unwrap().aborted += 1;
+        let mut data = self.data.lock().unwrap();
+        data.aborted += 1;
+        data.transition_active = false;
         Ok(())
     }
 }
@@ -463,7 +481,11 @@ impl PluginStore for LifecycleFixture {
             }))
     }
     async fn load_instances(&self) -> AdminStoreResult<PluginInstanceSnapshot> {
-        Ok(self.snapshot())
+        let mut data = self.data.lock().unwrap();
+        if std::mem::take(&mut data.fail_next_load) {
+            return Err(admin_error(AdminStoreErrorKind::Unavailable));
+        }
+        Ok(data.snapshot.clone())
     }
 
     async fn load_version_configuration(
@@ -1044,6 +1066,36 @@ async fn failed_state_migration_restores_the_previous_enabled_version_with_cas()
     assert!(!data.saves[0].enabled);
     assert!(data.saves[1].enabled);
     assert_eq!(published.revisions.lock().unwrap().as_slice(), [11, 12]);
+}
+
+#[tokio::test]
+async fn reload_failure_after_migration_aborts_restores_and_allows_retry() {
+    let fixture = LifecycleFixture::new(MigrationBehavior::Succeed);
+    fixture.data.lock().unwrap().fail_reload_after_migration = true;
+    let published = Arc::new(Published::default());
+    let service = service(fixture.clone(), published.clone());
+    let id = "00000000-0000-7000-8000-000000000001";
+    let error = service
+        .configure_instance(Some(id), input(), &context())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), AdminErrorKind::Unavailable);
+    {
+        let data = fixture.data.lock().unwrap();
+        assert_eq!(data.aborted, 1);
+        assert!(!data.transition_active);
+        assert!(data.snapshot.instances[0].enabled);
+        assert_eq!(data.snapshot.instances[0].artifact_sha256, OLD_ARTIFACT);
+        assert_eq!(*published.revisions.lock().unwrap(), [11, 12]);
+    }
+    let result = service
+        .configure_instance(Some(id), input(), &context())
+        .await
+        .unwrap();
+    assert_eq!(result.instance.artifact_sha256, NEW_ARTIFACT);
+    assert!(result.instance.enabled);
+    assert!(!fixture.data.lock().unwrap().transition_active);
 }
 
 #[tokio::test]

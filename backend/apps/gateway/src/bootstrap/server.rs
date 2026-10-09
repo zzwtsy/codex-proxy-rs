@@ -1,4 +1,4 @@
-//! 服务模式完成全部组装后交给 Host 监听，并在请求和 Worker 排空后关闭插件
+//! 服务模式完成全部组装后交给 Host 监听，并在停止监听与 Worker 收尾后关闭插件
 
 use gateway_host::ConfigError;
 

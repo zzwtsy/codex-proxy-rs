@@ -1071,3 +1071,35 @@ fn transparent_encoder_should_only_require_wire_terminal_for_buffered_conversion
         ResponseEncodeError::MissingWireTerminal
     );
 }
+
+#[test]
+fn metadata_keeps_business_extensions_and_filters_only_protected_headers() {
+    let data = json!({
+        "type":"response.metadata",
+        "headers":{"x-future-header":["first","second"],"authorization":"private","set-cookie":"private","chatgpt-account-id":"private","connection":"x-private-hop","x-private-hop":"private"},
+        "metadata":{"type":"safety_buffering","use_cases":["cyber"],"reasons":["user_risk"],"openai_verification_recommendation":{"future":true},"openai_chatgpt_moderation_metadata":{"future":true}},
+        "future_extension":{"keep":true}
+    });
+    let raw = data.to_string();
+    let event = ProviderEvent::wire(
+        ProtocolWireEvent::json("openai", Some("response.metadata".to_owned()), data.clone())
+            .unwrap()
+            .with_raw_websocket_message(raw.as_str()),
+    );
+    let mut encoder = OpenAiResponsesEncoder::new();
+    let ws = encoder.push_websocket(&event);
+    let delivered: Value = serde_json::from_str(&ws[0]).unwrap();
+    assert_eq!(delivered["metadata"], data["metadata"]);
+    assert_eq!(delivered["future_extension"], data["future_extension"]);
+    assert_eq!(
+        delivered["headers"],
+        json!({"x-future-header":["first","second"]})
+    );
+    let sse = encoder.push_sse(&event);
+    assert!(!std::str::from_utf8(&sse[0]).unwrap().contains("private"));
+    assert!(
+        std::str::from_utf8(&sse[0])
+            .unwrap()
+            .contains("safety_buffering")
+    );
+}

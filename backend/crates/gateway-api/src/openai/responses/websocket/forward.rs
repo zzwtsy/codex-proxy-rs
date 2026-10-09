@@ -12,7 +12,7 @@ use gateway_core::engine::middleware::{
     MiddlewareBody, MiddlewareError, MiddlewareFrame, MiddlewareFraming, MiddlewareHeader,
     MiddlewareResponse,
 };
-use gateway_core::engine::response_control::ResponseControl;
+use gateway_core::engine::response_control::{ResponseControl, ResponseControlUnavailable};
 use gateway_core::error::{GatewayError, GatewayErrorKind};
 use gateway_core::event::ProviderResponseHeader;
 use gateway_core::operation::ProviderSessionState;
@@ -25,7 +25,7 @@ use super::{
     super::{DecodedResponsesRequest, OpenAiResponsesEncoder, ProtocolErrorBody},
     connection::{ConnectionEvent, FramePhase, ResponsesWebSocketConnection, WriteContext},
     protocol::{
-        decode_response_interrupt, error_event, initial_engine_error_event, response_metadata_event,
+        error_event, initial_engine_error_event, is_response_create, response_metadata_event,
     },
 };
 
@@ -137,7 +137,7 @@ pub(super) async fn forward_response(
     replay: &mut ConnectionReplaySnapshot,
     capture: ReplayCaptureHandle,
     validation: ResponseValidationFacts,
-    response_control: ResponseControl,
+    response_control: &ResponseControl,
 ) -> ForwardOutcome {
     let (protocol, status, headers, mut body, _) = response.into_parts();
     if protocol != "openai" || StatusCode::from_u16(status).is_err() {
@@ -150,8 +150,14 @@ pub(super) async fn forward_response(
             ProviderResponseHeader::new(name, value)
         })
         .collect::<Vec<_>>();
-    let first = match next_body_input(connection, body.as_mut(), &response_control, &request_id)
-        .await
+    let first = match next_body_input(
+        connection,
+        body.as_mut(),
+        response_control,
+        &request_id,
+        false,
+    )
+    .await
     {
         BodyInput::Frame(Ok(Some(frame))) => frame,
         BodyInput::Frame(Ok(None)) => {
@@ -197,8 +203,14 @@ pub(super) async fn forward_response(
         let frame = match current.take() {
             Some(frame) => frame,
             None => {
-                match next_body_input(connection, body.as_mut(), &response_control, &request_id)
-                    .await
+                match next_body_input(
+                    connection,
+                    body.as_mut(),
+                    response_control,
+                    &request_id,
+                    terminal_seen,
+                )
+                .await
                 {
                     BodyInput::Frame(Ok(Some(frame))) => frame,
                     BodyInput::Frame(Ok(None)) if terminal_seen && body.is_finalized() => {
@@ -284,8 +296,10 @@ fn detach_body(body: Box<dyn MiddlewareBody>) {
 }
 
 fn validate_frame(frame: &MiddlewareFrame) -> Result<(), MiddlewareError> {
-    if frame.framing() != MiddlewareFraming::JsonDocument
-        || serde_json::from_slice::<serde::de::IgnoredAny>(frame.bytes()).is_err()
+    if !matches!(
+        frame.framing(),
+        MiddlewareFraming::JsonDocument | MiddlewareFraming::RawBytes
+    ) || std::str::from_utf8(frame.bytes()).is_err()
     {
         return Err(MiddlewareError::InvalidState);
     }
@@ -302,6 +316,7 @@ async fn next_body_input(
     body: &mut dyn MiddlewareBody,
     response_control: &ResponseControl,
     request_id: &Arc<str>,
+    terminal_seen: bool,
 ) -> BodyInput {
     // 处理控制帧时继续持有同一个读取 future，不能取消正在加工正文的中间件
     let frame = body.next_frame();
@@ -312,19 +327,11 @@ async fn next_body_input(
                 let Some(event) = event else { return BodyInput::Disconnect; };
                 match &event.event {
                     ConnectionEvent::Text(payload) => {
-                        let error = match decode_response_interrupt(payload) {
-                            Ok(Some(response_id)) => response_control.interrupt(&response_id).err().map(|_| {
-                                super::super::RequestDecodeError::InvalidValue { field: "response_id".to_owned() }.protocol_body()
-                            }),
-                            Ok(None) => {
-                                connection.defer(event);
-                                continue;
-                            }
-                            Err(error) => Some(error.protocol_body()),
-                        };
-                        if let Some(error) = error
-                            && send_protocol_error(connection, StatusCode::BAD_REQUEST, error, request_id).await == ForwardOutcome::Disconnect
-                        {
+                        if is_response_create(payload) {
+                            connection.defer(event);
+                            continue;
+                        }
+                        if send_control(connection, response_control, payload, request_id).await == ForwardOutcome::Disconnect {
                             return BodyInput::Disconnect;
                         }
                     }
@@ -335,6 +342,11 @@ async fn next_body_input(
                         connection.defer(event);
                     }
                     ConnectionEvent::Exited(_) => return BodyInput::Disconnect,
+                }
+            }
+            event = response_control.receive(), if terminal_seen => {
+                if forward_control_event(connection, response_control, event).await == ForwardOutcome::Disconnect {
+                    return BodyInput::Disconnect;
                 }
             }
             frame = &mut frame => return BodyInput::Frame(frame),
@@ -537,19 +549,26 @@ impl WebSocketExecutionBody {
                     self.transformed_pending = transformed;
                     continue;
                 }
-                messages.extend(encoded.into_iter().map(|message| (message, transformed)));
+                let framing = if event.wire_event().is_some_and(|wire| {
+                    wire.raw_websocket_message().is_some() && !wire.has_json_data()
+                }) {
+                    MiddlewareFraming::RawBytes
+                } else {
+                    MiddlewareFraming::JsonDocument
+                };
+                messages.extend(
+                    encoded
+                        .into_iter()
+                        .map(|message| (message, transformed, framing)),
+                );
                 self.transformed_pending = false;
             }
             let terminal = self.encoder.is_completed() || self.encoder.has_wire_failure();
             let last = messages.len().saturating_sub(1);
             self.pending.extend(messages.into_iter().enumerate().map(
-                |(index, (message, transformed))| {
-                    MiddlewareFrame::new(
-                        Bytes::from(message),
-                        MiddlewareFraming::JsonDocument,
-                        terminal && index == last,
-                    )
-                    .with_transformed(transformed)
+                |(index, (message, transformed, framing))| {
+                    MiddlewareFrame::new(Bytes::from(message), framing, terminal && index == last)
+                        .with_transformed(transformed)
                 },
             ));
             self.awaiting_terminal_eof = terminal;
@@ -719,4 +738,47 @@ async fn send_metadata(
         )
         .await
         .is_ok()
+}
+
+pub(super) async fn send_control(
+    connection: &mut ResponsesWebSocketConnection,
+    control: &ResponseControl,
+    payload: &str,
+    request_id: &Arc<str>,
+) -> ForwardOutcome {
+    let result = tokio::select! {
+        _ = connection.wait_for_exit() => return ForwardOutcome::Disconnect,
+        result = control.send(payload) => result,
+    };
+    if result.is_err() {
+        return send_gateway_error(
+            connection,
+            &GatewayError::new(
+                GatewayErrorKind::InvalidRequest,
+                "No upstream WebSocket connection is available for control messages",
+            ),
+            request_id,
+        )
+        .await;
+    }
+    ForwardOutcome::Continue
+}
+
+pub(super) async fn forward_control_event(
+    connection: &mut ResponsesWebSocketConnection,
+    control: &ResponseControl,
+    event: Result<String, ResponseControlUnavailable>,
+) -> ForwardOutcome {
+    let Ok(payload) = event else {
+        control.clear();
+        return ForwardOutcome::Continue;
+    };
+    if connection
+        .send_text(payload, WriteContext::connection(FramePhase::Data))
+        .await
+        .is_err()
+    {
+        return ForwardOutcome::Disconnect;
+    }
+    ForwardOutcome::Continue
 }

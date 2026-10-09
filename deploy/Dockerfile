@@ -70,7 +70,8 @@ ENV PATH="/app/bin:/usr/lib/postgresql/18/bin:${PATH}"
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# 首次升级的历史请求迁移需要启动宽限期
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 
 CMD ["/app/bin/codex-proxy-rs"]

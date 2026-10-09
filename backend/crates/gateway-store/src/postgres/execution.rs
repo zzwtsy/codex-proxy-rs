@@ -4,7 +4,6 @@ use crate::core_store_error;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -13,349 +12,20 @@ use gateway_core::engine::{
     ModelRequestFinalization as CoreModelRequestFinalization, ModelRequestId,
     NewModelRequest as CoreNewModelRequest, ProbeFailure, RecoveryReport as CoreRecoveryReport,
 };
-use gateway_core::error::{
-    ProviderErrorKind, StoreError as CoreStoreError, StoreErrorKind as CoreStoreErrorKind,
-};
-use gateway_core::metering::CostSource as CoreCostSource;
-use gateway_core::routing::{AccountRoutingScopeKind, AccountRoutingSnapshot};
+use gateway_core::error::{StoreError as CoreStoreError, StoreErrorKind as CoreStoreErrorKind};
 use gateway_core::upstream::UpstreamSendState as CoreUpstreamSendState;
 
-use crate::{
-    ConflictKind, DecimalAmount, StoreError, StoreResult, postgres_unavailable, require_nonempty,
+use crate::{ConflictKind, StoreError, StoreResult, postgres_unavailable, require_nonempty};
+
+pub use crate::execution::{
+    ContinuationRequestObservation, CostSource, ModelRequestAttemptStart, ModelRequestFinalization,
+    ModelRequestOutcome, ModelRequestTimings, ModelRequestUsage, NewModelRequest,
+    UpstreamSendState,
 };
-
-const ENTITY: &str = "model request";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamSendState {
-    NotSent,
-    Sent,
-    Ambiguous,
-}
-
-impl UpstreamSendState {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotSent => "not_sent",
-            Self::Sent => "sent",
-            Self::Ambiguous => "ambiguous",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelRequestOutcome {
-    Succeeded,
-    Failed,
-    Cancelled,
-    Incomplete,
-}
-
-impl ModelRequestOutcome {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Incomplete => "incomplete",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CostSource {
-    ProviderReported,
-    Calculated,
-    Unavailable,
-}
-
-impl CostSource {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ProviderReported => "provider_reported",
-            Self::Calculated => "calculated",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewModelRequest {
-    pub id: String,
-    pub client_api_key_id: Option<String>,
-    pub client_api_key_ref: String,
-    pub config_revision: u64,
-    pub routing_scope: String,
-    pub routing_group_refs: Vec<String>,
-    pub routing_group_names_snapshot: Value,
-    pub protocol: String,
-    pub operation: String,
-    pub endpoint: String,
-    pub client_transport: String,
-    pub requested_model_id: Option<String>,
-    pub client_ip: Option<String>,
-    pub user_agent: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub reasoning_preset: Option<String>,
-    pub request_kind: Option<String>,
-    pub subagent_kind: Option<String>,
-    pub compact: bool,
-    pub continuation: ContinuationRequestObservation,
-    pub image_generation_requested: bool,
-    pub admission_decision_ms: Option<u64>,
-    pub started_at: DateTime<Utc>,
-    pub deadline_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ContinuationRequestObservation {
-    pub affinity_hash: Option<String>,
-    pub previous_response_id_hash: Option<String>,
-    pub requested: bool,
-}
-
-impl NewModelRequest {
-    pub fn validate(&self) -> StoreResult<()> {
-        require_nonempty(ENTITY, "id", &self.id)?;
-        require_nonempty(ENTITY, "client_api_key_ref", &self.client_api_key_ref)?;
-        require_nonempty(ENTITY, "protocol", &self.protocol)?;
-        require_nonempty(ENTITY, "operation", &self.operation)?;
-        require_nonempty(ENTITY, "endpoint", &self.endpoint)?;
-        require_nonempty(ENTITY, "client_transport", &self.client_transport)?;
-        if let Some(requested_model_id) = self.requested_model_id.as_deref() {
-            require_nonempty(ENTITY, "requested_model_id", requested_model_id)?;
-        }
-        validate_routing_snapshot(
-            &self.routing_scope,
-            &self.routing_group_refs,
-            &self.routing_group_names_snapshot,
-        )?;
-        if self.config_revision == 0 || self.started_at > self.deadline_at {
-            return Err(invalid(
-                "revision and deadline violate the frozen constraints",
-            ));
-        }
-        if self
-            .client_api_key_id
-            .as_ref()
-            .is_some_and(|id| id != &self.client_api_key_ref)
-        {
-            return Err(invalid("live client key ID must equal its historical ref"));
-        }
-        self.continuation.validate()?;
-        Ok(())
-    }
-}
-
-impl ContinuationRequestObservation {
-    fn validate(&self) -> StoreResult<()> {
-        for value in [
-            self.affinity_hash.as_deref(),
-            self.previous_response_id_hash.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if value.len() != 64
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err(invalid("continuation observation hash is invalid"));
-            }
-        }
-        if !self.requested && self.previous_response_id_hash.is_some() {
-            return Err(invalid("continuation request facts do not agree"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelRequestAttemptStart {
-    pub model_request_id: String,
-    pub attempt_count: u32,
-    pub provider_kind: String,
-    pub provider_account_id: Option<String>,
-    pub provider_account_ref: Option<String>,
-    pub upstream_model_id: Option<String>,
-    pub upstream_transport: String,
-    pub http_version: Option<String>,
-    pub account_selection_wait_ms: Option<u64>,
-    pub capacity_used_slots: Option<u64>,
-    pub capacity_total_slots: Option<u64>,
-}
-
-impl ModelRequestAttemptStart {
-    pub fn validate(&self) -> StoreResult<()> {
-        for (field, value) in [
-            ("model_request_id", self.model_request_id.as_str()),
-            ("provider_kind", self.provider_kind.as_str()),
-            ("upstream_transport", self.upstream_transport.as_str()),
-        ] {
-            require_nonempty(ENTITY, field, value)?;
-        }
-        if let Some(upstream_model_id) = self.upstream_model_id.as_deref() {
-            require_nonempty(ENTITY, "upstream_model_id", upstream_model_id)?;
-        }
-        if self.attempt_count == 0 {
-            return Err(invalid("attempt_count must be positive"));
-        }
-        match (self.capacity_used_slots, self.capacity_total_slots) {
-            (None, None) => {}
-            (Some(used), Some(total)) if total > 0 && used <= total => {}
-            _ => return Err(invalid("capacity snapshot is invalid")),
-        }
-        if self
-            .provider_account_id
-            .as_ref()
-            .is_some_and(|id| Some(id) != self.provider_account_ref.as_ref())
-        {
-            return Err(invalid(
-                "live provider account ID must equal its historical ref",
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub use gateway_core::{engine::ModelRequestTimings, metering::Usage as ModelRequestUsage};
-
-fn validate_timings(timings: &ModelRequestTimings) -> StoreResult<()> {
-    if let Some(total) = timings.latency_ms {
-        let phases = [
-            timings.transport_decision_wait_ms,
-            timings.connect_ms,
-            timings.headers_ms,
-            timings.first_event_ms,
-            timings.first_reasoning_ms,
-            timings.first_text_ms,
-            timings.first_token_ms,
-            timings.provider_processing_ms,
-        ];
-        if phases.into_iter().flatten().any(|phase| phase > total) {
-            return Err(invalid("timing phase exceeds total latency"));
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelRequestFinalization {
-    pub billing_snapshot_json: Option<Value>,
-    pub model_request_id: String,
-    pub outcome: ModelRequestOutcome,
-    pub upstream_send_state: UpstreamSendState,
-    pub attempt_count: u32,
-    pub downstream_committed_at: Option<DateTime<Utc>>,
-    pub client_status_code: Option<u16>,
-    pub upstream_status_code: Option<u16>,
-    pub client_response_id: Option<String>,
-    pub upstream_request_id: Option<String>,
-    pub upstream_response_id: Option<String>,
-    pub upstream_transport: Option<String>,
-    pub http_version: Option<String>,
-    pub websocket_pool: Option<String>,
-    pub service_tier: Option<String>,
-    pub upstream_response_model: Option<String>,
-    pub provider_metadata_json: Option<Value>,
-    pub diagnostic_trace_json: Option<Value>,
-    pub error_kind: Option<String>,
-    pub provider_error_code: Option<String>,
-    pub error_message: Option<String>,
-    pub error_details: Option<String>,
-    pub continuation_unavailable_reason: Option<String>,
-    pub upstream_connection_id: Option<String>,
-    pub upstream_connection_exit_reason: Option<String>,
-    pub upstream_connection_age_ms: Option<u64>,
-    pub upstream_connection_idle_ms: Option<u64>,
-    pub retry_after_ms: Option<u64>,
-    pub usage: ModelRequestUsage,
-    pub image_generation_succeeded: Option<bool>,
-    pub cost_source: CostSource,
-    pub cost_amount: Option<DecimalAmount>,
-    pub cost_currency: Option<String>,
-    pub timings: ModelRequestTimings,
-    pub completed_at: DateTime<Utc>,
-}
-
-impl ModelRequestFinalization {
-    pub fn validate(&self) -> StoreResult<()> {
-        require_nonempty(ENTITY, "model_request_id", &self.model_request_id)?;
-        for status in [self.client_status_code, self.upstream_status_code]
-            .into_iter()
-            .flatten()
-        {
-            if !(100..=599).contains(&status) {
-                return Err(invalid("HTTP status must be between 100 and 599"));
-            }
-        }
-        let cost_is_absent = self.cost_amount.is_none() && self.cost_currency.is_none();
-        let cost_is_complete = self.cost_amount.is_some() && self.cost_currency.is_some();
-        if (self.cost_source == CostSource::Unavailable && !cost_is_absent)
-            || (self.cost_source != CostSource::Unavailable && !cost_is_complete)
-        {
-            return Err(invalid("cost source, amount, and currency do not agree"));
-        }
-        if let Some(currency) = &self.cost_currency
-            && (currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_uppercase()))
-        {
-            return Err(invalid("cost currency must be three uppercase characters"));
-        }
-        for (field, value) in [
-            ("upstream_transport", self.upstream_transport.as_deref()),
-            ("http_version", self.http_version.as_deref()),
-        ] {
-            if let Some(value) = value {
-                require_nonempty(ENTITY, field, value)?;
-            }
-        }
-        if self
-            .websocket_pool
-            .as_deref()
-            .is_some_and(|kind| !matches!(kind, "new" | "reuse"))
-        {
-            return Err(invalid("websocket pool must be new or reuse"));
-        }
-        if let Some(service_tier) = self.service_tier.as_deref() {
-            require_nonempty(ENTITY, "service_tier", service_tier)?;
-            if service_tier.len() > 64 || service_tier.chars().any(char::is_control) {
-                return Err(invalid("service tier is invalid"));
-            }
-        }
-        if let Some(model) = self.upstream_response_model.as_deref() {
-            require_nonempty(ENTITY, "upstream_response_model", model)?;
-            if model.len() > 256 || model.chars().any(char::is_control) {
-                return Err(invalid("upstream response model is invalid"));
-            }
-        }
-        if self
-            .provider_metadata_json
-            .as_ref()
-            .is_some_and(|metadata| !metadata.is_object())
-        {
-            return Err(invalid("provider observation must be a JSON object"));
-        }
-        if self
-            .diagnostic_trace_json
-            .as_ref()
-            .is_some_and(|trace| !trace.is_object() || trace.to_string().len() > 64 * 1024)
-        {
-            return Err(invalid(
-                "diagnostic trace must be a JSON object within 64 KiB",
-            ));
-        }
-        validate_optional_stable_reason(
-            self.continuation_unavailable_reason.as_deref(),
-            "continuation unavailable reason",
-        )?;
-        validate_connection_observation(self)?;
-        validate_timings(&self.timings)
-    }
-}
+use crate::execution::{
+    ENTITY, finalization_row, invalid, new_model_request_row, send_state_from_core,
+};
+use crate::request_observation::RequestObservation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ModelRequestRecoveryReport {
@@ -422,51 +92,27 @@ impl PgExecutionStore {
 impl ModelRequestRepository for PgExecutionStore {
     async fn insert_model_request(&self, request: NewModelRequest) -> StoreResult<()> {
         request.validate()?;
+        let observation = RequestObservation::initial(&request)?;
         sqlx::query(
             "insert into model_requests (
-               id, client_api_key_id, client_api_key_ref, config_revision, protocol,
-               routing_scope, routing_group_refs, routing_group_names_snapshot,
-               operation, endpoint, client_transport, requested_model_id,
-               client_ip, user_agent, reasoning_effort,
-               reasoning_preset, request_kind, subagent_kind, compact,
-               image_generation_requested, admission_decision_ms, started_at, deadline_at,
-               continuation_affinity_hash, continuation_previous_response_id_hash,
-               continuation_requested
-             ) values (
-               $1, $2, $3, $4, $5, $6, $7, $8,
-               $9, $10, $11, $12, $13::inet, $14, $15,
-               $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
-             )",
+               id, client_api_key_id, client_api_key_ref, operation, client_transport,
+               requested_model_id, image_generation_requested, started_at, deadline_at,
+               continuation_affinity_hash, continuation_requested, request_kind, request_observation_json
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(request.id)
         .bind(request.client_api_key_id)
         .bind(request.client_api_key_ref)
-        .bind(to_i64(request.config_revision, "config_revision")?)
-        .bind(request.protocol)
-        .bind(request.routing_scope)
-        .bind(request.routing_group_refs)
-        .bind(sqlx::types::Json(request.routing_group_names_snapshot))
         .bind(request.operation)
-        .bind(request.endpoint)
         .bind(request.client_transport)
         .bind(request.requested_model_id)
-        .bind(request.client_ip)
-        .bind(request.user_agent)
-        .bind(request.reasoning_effort)
-        .bind(request.reasoning_preset)
-        .bind(request.request_kind)
-        .bind(request.subagent_kind)
-        .bind(request.compact)
         .bind(request.image_generation_requested)
-        .bind(optional_i64(
-            request.admission_decision_ms,
-            "admission_decision_ms",
-        )?)
         .bind(request.started_at)
         .bind(request.deadline_at)
         .bind(request.continuation.affinity_hash)
-        .bind(request.continuation.previous_response_id_hash)
         .bind(request.continuation.requested)
+        .bind(request.request_kind)
+        .bind(observation)
         .execute(&self.pool)
         .await
         .map_err(|source| postgres_unavailable("insert model request", source))?;
@@ -483,58 +129,40 @@ impl ModelRequestRepository for PgExecutionStore {
         if attempt.attempt_count != 1 || attempt.model_request_id != request.id {
             return Err(invalid("first attempt must target the inserted request"));
         }
+        let observation = RequestObservation::initial(&request)?;
         sqlx::query(
             "insert into model_requests (
-               id, client_api_key_id, client_api_key_ref, config_revision, protocol,
-               routing_scope, routing_group_refs, routing_group_names_snapshot,
-               operation, endpoint, client_transport, requested_model_id,
-               client_ip, user_agent, reasoning_effort,
-               reasoning_preset, request_kind, subagent_kind, compact,
-               image_generation_requested, admission_decision_ms, started_at, deadline_at,
-               provider_kind, provider_account_id, provider_account_ref,
-               provider_account_name_snapshot, provider_account_email_snapshot,
-               provider_account_authentication_kind_snapshot,
-               upstream_model_id, upstream_transport, http_version,
-               attempt_count, upstream_send_state, account_selection_wait_ms,
-               capacity_used_slots, capacity_total_slots
-               , continuation_affinity_hash, continuation_previous_response_id_hash,
-               continuation_requested
-             ) select
-               $1, $2, $3, $4, $5, $6, $7, $8,
-               $9, $10, $11, $12, $13::inet, $14, $15,
-               $16, $17, $18, $19, $20, $21, $22, $23,
-               $24, $25, $26,
-               account.name, account.email, account.authentication_kind,
-               $27, $28, $29, 1, 'not_sent', $30, $31, $32, $33, $34, $35
+               id, client_api_key_id, client_api_key_ref, operation, client_transport,
+               requested_model_id, image_generation_requested, started_at, deadline_at,
+               continuation_affinity_hash, continuation_requested, request_kind, request_observation_json,
+               provider_kind, provider_account_id, provider_account_ref, upstream_model_id,
+               upstream_transport, attempt_count, upstream_send_state
+             ) select $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+               $13::jsonb || jsonb_build_object(
+                 'account', jsonb_strip_nulls(jsonb_build_object(
+                   'name', account.name, 'email', account.email,
+                   'authenticationKind', account.authentication_kind)),
+                 'transport', jsonb_strip_nulls(jsonb_build_object('httpVersion', $19::text)),
+                 'scheduling', ($13::jsonb -> 'scheduling') || jsonb_strip_nulls(jsonb_build_object(
+                   'accountSelectionWaitMs', $20::bigint,
+                   'capacityUsedSlots', $21::bigint, 'capacityTotalSlots', $22::bigint))),
+               $14, $15, $16, $17, $18, 1, 'not_sent'
              from (values (true)) as seed(present)
-             left join provider_accounts account on account.id = $25",
+             left join provider_accounts account on account.id = $15",
         )
         .bind(request.id)
         .bind(request.client_api_key_id)
         .bind(request.client_api_key_ref)
-        .bind(to_i64(request.config_revision, "config_revision")?)
-        .bind(request.protocol)
-        .bind(request.routing_scope)
-        .bind(request.routing_group_refs)
-        .bind(sqlx::types::Json(request.routing_group_names_snapshot))
         .bind(request.operation)
-        .bind(request.endpoint)
         .bind(request.client_transport)
         .bind(request.requested_model_id)
-        .bind(request.client_ip)
-        .bind(request.user_agent)
-        .bind(request.reasoning_effort)
-        .bind(request.reasoning_preset)
-        .bind(request.request_kind)
-        .bind(request.subagent_kind)
-        .bind(request.compact)
         .bind(request.image_generation_requested)
-        .bind(optional_i64(
-            request.admission_decision_ms,
-            "admission_decision_ms",
-        )?)
         .bind(request.started_at)
         .bind(request.deadline_at)
+        .bind(request.continuation.affinity_hash)
+        .bind(request.continuation.requested)
+        .bind(request.request_kind)
+        .bind(observation)
         .bind(attempt.provider_kind)
         .bind(attempt.provider_account_id)
         .bind(attempt.provider_account_ref)
@@ -553,9 +181,6 @@ impl ModelRequestRepository for PgExecutionStore {
             attempt.capacity_total_slots,
             "capacity_total_slots",
         )?)
-        .bind(request.continuation.affinity_hash)
-        .bind(request.continuation.previous_response_id_hash)
-        .bind(request.continuation.requested)
         .execute(&self.pool)
         .await
         .map_err(|source| {
@@ -577,22 +202,20 @@ impl ModelRequestRepository for PgExecutionStore {
              set provider_kind = $2,
                  provider_account_id = $3,
                  provider_account_ref = $4,
-                 (provider_account_name_snapshot,
-                  provider_account_email_snapshot,
-                  provider_account_authentication_kind_snapshot) = (
-                   select name, email, authentication_kind
-                   from provider_accounts where id = $3
-                 ),
                  upstream_model_id = $5,
                  upstream_transport = $6,
-                 http_version = $7,
                  attempt_count = $8,
-                 account_selection_wait_ms = case
-                   when $9::bigint is null then account_selection_wait_ms
-                   else coalesce(account_selection_wait_ms, 0) + $9
-                 end,
-                 capacity_used_slots = coalesce($10, capacity_used_slots),
-                 capacity_total_slots = coalesce($11, capacity_total_slots)
+                 request_observation_json = request_observation_json || jsonb_build_object(
+                   'account', coalesce((select jsonb_strip_nulls(jsonb_build_object(
+                     'name', name, 'email', email, 'authenticationKind', authentication_kind))
+                     from provider_accounts where id = $3), '{}'::jsonb),
+                   'transport', jsonb_strip_nulls(jsonb_build_object('httpVersion', $7::text)),
+                   'scheduling', coalesce(request_observation_json -> 'scheduling', '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
+                     'accountSelectionWaitMs', case when $9::bigint is null
+                       then (request_observation_json #>> '{scheduling,accountSelectionWaitMs}')::bigint
+                       else coalesce((request_observation_json #>> '{scheduling,accountSelectionWaitMs}')::bigint, 0) + $9 end,
+                     'capacityUsedSlots', coalesce($10::bigint, (request_observation_json #>> '{scheduling,capacityUsedSlots}')::bigint),
+                     'capacityTotalSlots', coalesce($11::bigint, (request_observation_json #>> '{scheduling,capacityTotalSlots}')::bigint))))
              where id = $1 and outcome = 'running' and downstream_committed_at is null
                and $8 = attempt_count + 1
              returning attempt_count",
@@ -698,35 +321,29 @@ impl ModelRequestRepository for PgExecutionStore {
         finalization: ModelRequestFinalization,
     ) -> StoreResult<bool> {
         finalization.validate()?;
+        let observation = RequestObservation::finalized(&finalization)?;
         // 墙上时间可能回拨；终态必须可落盘，实际耗时仍保留 Core 的单调时钟观测
         let finalized = sqlx::query_scalar::<_, i64>(
             "with finalized as (
              update model_requests
              set outcome = $2, upstream_send_state = $3, attempt_count = $4,
                  downstream_committed_at = $5,
-                 client_status_code = coalesce(client_status_code, $6),
-                 upstream_status_code = $7,
+                 client_status_code = coalesce(client_status_code, $6), upstream_status_code = $7,
                  client_response_id = $8, upstream_request_id = $9, upstream_response_id = $10,
-                 error_kind = $11, provider_error_code = $12, error_message = $13,
-                 retry_after_ms = $14, input_tokens = $15, output_tokens = $16,
-                 cached_tokens = $17, cache_write_tokens = $18, reasoning_tokens = $19,
-                 image_input_tokens = $20, image_output_tokens = $21, total_tokens = $22,
-                 image_generation_succeeded = $23, cost_source = $24,
-                 cost_amount = $25::numeric, cost_currency = $26,
-                 transport_decision_wait_ms = $27, connect_ms = $28,
-                 headers_ms = $29, first_event_ms = $30, first_reasoning_ms = $31,
-                 first_text_ms = $32, first_token_ms = $33, provider_processing_ms = $34,
-                 latency_ms = $35, completed_at = greatest($36, started_at),
-                 upstream_transport = coalesce($37, upstream_transport),
-                 http_version = coalesce($38, http_version), websocket_pool = $39,
-                 service_tier = $40, provider_observation_json = $41,
-                 error_details = $42,
-                 continuation_unavailable_reason = $43,
-                 upstream_connection_id = $44,
-                 upstream_connection_exit_reason = $45,
-                 upstream_connection_age_ms = $46,
-                 upstream_connection_idle_ms = $47, diagnostic_trace_json = $48,
-                 upstream_response_model = $49, billing_snapshot_json = $50
+                 error_kind = $11, input_tokens = $12, output_tokens = $13,
+                 cached_tokens = $14, cache_write_tokens = $15, reasoning_tokens = $16,
+                 image_input_tokens = $17, image_output_tokens = $18, total_tokens = $19,
+                 image_generation_succeeded = $20, cost_source = $21,
+                 cost_amount = $22::numeric, cost_currency = $23,
+                 completed_at = greatest($24, started_at),
+                 upstream_transport = coalesce($25, upstream_transport), service_tier = $26,
+                 provider_observation_json = $27, error_details = $28,
+                 diagnostic_trace_json = $29, billing_snapshot_json = $30,
+                 request_observation_json = request_observation_json || $31::jsonb || jsonb_build_object(
+                   'transport', ($31::jsonb -> 'transport') || jsonb_strip_nulls(jsonb_build_object(
+                     'httpVersion', coalesce($31::jsonb #>> '{transport,httpVersion}', request_observation_json #>> '{transport,httpVersion}'))),
+                   'continuation', coalesce(request_observation_json -> 'continuation', '{}'::jsonb)
+                     || ($31::jsonb -> 'continuation'))
              where id = $1 and outcome = 'running'
              returning id, client_api_key_ref, continuation_affinity_hash,
                        continuation_requested, provider_kind, upstream_transport,
@@ -758,20 +375,11 @@ impl ModelRequestRepository for PgExecutionStore {
                    when current.outcome = 'succeeded' then current.completed_at
                    else prior.recovered_at
                  end,
-                 recovery_retry_delay_ms = case
-                   when current.outcome = 'succeeded' then greatest(
-                     0,
-                     floor(extract(epoch from (current.started_at - prior.completed_at)) * 1000)
-                   )::bigint
-                   else prior.recovery_retry_delay_ms
-                 end,
-                 recovery_total_latency_ms = case
-                   when current.outcome = 'succeeded' then greatest(
-                     0,
-                     floor(extract(epoch from (current.completed_at - prior.completed_at)) * 1000)
-                   )::bigint
-                   else prior.recovery_total_latency_ms
-                 end
+                 request_observation_json = case when current.outcome = 'succeeded' then
+                   prior.request_observation_json || jsonb_build_object('recovery', jsonb_build_object(
+                     'retryDelayMs', greatest(0, floor(extract(epoch from (current.started_at - prior.completed_at)) * 1000))::bigint,
+                     'totalLatencyMs', greatest(0, floor(extract(epoch from (current.completed_at - prior.completed_at)) * 1000))::bigint))
+                   else prior.request_observation_json end
              from finalized current
              join recovery_target target on true
              where prior.id = target.id
@@ -801,14 +409,9 @@ impl ModelRequestRepository for PgExecutionStore {
              set recovery_attempt_count = prior.recovery_attempt_count + 1,
                  recovery_request_id = current.id,
                  recovered_at = current.completed_at,
-                 recovery_retry_delay_ms = greatest(
-                   0,
-                   floor(extract(epoch from (current.started_at - prior.completed_at)) * 1000)
-                 )::bigint,
-                 recovery_total_latency_ms = greatest(
-                   0,
-                   floor(extract(epoch from (current.completed_at - prior.completed_at)) * 1000)
-                 )::bigint
+                 request_observation_json = prior.request_observation_json || jsonb_build_object('recovery', jsonb_build_object(
+                   'retryDelayMs', greatest(0, floor(extract(epoch from (current.started_at - prior.completed_at)) * 1000))::bigint,
+                   'totalLatencyMs', greatest(0, floor(extract(epoch from (current.completed_at - prior.completed_at)) * 1000))::bigint))
              from finalized current
              join session_transport_recovery_target target on true
              where prior.id = target.id
@@ -833,93 +436,26 @@ impl ModelRequestRepository for PgExecutionStore {
         .bind(finalization.upstream_request_id)
         .bind(finalization.upstream_response_id.map(String::into_bytes))
         .bind(finalization.error_kind)
-        .bind(finalization.provider_error_code)
-        .bind(finalization.error_message)
-        .bind(optional_i64(finalization.retry_after_ms, "retry_after_ms")?)
-        .bind(optional_i64(
-            finalization.usage.input_tokens,
-            "input_tokens",
-        )?)
-        .bind(optional_i64(
-            finalization.usage.output_tokens,
-            "output_tokens",
-        )?)
-        .bind(optional_i64(
-            finalization.usage.cached_tokens,
-            "cached_tokens",
-        )?)
-        .bind(optional_i64(
-            finalization.usage.cache_write_tokens,
-            "cache_write_tokens",
-        )?)
-        .bind(optional_i64(
-            finalization.usage.reasoning_tokens,
-            "reasoning_tokens",
-        )?)
-        .bind(optional_i64(
-            finalization.usage.image_input_tokens,
-            "image_input_tokens",
-        )?)
-        .bind(optional_i64(
-            finalization.usage.image_output_tokens,
-            "image_output_tokens",
-        )?)
-        .bind(optional_i64(
-            finalization.usage.total_tokens,
-            "total_tokens",
-        )?)
+        .bind(optional_i64(finalization.usage.input_tokens, "input_tokens")?)
+        .bind(optional_i64(finalization.usage.output_tokens, "output_tokens")?)
+        .bind(optional_i64(finalization.usage.cached_tokens, "cached_tokens")?)
+        .bind(optional_i64(finalization.usage.cache_write_tokens, "cache_write_tokens")?)
+        .bind(optional_i64(finalization.usage.reasoning_tokens, "reasoning_tokens")?)
+        .bind(optional_i64(finalization.usage.image_input_tokens, "image_input_tokens")?)
+        .bind(optional_i64(finalization.usage.image_output_tokens, "image_output_tokens")?)
+        .bind(optional_i64(finalization.usage.total_tokens, "total_tokens")?)
         .bind(finalization.image_generation_succeeded)
         .bind(finalization.cost_source.as_str())
         .bind(finalization.cost_amount.map(|amount| amount.to_string()))
         .bind(finalization.cost_currency)
-        .bind(optional_i64(
-            finalization.timings.transport_decision_wait_ms,
-            "transport_decision_wait_ms",
-        )?)
-        .bind(optional_i64(finalization.timings.connect_ms, "connect_ms")?)
-        .bind(optional_i64(finalization.timings.headers_ms, "headers_ms")?)
-        .bind(optional_i64(
-            finalization.timings.first_event_ms,
-            "first_event_ms",
-        )?)
-        .bind(optional_i64(
-            finalization.timings.first_reasoning_ms,
-            "first_reasoning_ms",
-        )?)
-        .bind(optional_i64(
-            finalization.timings.first_text_ms,
-            "first_text_ms",
-        )?)
-        .bind(optional_i64(
-            finalization.timings.first_token_ms,
-            "first_token_ms",
-        )?)
-        .bind(optional_i64(
-            finalization.timings.provider_processing_ms,
-            "provider_processing_ms",
-        )?)
-        .bind(optional_i64(finalization.timings.latency_ms, "latency_ms")?)
         .bind(finalization.completed_at)
         .bind(finalization.upstream_transport)
-        .bind(finalization.http_version)
-        .bind(finalization.websocket_pool)
         .bind(finalization.service_tier)
         .bind(finalization.provider_metadata_json.map(sqlx::types::Json))
         .bind(finalization.error_details)
-        .bind(finalization.continuation_unavailable_reason)
-        .bind(finalization.upstream_connection_id)
-        .bind(finalization.upstream_connection_exit_reason)
-        .bind(optional_i64(
-            finalization.upstream_connection_age_ms,
-            "upstream_connection_age_ms",
-        )?)
-        .bind(optional_i64(
-            finalization.upstream_connection_idle_ms,
-            "upstream_connection_idle_ms",
-        )?)
         .bind(finalization.diagnostic_trace_json.map(sqlx::types::Json))
-        .bind(finalization.upstream_response_model)
         .bind(finalization.billing_snapshot_json.map(sqlx::types::Json))
+        .bind(observation)
         .fetch_one(&self.pool)
         .await
         .map_err(|source| postgres_unavailable("finalize model request", source))?;
@@ -933,7 +469,8 @@ impl ModelRequestRepository for PgExecutionStore {
         let result = sqlx::query(
             "update model_requests
              set outcome = 'incomplete', error_kind = 'process_interrupted',
-                 error_message = 'request did not reach a terminal state',
+                 request_observation_json = request_observation_json || jsonb_build_object('error',
+                   jsonb_build_object('message', 'request did not reach a terminal state')),
                  image_generation_succeeded = case
                    when image_generation_requested then false else null
                  end,
@@ -1220,122 +757,10 @@ impl ExecutionStore for PgExecutionStore {
         &self,
         finalization: CoreModelRequestFinalization,
     ) -> Result<(), CoreStoreError> {
-        let continuation_unavailable_reason = finalization
-            .failure_observation
-            .continuation_unavailable_reason
-            .clone();
-        let connection_observation = finalization
-            .failure_observation
-            .upstream_connection
-            .as_ref();
-        let upstream_connection_id =
-            connection_observation.map(|observation| observation.connection_id().to_owned());
-        let upstream_connection_exit_reason =
-            connection_observation.map(|observation| observation.exit_reason().to_owned());
-        let upstream_connection_age_ms =
-            connection_observation.map(|observation| observation.age_ms());
-        let upstream_connection_idle_ms =
-            connection_observation.map(|observation| observation.idle_ms());
-        let provider_metadata_json = finalization
-            .provider_metadata_json
-            .as_deref()
-            .map(serde_json::from_str::<Value>)
-            .transpose()
-            .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source))?;
-        if provider_metadata_json
-            .as_ref()
-            .is_some_and(|metadata| !metadata.is_object())
-        {
-            return Err(CoreStoreError::new(CoreStoreErrorKind::InvalidData));
-        }
-        let (cost_source, cost_amount, cost_currency) = match finalization.cost.total() {
-            Some(total) => (
-                cost_source_from_core(finalization.cost.source()),
-                Some(
-                    total
-                        .amount()
-                        .to_string()
-                        .parse::<DecimalAmount>()
-                        .map_err(|source| {
-                            CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source)
-                        })?,
-                ),
-                Some(total.currency().as_str().to_owned()),
-            ),
-            None => (CostSource::Unavailable, None, None),
-        };
-        let error_kind = if continuation_unavailable_reason.is_some() {
-            Some(
-                ProviderErrorKind::ContinuationRecoveryRequired
-                    .as_str()
-                    .to_owned(),
-            )
-        } else {
-            finalization
-                .error
-                .as_ref()
-                .map(|error| error.kind().as_str().to_owned())
-        };
-        let error_message = finalization.error.as_ref().map(|error| {
-            error.diagnostic().map_or_else(
-                || error.safe_message().to_owned(),
-                |diagnostic| diagnostic.as_str().to_owned(),
-            )
-        });
-        let completed = ModelRequestRepository::finalize_model_request(
-            self,
-            ModelRequestFinalization {
-                billing_snapshot_json: finalization
-                    .cost
-                    .breakdown()
-                    .map(super::pricing::encode_billing_snapshot),
-                model_request_id: finalization.request_id.as_str().to_owned(),
-                outcome: outcome_from_core(finalization.outcome)?,
-                upstream_send_state: send_state_from_core(finalization.send_state),
-                attempt_count: finalization.attempt_count,
-                downstream_committed_at: finalization
-                    .downstream_committed_at
-                    .map(DateTime::<Utc>::from),
-                client_status_code: finalization.client_status_code,
-                upstream_status_code: finalization.upstream_status_code,
-                client_response_id: finalization.client_response_id,
-                upstream_request_id: finalization.upstream_request_id,
-                upstream_response_id: finalization.upstream_response_id,
-                upstream_transport: finalization.upstream_transport,
-                http_version: finalization.http_version,
-                websocket_pool: finalization.websocket_pool,
-                service_tier: finalization.service_tier,
-                upstream_response_model: finalization.upstream_response_model,
-                provider_metadata_json,
-                diagnostic_trace_json: finalization
-                    .diagnostic_trace_json
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|source| {
-                        CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source)
-                    })?,
-                error_kind,
-                provider_error_code: finalization.provider_error_code,
-                error_message,
-                error_details: finalization.error_details,
-                continuation_unavailable_reason,
-                upstream_connection_id,
-                upstream_connection_exit_reason,
-                upstream_connection_age_ms,
-                upstream_connection_idle_ms,
-                retry_after_ms: finalization.retry_after_ms,
-                usage: finalization.usage,
-                image_generation_succeeded: finalization.image_generation_succeeded,
-                cost_source,
-                cost_amount,
-                cost_currency,
-                timings: finalization.timings,
-                completed_at: DateTime::<Utc>::from(finalization.completed_at),
-            },
-        )
-        .await
-        .map_err(core_store_error)?;
+        let completed =
+            ModelRequestRepository::finalize_model_request(self, finalization_row(finalization)?)
+                .await
+                .map_err(core_store_error)?;
         require_core_update(completed)
     }
 
@@ -1353,123 +778,11 @@ impl ExecutionStore for PgExecutionStore {
     }
 }
 
-const fn send_state_from_core(value: CoreUpstreamSendState) -> UpstreamSendState {
-    match value {
-        CoreUpstreamSendState::NotSent => UpstreamSendState::NotSent,
-        CoreUpstreamSendState::Sent => UpstreamSendState::Sent,
-        CoreUpstreamSendState::Ambiguous => UpstreamSendState::Ambiguous,
-    }
-}
-
-fn outcome_from_core(
-    value: gateway_core::engine::ExecutionOutcome,
-) -> Result<ModelRequestOutcome, CoreStoreError> {
-    match value {
-        gateway_core::engine::ExecutionOutcome::Running => {
-            Err(CoreStoreError::new(CoreStoreErrorKind::InvalidState))
-        }
-        gateway_core::engine::ExecutionOutcome::Succeeded => Ok(ModelRequestOutcome::Succeeded),
-        gateway_core::engine::ExecutionOutcome::Failed => Ok(ModelRequestOutcome::Failed),
-        gateway_core::engine::ExecutionOutcome::Cancelled => Ok(ModelRequestOutcome::Cancelled),
-        gateway_core::engine::ExecutionOutcome::Incomplete => Ok(ModelRequestOutcome::Incomplete),
-    }
-}
-
-const fn cost_source_from_core(value: CoreCostSource) -> CostSource {
-    match value {
-        CoreCostSource::ProviderReported => CostSource::ProviderReported,
-        CoreCostSource::Calculated => CostSource::Calculated,
-        CoreCostSource::Unavailable => CostSource::Unavailable,
-    }
-}
-
 fn require_core_update(updated: bool) -> Result<(), CoreStoreError> {
     if updated {
         Ok(())
     } else {
         Err(CoreStoreError::new(CoreStoreErrorKind::InvalidState))
-    }
-}
-
-fn new_model_request_row(request: CoreNewModelRequest) -> NewModelRequest {
-    let (routing_scope, routing_group_refs, routing_group_names_snapshot) =
-        routing_snapshot_row(&request.routing);
-    NewModelRequest {
-        id: request.id.as_str().to_owned(),
-        client_api_key_id: request
-            .client_api_key_id
-            .as_ref()
-            .map(|id| id.as_str().to_owned()),
-        client_api_key_ref: request.client_api_key_ref.as_str().to_owned(),
-        config_revision: request.config_revision.get(),
-        routing_scope,
-        routing_group_refs,
-        routing_group_names_snapshot,
-        protocol: request.protocol,
-        operation: request.operation.as_str().to_owned(),
-        endpoint: request.endpoint,
-        client_transport: request.client_transport,
-        requested_model_id: request
-            .requested_model
-            .map(|model| model.as_str().to_owned()),
-        client_ip: request.client_ip.map(|address| address.to_string()),
-        user_agent: request.user_agent,
-        reasoning_effort: request.reasoning_effort,
-        reasoning_preset: request.reasoning_preset,
-        request_kind: request.request_kind,
-        subagent_kind: request.subagent_kind,
-        compact: request.compact,
-        continuation: ContinuationRequestObservation {
-            affinity_hash: request.continuation.affinity_hash,
-            previous_response_id_hash: request.continuation.previous_response_id_hash,
-            requested: request.continuation.requested,
-        },
-        image_generation_requested: request.image_generation_requested,
-        admission_decision_ms: request.admission_decision_ms,
-        started_at: DateTime::<Utc>::from(request.started_at),
-        deadline_at: DateTime::<Utc>::from(request.deadline_at.lease_deadline()),
-    }
-}
-
-fn routing_snapshot_row(snapshot: &AccountRoutingSnapshot) -> (String, Vec<String>, Value) {
-    let groups = snapshot.groups_snapshot();
-    (
-        snapshot.kind().as_str().to_owned(),
-        groups
-            .iter()
-            .map(|group| group.id().as_str().to_owned())
-            .collect(),
-        Value::Array(
-            groups
-                .iter()
-                .map(|group| Value::String(group.name().to_owned()))
-                .collect(),
-        ),
-    )
-}
-
-fn validate_routing_snapshot(scope: &str, refs: &[String], names: &Value) -> StoreResult<()> {
-    let Some(names) = names.as_array() else {
-        return Err(invalid("routing group names snapshot must be an array"));
-    };
-    let valid = match scope {
-        value if value == AccountRoutingScopeKind::All.as_str() => {
-            refs.is_empty() && names.is_empty()
-        }
-        value if value == AccountRoutingScopeKind::Groups.as_str() => {
-            !refs.is_empty()
-                && refs.len() == names.len()
-                && refs.iter().all(|id| !id.is_empty())
-                && names
-                    .iter()
-                    .all(|name| name.as_str().is_some_and(|name| !name.is_empty()))
-        }
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(invalid("invalid routing scope snapshot"))
     }
 }
 
@@ -1508,62 +821,8 @@ fn validate_status_code(status: Option<u16>) -> StoreResult<()> {
     Ok(())
 }
 
-fn validate_optional_stable_reason(value: Option<&str>, field: &str) -> StoreResult<()> {
-    if value.is_some_and(|value| {
-        value.is_empty()
-            || value.len() > 64
-            || !value.bytes().enumerate().all(|(index, byte)| {
-                byte.is_ascii_lowercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'_'))
-            })
-    }) {
-        return Err(invalid(field));
-    }
-    Ok(())
-}
-
-fn validate_connection_observation(finalization: &ModelRequestFinalization) -> StoreResult<()> {
-    let fields_present = [
-        finalization.upstream_connection_id.is_some(),
-        finalization.upstream_connection_exit_reason.is_some(),
-        finalization.upstream_connection_age_ms.is_some(),
-        finalization.upstream_connection_idle_ms.is_some(),
-    ];
-    if fields_present.iter().any(|present| *present)
-        && !fields_present.iter().all(|present| *present)
-    {
-        return Err(invalid("upstream connection observation is incomplete"));
-    }
-    if let Some(connection_id) = finalization.upstream_connection_id.as_deref()
-        && (connection_id.is_empty()
-            || connection_id.len() > 128
-            || connection_id.chars().any(char::is_control))
-    {
-        return Err(invalid("upstream connection ID is invalid"));
-    }
-    validate_optional_stable_reason(
-        finalization.upstream_connection_exit_reason.as_deref(),
-        "upstream connection exit reason is invalid",
-    )?;
-    if finalization
-        .upstream_connection_age_ms
-        .zip(finalization.upstream_connection_idle_ms)
-        .is_some_and(|(age, idle)| idle > age)
-    {
-        return Err(invalid("upstream connection idle time exceeds its age"));
-    }
-    Ok(())
-}
-
 fn to_i64(value: u64, field: &'static str) -> StoreResult<i64> {
     i64::try_from(value).map_err(|source| invalid(field).with_source(source))
-}
-
-fn invalid(message: &str) -> StoreError {
-    StoreError::InvalidData {
-        source: None,
-        entity: ENTITY,
-        message: message.to_owned(),
-    }
 }
 
 #[async_trait]

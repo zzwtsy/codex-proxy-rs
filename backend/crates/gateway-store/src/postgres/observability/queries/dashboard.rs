@@ -67,19 +67,19 @@ pub(crate) async fn request_metrics(
                   as account_selection_wait_p99_ms,
                 round((percentile_cont(0.10) within group (
                   order by output_tokens::double precision * 1000.0
-                    / nullif(latency_ms, 0)
+                    / nullif(upstream_response_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > 0)))::bigint as output_throughput_p10,
+                          and upstream_response_ms > 0)))::bigint as output_throughput_p10,
                 round((percentile_cont(0.50) within group (
                   order by output_tokens::double precision * 1000.0
-                    / nullif(latency_ms, 0)
+                    / nullif(upstream_response_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > 0)))::bigint as output_throughput_p50,
+                          and upstream_response_ms > 0)))::bigint as output_throughput_p50,
                 round((percentile_cont(0.90) within group (
                   order by output_tokens::double precision * 1000.0
-                    / nullif(latency_ms, 0)
+                    / nullif(upstream_response_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > 0)))::bigint as output_throughput_p90,
+                          and upstream_response_ms > 0)))::bigint as output_throughput_p90,
                 count(capacity_total_slots)::bigint as capacity_sample_count,
                 round(avg(capacity_used_slots::double precision
                           / nullif(capacity_total_slots, 0)) * 10000)::bigint
@@ -88,7 +88,7 @@ pub(crate) async fn request_metrics(
                   order by capacity_used_slots::double precision
                     / nullif(capacity_total_slots, 0)
                 ) * 10000)::bigint as capacity_utilization_p95_basis_points
-         from model_requests mr where mr.started_at >= "
+         from model_request_observations mr where mr.started_at >= "
     ));
     query.push_bind(range.start);
     query.push(" and mr.started_at < ");
@@ -114,7 +114,7 @@ pub(crate) async fn dashboard_totals(pool: &PgPool) -> StoreResult<DashboardTota
                 coalesce(sum(total_tokens) filter (where {fact}), 0)::bigint as total_tokens,
                 sum(cost_amount) filter (where {fact} and cost_currency = 'USD')::text
                   as billing_usd
-           from model_requests mr
+           from model_request_observations mr
           where mr.recovered_at is null"
     ));
     let row = query
@@ -222,19 +222,19 @@ async fn request_metric_series_inner(
                   as account_selection_wait_p99_ms,
                 round((percentile_cont(0.10) within group (
                   order by output_tokens::double precision * 1000.0
-                    / nullif(latency_ms, 0)
+                    / nullif(upstream_response_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > 0)))::bigint as output_throughput_p10,
+                          and upstream_response_ms > 0)))::bigint as output_throughput_p10,
                 round((percentile_cont(0.50) within group (
                   order by output_tokens::double precision * 1000.0
-                    / nullif(latency_ms, 0)
+                    / nullif(upstream_response_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > 0)))::bigint as output_throughput_p50,
+                          and upstream_response_ms > 0)))::bigint as output_throughput_p50,
                 round((percentile_cont(0.90) within group (
                   order by output_tokens::double precision * 1000.0
-                    / nullif(latency_ms, 0)
+                    / nullif(upstream_response_ms, 0)
                 ) filter (where {fact} and output_tokens > 0
-                          and latency_ms > 0)))::bigint as output_throughput_p90,
+                          and upstream_response_ms > 0)))::bigint as output_throughput_p90,
                 count(capacity_total_slots)::bigint as capacity_sample_count,
                 round(avg(capacity_used_slots::double precision
                           / nullif(capacity_total_slots, 0)) * 10000)::bigint
@@ -249,7 +249,7 @@ async fn request_metric_series_inner(
                   as calculated_count,
                 count(*) filter (where {fact} and cost_source = 'unavailable')::bigint
                   as unavailable_count
-         from model_requests mr where mr.started_at >= "
+         from model_request_observations mr where mr.started_at >= "
     ));
     query.push_bind(range.start);
     query.push(" and mr.started_at < ");
@@ -307,7 +307,7 @@ pub(crate) fn calculated_usage_billing_facts(
                     mr.provider_kind, mr.upstream_model_id, mr.service_tier,
                     mr.input_tokens, mr.output_tokens, mr.cached_tokens, mr.cache_write_tokens,
                     mr.billing_snapshot_json, mr.cost_currency, mr.cost_amount::text as amount
-             from model_requests mr where mr.started_at >= ",
+             from model_request_observations mr where mr.started_at >= ",
         );
         query.push_bind(range.start);
         query.push(" and mr.started_at < ");
@@ -342,7 +342,7 @@ pub(crate) async fn request_costs_by_bucket(
     query.push(
         " as bucket_start,
                 mr.cost_currency, sum(mr.cost_amount)::text as amount
-         from model_requests mr
+         from model_request_observations mr
          where mr.started_at >= ",
     );
     query.push_bind(range.start);
@@ -382,7 +382,7 @@ pub(crate) async fn attempt_metrics(
            select mr.id, mr.attempt_count, mr.outcome, mr.error_kind,
                   mr.upstream_status_code, mr.client_status_code,
                   mr.cost_source, ({completed_usage}) as is_completed_usage
-           from model_requests mr where mr.started_at >= "
+           from model_request_observations mr where mr.started_at >= "
     ));
     query.push_bind(range.start);
     query.push(" and mr.started_at < ");
@@ -494,7 +494,7 @@ pub(crate) async fn request_costs(
 ) -> StoreResult<Vec<CurrencyCostTotal>> {
     let mut query = QueryBuilder::<Postgres>::new(
         "select mr.cost_currency, sum(mr.cost_amount)::text as amount
-         from model_requests mr where mr.started_at >= ",
+         from model_request_observations mr where mr.started_at >= ",
     );
     query.push_bind(range.start);
     query.push(" and mr.started_at < ");
@@ -527,7 +527,7 @@ pub(crate) async fn provider_observations(
                 count(*) filter (where mr.outcome = 'failed')::bigint as failure_count,
                 coalesce(sum(mr.total_tokens) filter (where {fact}), 0)::bigint
                   as total_tokens
-         from model_requests mr where mr.started_at >= "
+         from model_request_observations mr where mr.started_at >= "
     ));
     query.push_bind(range.start);
     query.push(" and mr.started_at < ");

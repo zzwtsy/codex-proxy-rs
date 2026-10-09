@@ -9,8 +9,8 @@ use gateway_admin::{
         AdminError,
         plugins::{
             InspectedPluginArtifact, PluginArtifactIcon, PluginArtifactIconResource,
-            PluginArtifactIconVariants, PluginArtifactMetadata, PluginContribution,
-            PluginIconTheme,
+            PluginArtifactIconVariants, PluginArtifactMetadata, PluginCompatibilityRequirements,
+            PluginContribution, PluginIconTheme,
         },
     },
     ports::plugins::PluginPackageInspector,
@@ -33,37 +33,12 @@ impl PackageInspector {
             slots: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
-}
 
-#[async_trait]
-impl PluginPackageInspector for PackageInspector {
-    async fn compatibility_warning(
-        &self,
-        archive: Arc<[u8]>,
-        expected_sha256: String,
-    ) -> Result<Option<String>, AdminError> {
-        let requirements = self.compatibility(archive, expected_sha256).await?;
-        super::compatibility::warning(&requirements, &self.host_version)
-    }
-
-    fn api_deprecations(
-        &self,
-        metadata: &PluginArtifactMetadata,
-    ) -> Result<Vec<gateway_admin::model::plugins::instances::PluginApiDeprecation>, AdminError>
-    {
-        crate::compatibility::warnings(
-            metadata
-                .contributes
-                .iter()
-                .map(|(capability, declaration)| (capability.as_str(), declaration.version)),
-        )
-    }
-
-    async fn inspect(
+    async fn inspect_package(
         &self,
         archive: Arc<[u8]>,
         expected_sha256: Option<String>,
-    ) -> Result<InspectedPluginArtifact, AdminError> {
+    ) -> Result<(InspectedPluginArtifact, PluginCompatibilityRequirements), AdminError> {
         let permit = Arc::clone(&self.slots)
             .try_acquire_owned()
             .map_err(|_| AdminError::unavailable("插件包校验繁忙，请稍后重试"))?;
@@ -129,13 +104,52 @@ impl PluginPackageInspector for PackageInspector {
                 state_namespaces: crate::callback::private_state::configuration(manifest)?
                     .namespaces,
             };
-            Ok(InspectedPluginArtifact {
-                metadata,
-                archive: package.archive(),
-            })
+            let requirements = super::compatibility::requirements(manifest)?;
+            Ok((
+                InspectedPluginArtifact {
+                    metadata,
+                    archive: package.archive(),
+                },
+                requirements,
+            ))
         })
         .await
         .map_err(|_| AdminError::internal("插件包校验任务失败"))?
+    }
+}
+
+#[async_trait]
+impl PluginPackageInspector for PackageInspector {
+    async fn compatibility_warning(
+        &self,
+        archive: Arc<[u8]>,
+        expected_sha256: String,
+    ) -> Result<Option<String>, AdminError> {
+        let (_, requirements) = self.inspect_package(archive, Some(expected_sha256)).await?;
+        super::compatibility::warning(&requirements, &self.host_version)
+    }
+
+    fn api_deprecations(
+        &self,
+        metadata: &PluginArtifactMetadata,
+    ) -> Result<Vec<gateway_admin::model::plugins::instances::PluginApiDeprecation>, AdminError>
+    {
+        crate::compatibility::warnings(
+            metadata
+                .contributes
+                .iter()
+                .map(|(capability, declaration)| (capability.as_str(), declaration.version)),
+        )
+    }
+
+    async fn inspect(
+        &self,
+        archive: Arc<[u8]>,
+        expected_sha256: Option<String>,
+    ) -> Result<InspectedPluginArtifact, AdminError> {
+        self.inspect_package(archive, expected_sha256)
+            .await
+            .map(|(artifact, _)| artifact)
     }
 
     async fn icon(

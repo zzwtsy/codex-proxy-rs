@@ -93,14 +93,19 @@ async fn seed_request(
     let completed_at = (outcome != "running").then_some(started_at + Duration::seconds(1));
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, outcome,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, outcome, started_at, deadline_at, completed_at, request_observation_json
          ) values (
-           $1, 'key-recovery', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'coding', $2, $3, $4, $5,
-           'all', '{}'::text[], '[]'::jsonb
+           $1, 'key-recovery', 'responses', 'http_sse', 'coding', $2, $3, $4, $5,
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .bind(id)

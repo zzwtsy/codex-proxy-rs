@@ -1,7 +1,5 @@
 //! 真实子进程协议对端；只依赖公开 SDK，Cargo 为集成测试构建此辅助二进制
 
-mod legacy_upstream;
-
 use std::{
     collections::BTreeMap,
     io::Write as _,
@@ -1481,16 +1479,10 @@ async fn main() {
 
 impl Peer {
     async fn upstream_adapter(&self, id: u64, payload: Vec<u8>) -> Result<(), PluginFault> {
-        let (request, body) = if self.configuration["upstream_version"] == 1 {
-            legacy_upstream::decode(
-                &payload,
-                self.configuration["expected_disable_fast"]
-                    .as_bool()
-                    .unwrap(),
-            )
-        } else {
-            UpstreamAdapterRequest::decode(&payload).unwrap()
-        };
+        let (request, body) = UpstreamAdapterRequest::decode(&payload).unwrap();
+        if let Some(expected) = self.configuration.get("expected_fast_mode") {
+            assert_eq!(request.fast_mode, expected.as_str().unwrap());
+        }
         // 假凭据用于检测宿主是否把已选账号令牌放入了插件输入
         assert!(!String::from_utf8_lossy(&payload).contains("fixture-native-token"));
         self.append_observation_marker("upstream_marker", &json!({"key":request.client_key_id,"account":request.account_id,"continuation":request.continuation}));

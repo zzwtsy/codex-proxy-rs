@@ -538,6 +538,7 @@ impl SystemOperations for ProcessSystemOperations {
         let cancellation = self.cancellation.clone();
         drop(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            // 留出受理响应返回时间，再走统一关闭流程
             cancellation.cancel();
         }));
         Ok(SystemOperationAccepted::Restart {

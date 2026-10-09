@@ -1,3 +1,5 @@
+//! 验证 SQLite 设置变更、审计、隐私策略与升级兼容
+
 mod tests {
     use std::collections::BTreeMap;
 
@@ -22,6 +24,7 @@ mod tests {
             model_mappings: BTreeMap::new(),
             rotation_strategy: gateway_core::account::RotationStrategy::Smart,
             values: RuntimeSettingsValues {
+                codex_privacy_policy: Default::default(),
                 request_location_enabled: false,
                 request_location: Default::default(),
                 refresh_margin_seconds: 3_600,
@@ -69,6 +72,85 @@ mod tests {
             }
         }))
         .expect("valid model price")
+    }
+
+    #[tokio::test]
+    async fn privacy_policy_survives_reopen_and_snapshot_and_stale_writes() {
+        use gateway_core::settings::privacy::*;
+        use gateway_store::RuntimeSnapshotRepository;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("privacy.sqlite3");
+        let pool = sqlite::connect_and_migrate(&path, &SqliteStoreConfig::default())
+            .await
+            .unwrap();
+        let repository = sqlite::admin_settings_store(pool.clone());
+        assert_eq!(
+            repository
+                .load_runtime_settings()
+                .await
+                .unwrap()
+                .values
+                .codex_privacy_policy,
+            CodexPrivacyPolicy::default()
+        );
+        let mut update = runtime_update(1);
+        update.values.codex_privacy_policy = CodexPrivacyPolicy {
+            enabled: true,
+            on_error: PrivacyFailureMode::RejectRequest,
+            rules: vec![PrivacyRule {
+                id: "remove-auth".into(),
+                name: "配置者控制".into(),
+                enabled: true,
+                scope: PrivacyScope::RequestHeader,
+                selector: "authorization".into(),
+                action: PrivacyAction::RemoveField,
+                pattern: None,
+                replacement: String::new(),
+                value: serde_json::Value::Null,
+                replace_all: true,
+                case_insensitive: false,
+                multi_line: false,
+            }],
+        };
+        let expected = update.values.codex_privacy_policy.clone();
+        let saved = repository
+            .replace_runtime_settings(update.clone(), &context("privacy-save"))
+            .await
+            .unwrap();
+        assert_eq!(saved.config_revision.get(), 2);
+        assert!(
+            repository
+                .replace_runtime_settings(update, &context("privacy-stale"))
+                .await
+                .is_err()
+        );
+        let changes: String = sqlx::query_scalar(
+            "select changed_fields_json from admin_audit_events where admin_request_id = 'privacy-save'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(changes.contains("codex_privacy_policy_json"));
+        drop(repository);
+        pool.close().await;
+        let pool = sqlite::connect_and_migrate(&path, &SqliteStoreConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlite::admin_settings_store(pool.clone())
+                .load_runtime_settings()
+                .await
+                .unwrap()
+                .values
+                .codex_privacy_policy,
+            expected
+        );
+        let snapshot = sqlite::SqliteRuntimeSnapshotRepository::new(pool.clone())
+            .load_runtime_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.settings.codex_privacy_policy, expected);
+        pool.close().await;
     }
 
     #[tokio::test]

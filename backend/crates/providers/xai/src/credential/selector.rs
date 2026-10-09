@@ -191,6 +191,7 @@ impl GrokAccountSessionSelector {
                     request.client_api_key_id(),
                     &self.provider_kind,
                     &account_ids,
+                    gateway_core::provider_ports::ProviderConcurrencyPool::Shared,
                 )
                 .await
                 .map_err(|source| {

@@ -365,10 +365,15 @@ async fn ops_errors_should_keep_request_and_event_snapshots_after_account_deleti
         .expect("insert failed request");
     sqlx::query(
         "update model_requests
-         set outcome = 'failed', error_kind = 'upstream_error',
-             error_message = 'snapshot failure', client_status_code = 502,
-             upstream_status_code = 502, completed_at = $1,
-             error_details = $2
+         set outcome = 'failed',
+           error_kind = 'upstream_error',
+           client_status_code = 502,
+           upstream_status_code = 502,
+           completed_at = $1,
+           error_details = $2,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'error', coalesce(request_observation_json #> '{error}', '{}'::jsonb) || jsonb_build_object(
+             'message', 'snapshot failure')))
          where id = 'req_snap_error'",
     )
     .bind(started_at + chrono::Duration::seconds(2))
@@ -707,9 +712,14 @@ async fn failure_diagnostics_should_only_include_errored_requests() {
         .expect("insert errored request");
     sqlx::query(
         "update model_requests
-         set outcome = 'failed', error_kind = 'rate_limited',
-             error_message = 'upstream limited', client_status_code = 429,
-             upstream_status_code = 429, completed_at = $2
+         set outcome = 'failed',
+           error_kind = 'rate_limited',
+           client_status_code = 429,
+           upstream_status_code = 429,
+           completed_at = $2,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'error', coalesce(request_observation_json #> '{error}', '{}'::jsonb) || jsonb_build_object(
+             'message', 'upstream limited')))
          where id = $1",
     )
     .bind("req_snap_err")
@@ -1021,11 +1031,17 @@ async fn api_key_diagnostics_should_display_key_name_and_fallback_to_ref() {
             .expect("insert api key request");
         finalize_request(&database.pool, id, started_at).await;
     }
-    sqlx::query("update model_requests set latency_ms = 1000 where id = 'req_key_a'")
+    sqlx::query("update model_requests set request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'timings', coalesce(request_observation_json #> '{timings}', '{}'::jsonb) || jsonb_build_object(
+             'local', coalesce(request_observation_json #> '{timings,local}', '{}'::jsonb) || jsonb_build_object(
+               'latencyMs', 1000)))) where id = 'req_key_a'")
         .execute(&database.pool)
         .await
         .expect("set request a latency");
-    sqlx::query("update model_requests set latency_ms = 2000 where id = 'req_key_b'")
+    sqlx::query("update model_requests set request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'timings', coalesce(request_observation_json #> '{timings}', '{}'::jsonb) || jsonb_build_object(
+             'local', coalesce(request_observation_json #> '{timings,local}', '{}'::jsonb) || jsonb_build_object(
+               'latencyMs', 2000)))) where id = 'req_key_b'")
         .execute(&database.pool)
         .await
         .expect("set request b latency");
@@ -1236,13 +1252,23 @@ async fn finalize_request_without_client_status(
 ) {
     sqlx::query(
         "update model_requests
-         set outcome = 'succeeded', upstream_send_state = 'sent',
-             client_status_code = null, upstream_status_code = 200,
-             input_tokens = 7, output_tokens = 3, total_tokens = 10,
-             first_token_ms = 100, latency_ms = 500,
-             cost_source = 'provider_reported', cost_amount = 1.25,
-             cost_currency = 'USD',
-             downstream_committed_at = $2, completed_at = $2
+         set outcome = 'succeeded',
+           upstream_send_state = 'sent',
+           client_status_code = null,
+           upstream_status_code = 200,
+           input_tokens = 7,
+           output_tokens = 3,
+           total_tokens = 10,
+           cost_source = 'provider_reported',
+           cost_amount = 1.25,
+           cost_currency = 'USD',
+           downstream_committed_at = $2,
+           completed_at = $2,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'timings', coalesce(request_observation_json #> '{timings}', '{}'::jsonb) || jsonb_build_object(
+             'local', coalesce(request_observation_json #> '{timings,local}', '{}'::jsonb) || jsonb_build_object(
+               'firstTokenMs', 100,
+               'latencyMs', 500))))
          where id = $1",
     )
     .bind(id)

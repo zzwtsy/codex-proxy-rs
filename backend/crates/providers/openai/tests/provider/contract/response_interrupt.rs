@@ -1,7 +1,7 @@
-//! 验证响应中断使用当前连接并在复用前释放控制权
+//! 验证未知控制帧和迟到中断使用原连接，并在复用时撤销旧执行控制权
 
 use super::*;
-use gateway_core::engine::response_control::{ResponseControl, ResponseInterruptError};
+use gateway_core::engine::response_control::{ResponseControl, ResponseControlUnavailable};
 
 async fn next_json(socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>) -> Value {
     loop {
@@ -46,11 +46,12 @@ fn interrupt_context(control: ResponseControl, previous: Option<&str>) -> Attemp
 }
 
 #[tokio::test]
-async fn response_interrupt_uses_the_active_socket_and_releases_control_before_reuse() {
+async fn response_controls_use_the_original_socket_through_terminal_and_revoke_on_reuse() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (finish, finished) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut socket = accept_codex_test_websocket(socket).await;
@@ -72,6 +73,19 @@ async fn response_interrupt_uses_the_active_socket_and_releases_control_before_r
                 .await
                 .unwrap();
             socket.send(Message::Text(json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial"}).to_string().into())).await.unwrap();
+            let unknown = next_json(&mut socket).await;
+            assert_eq!(
+                unknown,
+                json!({"type":"future.control", "extension":{"mode":"future"}})
+            );
+            socket
+                .send(Message::Text(
+                    json!({"type":"future.ack", "extension":true})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
             let interrupt = next_json(&mut socket).await;
             assert_eq!(
                 interrupt,
@@ -88,10 +102,25 @@ async fn response_interrupt_uses_the_active_socket_and_releases_control_before_r
                 ))
                 .await
                 .unwrap();
+            let late = next_json(&mut socket).await;
+            assert_eq!(
+                late,
+                json!({"type":"response.interrupt", "response_id":id,"mode":"future_mode", "extra":1})
+            );
+            socket
+                .send(Message::Text(
+                    json!({"type":"future.idle_ack", "original":late})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
         }
+        let _ = finished.await;
     });
     let provider = provider_with_base_url(&store, base_url);
     let mut session_state = None;
+    let mut old_control: Option<ResponseControl> = None;
     for id in ["resp_interrupt_a", "resp_interrupt_b"] {
         let control = ResponseControl::default();
         let previous = (id == "resp_interrupt_b").then_some("resp_interrupt_a");
@@ -112,34 +141,62 @@ async fn response_interrupt_uses_the_active_socket_and_releases_control_before_r
             )
             .await
             .unwrap();
-        let mut interrupted = false;
+        let mut unknown_reply = false;
+        let mut sent = false;
         timeout(Duration::from_secs(5), async {
             while let Some(event) = stream.next().await {
                 let event = event.unwrap();
                 if let Some(state) = event.session_update() {
                     session_state = Some(state.clone());
                 }
-                if !interrupted && control.interrupt(id).is_ok() {
-                    assert_eq!(
-                        control.interrupt("resp_foreign"),
-                        Err(ResponseInterruptError::ResponseMismatch)
-                    );
-                    control.interrupt(id).unwrap();
-                    interrupted = true;
+                if !sent {
+                    if let Some(old) = old_control.take() {
+                        assert_eq!(old.send("old control").await, Err(ResponseControlUnavailable));
+                    }
+                    control.send(&json!({"type":"future.control", "extension":{"mode":"future"}}).to_string()).await.unwrap();
+                    control.send(&json!({"type":"response.interrupt", "response_id":id,"mode":"discard_partial_items"}).to_string()).await.unwrap();
+                    sent = true;
                 }
+                unknown_reply |= event.wire_event().and_then(|wire| wire.event_type()) == Some("future.ack");
             }
         })
         .await
-        .expect("interrupt completes the active response");
-        assert!(interrupted);
+        .expect("controls complete the active response");
+        assert!(unknown_reply, "unknown upstream events remain visible");
         assert!(session_state.is_some());
+        let late =
+            json!({"type":"response.interrupt", "response_id":id,"mode":"future_mode", "extra":1});
+        control.send(&late.to_string()).await.unwrap();
+        let reply = timeout(Duration::from_secs(5), control.receive())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            control.interrupt(id),
-            Err(ResponseInterruptError::Unavailable)
+            serde_json::from_str::<Value>(&reply).unwrap(),
+            json!({"type":"future.idle_ack", "original":late})
         );
+        // 取消空闲读取后，下一轮正文必须能继续消费同一个有界接收通道
+        assert!(
+            timeout(Duration::from_millis(10), control.receive())
+                .await
+                .is_err()
+        );
+        old_control = Some(control);
     }
+    finish.send(()).unwrap();
     timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
         .unwrap();
+    let control = old_control.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(5), control.receive())
+            .await
+            .unwrap(),
+        Err(ResponseControlUnavailable)
+    );
+    assert_eq!(
+        control.send("closed connection").await,
+        Err(ResponseControlUnavailable)
+    );
 }

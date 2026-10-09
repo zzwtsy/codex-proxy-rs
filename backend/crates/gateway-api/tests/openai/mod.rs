@@ -323,7 +323,7 @@ fn snapshot_with_client_key(
 }
 
 #[derive(Default)]
-struct TestLifecycle {
+pub(crate) struct TestLifecycle {
     cancellation: gateway_core::lifecycle::CancellationToken,
 }
 

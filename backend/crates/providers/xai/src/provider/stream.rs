@@ -32,6 +32,42 @@ pub(super) struct GrokCompactionStreamAttempt {
     pub(super) reasoning_replay_key: Option<GrokReasoningReplayKey>,
 }
 
+// xAI 的首字要求真实语义输出，结构事件只记首事件时间
+fn observe_output_timings(
+    observation: &mut ProviderResponseObservation,
+    events: &[ProviderEvent],
+    started_at: Instant,
+) -> bool {
+    if events.is_empty() {
+        return false;
+    }
+    let previous = observation.timings();
+    let mut timings = previous;
+    let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    timings.first_event_ms.get_or_insert(elapsed_ms);
+    for event in events.iter().flat_map(ProviderEvent::canonical_facts) {
+        match event {
+            GatewayEvent::ReasoningDelta(delta) if !delta.text.is_empty() => {
+                timings.first_reasoning_ms.get_or_insert(elapsed_ms);
+                timings.first_token_ms.get_or_insert(elapsed_ms);
+            }
+            GatewayEvent::TextDelta(delta) if !delta.text.is_empty() => {
+                timings.first_text_ms.get_or_insert(elapsed_ms);
+                timings.first_token_ms.get_or_insert(elapsed_ms);
+            }
+            GatewayEvent::ToolCallDelta(delta) if !delta.arguments_delta.is_empty() => {
+                timings.first_token_ms.get_or_insert(elapsed_ms);
+            }
+            _ => {}
+        }
+    }
+    if timings == previous {
+        return false;
+    }
+    *observation = observation.clone().with_timings(timings);
+    true
+}
+
 fn append_middleware_grok_headers(
     target: &mut Vec<crate::transport::GrokHeader>,
     headers: &[MiddlewareHeader],
@@ -243,6 +279,9 @@ pub(super) fn cold_compaction_http_sse_stream(
                     return;
                 }
             };
+            if observe_output_timings(&mut observation, &events, context.timing_started_at()) {
+                yield ProviderEvent::observation(observation.clone());
+            }
             for event in events {
                 summary.observe(&event).map_err(map_compaction_decode_error)?;
                 facts.observe(&event);
@@ -268,6 +307,9 @@ pub(super) fn cold_compaction_http_sse_stream(
                     return;
                 }
             };
+            if observe_output_timings(&mut observation, &events, context.timing_started_at()) {
+                yield ProviderEvent::observation(observation.clone());
+            }
             for event in events {
                 summary.observe(&event).map_err(map_compaction_decode_error)?;
                 facts.observe(&event);
@@ -555,6 +597,9 @@ pub(super) fn cold_http_sse_stream(
                     return;
                 }
             };
+            if observe_output_timings(&mut observation, &events, context.timing_started_at()) {
+                yield ProviderEvent::observation(observation.clone());
+            }
             if let Some(model) = decoder.response_model()
                 && observation.upstream_response_model() != Some(model)
             {
@@ -609,6 +654,9 @@ pub(super) fn cold_http_sse_stream(
                 return;
             }
         };
+        if observe_output_timings(&mut observation, &final_events, context.timing_started_at()) {
+            yield ProviderEvent::observation(observation.clone());
+        }
         let completed = final_events
             .iter()
             .flat_map(ProviderEvent::canonical_facts)

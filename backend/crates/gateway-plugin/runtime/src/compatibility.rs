@@ -1,8 +1,4 @@
-//! 有期限的插件合同适配；旧字段只在此边界出现，不进入 Core 或持久化模型
-
-mod fast;
-
-pub(crate) use fast::FastSettings;
+//! 插件合同弃用声明、管理端提示与加载日志
 
 use std::sync::OnceLock;
 
@@ -26,7 +22,7 @@ struct Deprecation {
 fn declarations() -> Result<&'static [Deprecation], AdminError> {
     static DECLARATIONS: OnceLock<Result<Vec<Deprecation>, serde_json::Error>> = OnceLock::new();
     DECLARATIONS
-        .get_or_init(|| serde_json::from_str(include_str!("../../plugin-api-deprecations.json")))
+        .get_or_init(|| serde_json::from_str(include_str!("../plugin-api-deprecations.json")))
         .as_deref()
         .map_err(|_| AdminError::internal("插件接口弃用声明不合法"))
 }

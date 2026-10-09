@@ -3,7 +3,11 @@
 mod account_isolation;
 mod capacity;
 mod error_details;
+mod image_account_eligibility;
+mod image_model_access;
+mod passthrough;
 mod precommit;
+mod privacy;
 mod response_interrupt;
 mod session_binding;
 mod timing;
@@ -773,7 +777,10 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
     let provider = provider_with_base_url(&store, "http://upstream.invalid".to_owned());
     let original = json!({"model":"gpt-5.4", "input":[
         {"role":"user", "content":[{"type":"input_text", "text":"<environment_context><timezone>UTC</timezone></environment_context>"}], "internal_chat_message_metadata_passthrough":{"content_item_kinds":["environments.environment_context"], "create_time":1789293131.822}},
-        {"role":"user", "content":[{"type":"input_text", "text":"<environment_context><timezone>UTC</timezone></environment_context>"}], "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}}
+        {"role":"user", "content":[{"type":"input_text", "text":"<environment_context><timezone>UTC</timezone></environment_context>"}], "internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}},
+        {"role":"user", "content":[{"type":"input_text", "text":"<environment_context><timezone>UTC</timezone></environment_context>"}]},
+        {"role":"developer", "content":[{"type":"input_text", "text":"<codex_apps_client_time_context><timezone>UTC</timezone></codex_apps_client_time_context>"}], "internal_chat_message_metadata_passthrough":{"content_item_kinds":["additional_content.codex_apps_client_time_context"]}},
+        {"role":"developer", "content":[{"type":"input_text", "text":"<codex_apps_client_time_context><timezone>UTC</timezone></codex_apps_client_time_context>"}]}
     ], "tools":[{"type":"web_search"}]});
     let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
         ProtocolPayload::json_object("openai", original.as_object().unwrap().clone())
@@ -797,6 +804,9 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
         let expected = expected.unwrap_or("UTC");
         assert_eq!(body.pointer("/input/0/content/0/text"), Some(&json!(format!("<environment_context><timezone>{expected}</timezone></environment_context>"))));
         assert_eq!(body.pointer("/input/1/content/0/text"), original.pointer("/input/1/content/0/text"));
+        assert_eq!(body.pointer("/input/2/content/0/text"), body.pointer("/input/0/content/0/text"));
+        assert_eq!(body.pointer("/input/3/content/0/text"), Some(&json!(format!("<codex_apps_client_time_context><timezone>{expected}</timezone></codex_apps_client_time_context>"))));
+        assert_eq!(body.pointer("/input/4/content/0/text"), body.pointer("/input/3/content/0/text"));
         assert_eq!(body.pointer("/input/0/internal_chat_message_metadata_passthrough/create_time"), Some(&json!(1789293131.822)));
     }
     assert_eq!(first_proxy.received_requests().await.unwrap().len(), 2);
@@ -1872,6 +1882,72 @@ async fn provider_should_send_the_request_snapshot_location_to_the_upstream() {
     assert_eq!(
         body.pointer("/input/0/internal_chat_message_metadata_passthrough/create_time"),
         Some(&json!(1789293131.822))
+    );
+}
+
+#[tokio::test]
+async fn provider_should_override_unclassified_time_contexts_over_websocket() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let base_url = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept websocket");
+        let mut socket = accept_codex_test_websocket(socket).await;
+        let message = socket.next().await.expect("request").expect("valid frame");
+        let body: Value = serde_json::from_str(message.to_text().expect("text")).expect("JSON");
+        socket.send(Message::Text(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_location", "model": "gpt-5.4", "status": "completed", "output": []}
+        }).to_string().into())).await.expect("complete response");
+        body
+    });
+    let environment = "<environment_context><cwd>/home/example/项目</cwd><timezone>Asia/Shanghai</timezone></environment_context>";
+    let desktop = "<codex_apps_client_time_context><timezone>Asia/Shanghai</timezone></codex_apps_client_time_context>";
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": environment}]},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": desktop}]}
+            ],
+            "tools": [{"type": "web_search"}]
+        }).as_object().expect("request object").clone(),
+    )
+    .expect("payload")
+    .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))]));
+    let mut stream = provider_with_base_url(&store, base_url)
+        .execute(
+            planned_request(
+                "openai",
+                Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+            ),
+            context_with_state_owner("req_ws_location", "acct_provider_contract"),
+        )
+        .await
+        .expect("provider stream");
+    while let Some(event) = stream.next().await {
+        event.expect("successful websocket response");
+    }
+    let body = server.await.expect("server");
+    assert_eq!(
+        body.pointer("/input/1/content/0/text"),
+        Some(&json!(desktop.replace("Asia/Shanghai", "Pacific/Auckland")))
+    );
+    assert_eq!(
+        body.pointer("/input/0/content/0/text"),
+        Some(&json!(
+            environment.replace("Asia/Shanghai", "Pacific/Auckland")
+        ))
+    );
+    assert_eq!(
+        body.pointer("/tools/0/user_location/timezone"),
+        Some(&json!("Pacific/Auckland"))
+    );
+    assert!(
+        body.pointer("/input/0/internal_chat_message_metadata_passthrough")
+            .is_none()
     );
 }
 
@@ -7912,6 +7988,7 @@ async fn responses_should_observe_and_bill_the_outbound_service_tier_on_both_tra
             let response_frames = format!(
                 "event: response.created\ndata: {created}\n\nevent: response.completed\ndata: {completed}\n\n"
             );
+            let expected_messages = vec![created.to_string(), completed.to_string()];
             let (base_url, http_server, websocket_server) = if use_websocket {
                 let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
                 let base_url = format!("http://{}", listener.local_addr().expect("address"));
@@ -8002,6 +8079,7 @@ async fn responses_should_observe_and_bill_the_outbound_service_tier_on_both_tra
             let mut observations = Vec::new();
             let mut costs = Vec::new();
             let mut raw_response = Vec::new();
+            let mut raw_messages = Vec::new();
             while let Some(event) = stream.next().await {
                 let event = event.expect("provider event");
                 if let Some(observation) = event.response_observation() {
@@ -8014,6 +8092,12 @@ async fn responses_should_observe_and_bill_the_outbound_service_tier_on_both_tra
                 }
                 if let Some(frame) = event.wire_event().and_then(|wire| wire.raw_sse_frame()) {
                     raw_response.extend_from_slice(frame);
+                }
+                if let Some(message) = event
+                    .wire_event()
+                    .and_then(|wire| wire.raw_websocket_message())
+                {
+                    raw_messages.push(message.to_owned());
                 }
             }
             let outbound = if let Some(server) = http_server {
@@ -8067,7 +8151,11 @@ async fn responses_should_observe_and_bill_the_outbound_service_tier_on_both_tra
                 expected_cost.into_iter().collect::<Vec<_>>(),
                 "WebSocket={use_websocket}, requested={requested:?}, reported={reported:?}"
             );
-            assert_eq!(raw_response, response_frames.as_bytes());
+            if use_websocket {
+                assert_eq!(raw_messages, expected_messages);
+            } else {
+                assert_eq!(raw_response, response_frames.as_bytes());
+            }
         }
     }
 }
@@ -9505,7 +9593,7 @@ async fn exact_websocket_busy_then_replay_scope_relaxation_is_rejected_before_se
 }
 
 #[tokio::test]
-async fn continuation_prefetch_over_128_kib_should_commit_wire_without_protocol_failure() {
+async fn continuation_prefetch_over_128_kib_should_wait_for_grace_without_protocol_failure() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_prefetch_limit").await;
     let padding = "x".repeat(128 * 1024);
@@ -9523,7 +9611,7 @@ async fn continuation_prefetch_over_128_kib_should_commit_wire_without_protocol_
     );
     assert!(body.len() > 128 * 1024);
     let (base_url, release, _first_chunk_sent, server) =
-        paused_chunked_sse_server(body, String::new()).await;
+        paused_chunked_sse_server(body.clone(), String::new()).await;
     let mut stream = provider_with_base_url(&store, base_url)
         .execute(
             planned_request("openai", http_generate_operation()),
@@ -9532,25 +9620,52 @@ async fn continuation_prefetch_over_128_kib_should_commit_wire_without_protocol_
         )
         .await
         .expect("prepare provider stream");
-    let visible = loop {
-        let event = timeout(Duration::from_secs(1), stream.next())
+    let visible = {
+        let next_visible = async {
+            loop {
+                let event = stream
+                    .next()
+                    .await
+                    .expect("provider stream remains open")
+                    .expect("large prefetch cannot create a protocol failure");
+                if event.has_client_event() {
+                    break event;
+                }
+            }
+        };
+        tokio::pin!(next_visible);
+        assert!(
+            timeout(Duration::from_secs(1), next_visible.as_mut())
+                .await
+                .is_err(),
+            "large structural events must remain buffered during the grace period"
+        );
+        timeout(Duration::from_secs(3), next_visible)
             .await
-            .expect("prefetch threshold must release buffered wire")
-            .expect("provider stream remains open")
-            .expect("threshold cannot create a protocol failure");
-        if event.has_client_event() {
-            break event;
-        }
+            .expect("grace expiry must release buffered wire")
     };
 
     assert_eq!(
         visible.wire_event().and_then(|wire| wire.event_type()),
         Some("response.created")
     );
+    let mut wire = visible
+        .wire_event()
+        .unwrap()
+        .raw_sse_frame()
+        .unwrap()
+        .to_vec();
     release.send(()).expect("finish upstream response");
     while let Some(event) = stream.next().await {
-        event.expect("clean upstream EOF cannot become a protocol failure");
+        if let Some(frame) = event
+            .expect("clean upstream EOF cannot become a protocol failure")
+            .wire_event()
+            .and_then(|wire| wire.raw_sse_frame())
+        {
+            wire.extend_from_slice(frame);
+        }
     }
+    assert_eq!(wire, body.as_bytes());
     server.await.expect("chunked SSE server");
 }
 
@@ -10650,17 +10765,16 @@ async fn assert_websocket_failure_headers(headers: Value, request_id: Option<&st
             .iter()
             .filter_map(|event| event.wire_event()?.event_type())
             .collect::<Vec<_>>(),
-        vec![event_type],
-        "original failure stays atomically deliverable",
+        vec!["response.metadata", event_type],
+        "original metadata and failure stay atomically deliverable",
     );
     let wire = events
         .iter()
-        .find_map(|event| event.wire_event()?.raw_sse_frame())
+        .filter_map(|event| event.wire_event())
+        .find(|wire| wire.event_type() == Some(event_type))
+        .and_then(|wire| wire.raw_websocket_message())
         .expect("raw frame");
-    assert_eq!(
-        wire.as_ref(),
-        format!("event: {event_type}\ndata: {raw}\n\n").as_bytes()
-    );
+    assert_eq!(wire, raw);
 }
 
 #[tokio::test]

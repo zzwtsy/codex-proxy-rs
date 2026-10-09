@@ -79,14 +79,13 @@ async fn stream_failure(stream: &mut ProviderStream) -> (Vec<ProviderEvent>, Pro
 }
 
 #[tokio::test]
-async fn large_structural_events_preserve_overload_replay_past_the_old_grace_on_http_and_websocket()
-{
+async fn large_structural_events_preserve_overload_replay_on_http_and_websocket() {
     for websocket in [false, true] {
         let store = Arc::new(MemoryAccountStore::default());
         create_account(&store, "acct_provider_contract").await;
-        // #259 仅保留了事件长度；用合成配置回显复现尺寸，不依赖现场私有正文
-        let created = structural_event("response.created", 38_781);
-        let progress = structural_event("response.in_progress", 38_785);
+        // 大段配置回显不应提前结束重试窗口；使用合成正文覆盖单帧与累计的大体积前导事件
+        let created = structural_event("response.created", 300 * 1024);
+        let progress = structural_event("response.in_progress", 300 * 1024);
         let failure = overload();
         let expected = vec![created.clone(), progress.clone(), failure.clone()];
         let (base_url, release, server) = if websocket {
@@ -160,8 +159,8 @@ async fn large_structural_events_preserve_overload_replay_past_the_old_grace_on_
 async fn later_structural_events_do_not_extend_grace_and_late_overload_is_not_replayable() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
-    let created = sse(&structural_event("response.created", 38_781));
-    let progress = sse(&structural_event("response.in_progress", 38_785));
+    let created = sse(&structural_event("response.created", 96 * 1024));
+    let progress = sse(&structural_event("response.in_progress", 96 * 1024));
     let expected_bytes = created.len() + progress.len();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -220,21 +219,20 @@ async fn immediate_release_preserves_wire_and_records_the_boundary_once() {
     for (reason, body) in [
         (
             "semantic_output",
-            sse(&structural_event("response.created", 512)) + &sse(&semantic),
+            sse(&structural_event("response.created", 300 * 1024)) + &sse(&semantic),
         ),
         (
             "semantic_output",
-            sse(&structural_event("response.created", 512)) + &sse(&tool),
+            sse(&structural_event("response.created", 300 * 1024)) + &sse(&tool),
         ),
         (
             "terminal",
-            sse(&structural_event("response.created", 512)) + &sse(&terminal),
+            sse(&structural_event("response.created", 300 * 1024)) + &sse(&terminal),
         ),
         (
-            "byte_limit",
-            sse(&structural_event("response.created", 129 * 1024)),
+            "eof",
+            sse(&structural_event("response.created", 300 * 1024)),
         ),
-        ("eof", sse(&structural_event("response.created", 512))),
     ] {
         let store = Arc::new(MemoryAccountStore::default());
         create_account(&store, "acct_provider_contract").await;
@@ -274,11 +272,7 @@ async fn immediate_release_preserves_wire_and_records_the_boundary_once() {
         let releases = releases(&trace);
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0]["data"]["reason"], reason);
-        if reason == "byte_limit" {
-            assert!(releases[0]["data"]["prefetchedBytes"].as_u64().unwrap() > 128 * 1024);
-        } else {
-            assert_eq!(releases[0]["data"]["prefetchedBytes"], body.len());
-        }
+        assert_eq!(releases[0]["data"]["prefetchedBytes"], body.len());
         server.await.unwrap();
     }
 }
@@ -288,7 +282,7 @@ async fn cancelling_buffered_structural_events_does_not_release_or_offer_replay(
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
     let (base_url, release, _, server) = paused_chunked_sse_server(
-        sse(&structural_event("response.created", 38_781)),
+        sse(&structural_event("response.created", 300 * 1024)),
         String::new(),
     )
     .await;

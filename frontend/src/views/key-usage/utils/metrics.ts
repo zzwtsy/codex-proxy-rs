@@ -1,5 +1,6 @@
 import type { KeyUsageMetrics } from '@/api/modules/key-usage'
 import { ArrowDown, ArrowUp, Brain, Database, Sparkles } from '@lucide/vue'
+import { usageFreshInputTokens } from '@/components/usage/shared/presenter'
 
 // 卡片、曲线和图例共用语义与主题色，避免同一指标出现不同颜色。
 export const keyUsageTokenMetrics = [
@@ -12,11 +13,6 @@ export const keyUsageTokenMetrics = [
 
 export function keyUsageTokenValue(metrics: KeyUsageMetrics, key: typeof keyUsageTokenMetrics[number]['key']) {
   return key === 'inputTokens'
-    ? freshInput(metrics.inputTokens, metrics.cachedTokens, metrics.cacheWriteTokens)
+    ? usageFreshInputTokens(metrics.inputTokens, metrics.cachedTokens, metrics.cacheWriteTokens)
     : metrics[key]
-}
-
-function freshInput(input: number, cached: number, written: number) {
-  // 输入总量已经包含缓存读写，不把缓存再次计入消耗。
-  return Math.max(0, input - cached - written)
 }

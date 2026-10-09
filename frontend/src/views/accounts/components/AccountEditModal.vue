@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
 
-import type { Account, AccountGroup, AccountModelAccess } from '@/api'
+import type { Account, AccountGroupRef, AccountModelAccess } from '@/api'
 
 import { BaseButton, BaseFormItem, BaseModal, BaseSegmented, BaseTextarea } from '@codex-proxy/ui'
 import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
@@ -13,7 +13,7 @@ import AccountSettingsFields from './AccountSettingsFields.vue'
 
 defineProps<{
   account: Account | null
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
   groupsLoading: boolean
   saving: boolean
   configurationLoading: boolean

@@ -790,6 +790,8 @@ async fn completed_observation_contains_terminal_cost_timings_and_failure() {
             )
             .with_timings(ModelRequestTimings {
                 first_text_ms: Some(12),
+                upstream_response_ms: Some(7_000),
+                upstream_engine_iapi_tbt_ms: Some(2.450638),
                 latency_ms: Some(34),
                 ..ModelRequestTimings::default()
             }),
@@ -802,6 +804,11 @@ async fn completed_observation_contains_terminal_cost_timings_and_failure() {
     assert_eq!(observed["usage"]["cost"]["total"]["amount"], "0.0123");
     assert_eq!(observed["usage"]["cost"]["total"]["currency"], "USD");
     assert_eq!(observed["usage"]["timings"]["first_text_ms"], 12);
+    assert_eq!(observed["usage"]["timings"]["upstream_response_ms"], 7_000);
+    assert_eq!(
+        observed["usage"]["timings"]["upstream_engine_iapi_tbt_ms"],
+        2.450638
+    );
     assert_eq!(observed["usage"]["timings"]["latency_ms"], 34);
     assert_eq!(observed["usage"]["failure"]["outcome"], "failed");
     assert_eq!(observed["usage"]["failure"]["attempt_count"], 2);

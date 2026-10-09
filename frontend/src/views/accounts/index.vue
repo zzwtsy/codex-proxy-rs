@@ -309,7 +309,9 @@ const {
             </template>
 
             <template #planType="{ row }">
-              <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+              <div class="flex min-w-0 justify-center">
+                <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+              </div>
             </template>
 
             <template #usage="{ row }">

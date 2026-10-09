@@ -17,7 +17,7 @@ use gateway_core::{
 ///
 /// 组条件采用“任一命中”；同一 Key 可以同时属于多个组，因此不同组集合不能单独证明两个
 /// 调度绑定互斥
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct BindingScope {
     client_keys: BTreeSet<ClientApiKeyId>,
     account_groups: BTreeSet<AccountGroupId>,

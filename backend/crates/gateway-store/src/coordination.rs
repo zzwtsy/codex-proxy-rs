@@ -461,16 +461,29 @@ fn oauth_pending_invalid(operation: &'static str) -> ProviderStoreError {
 pub enum CredentialLeaseScope {
     Provider,
     ProviderAccount,
+    ProviderAccountReserved,
     OAuthRefreshCapacity,
     OAuthRefresh,
     ProviderTask,
 }
 
 impl CredentialLeaseScope {
+    pub(crate) const fn scheduling(
+        pool: gateway_core::provider_ports::ProviderConcurrencyPool,
+    ) -> Self {
+        match pool {
+            gateway_core::provider_ports::ProviderConcurrencyPool::Shared => Self::ProviderAccount,
+            gateway_core::provider_ports::ProviderConcurrencyPool::Reserved => {
+                Self::ProviderAccountReserved
+            }
+        }
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Provider => "provider",
             Self::ProviderAccount => "account",
+            Self::ProviderAccountReserved => "account-reserved",
             Self::OAuthRefreshCapacity => "refresh-capacity",
             Self::OAuthRefresh => "refresh",
             Self::ProviderTask => "task",
@@ -509,7 +522,13 @@ impl CredentialBoundedLeaseRequest {
     pub fn validate(&self) -> StoreResult<()> {
         require_nonempty("credential bounded lease", "resource_id", &self.resource_id)?;
         require_nonempty("credential bounded lease", "owner_id", &self.owner_id)?;
-        if self.max_concurrent == 0 && self.scope != CredentialLeaseScope::ProviderAccount {
+        if self.max_concurrent == 0
+            && !matches!(
+                self.scope,
+                CredentialLeaseScope::ProviderAccount
+                    | CredentialLeaseScope::ProviderAccountReserved
+            )
+        {
             return Err(invalid("max_concurrent must be positive"));
         }
         supported_duration(self.request_interval, true, "request interval")?;

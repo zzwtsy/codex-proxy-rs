@@ -26,6 +26,7 @@ const TURN_ID_CLIENT_METADATA_KEY: &str = "turn_id";
 const THREAD_SPAWN_SUBAGENT_KIND: &str = "thread_spawn";
 const THREAD_SPAWN_CONVERSATION_PREFIX: &str = "thread-spawn:";
 const ENVIRONMENT_CONTEXT_CONTENT_KIND: &str = "environments.environment_context";
+const DESKTOP_TIME_CONTEXT_CONTENT_KIND: &str = "additional_content.codex_apps_client_time_context";
 
 const CROSS_ACCOUNT_IDENTITY_KEYS: &[&str] = &[
     "authorization",
@@ -130,14 +131,14 @@ pub(crate) fn align_structured_location_fields(
     now: DateTime<Utc>,
     location: &CodexRequestLocation,
 ) {
-    // 只改写带环境标记的日期和时区；epoch 时间戳保持绝对时间原值
+    // 环境与 Desktop 时间上下文使用同一位置；epoch 时间戳保持绝对时间原值
     let current_date = now
         .with_timezone(&location.timezone)
         .format("%Y-%m-%d")
         .to_string();
     if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
         for item in input {
-            align_environment_context(item, &current_date, location.timezone.name());
+            align_time_context(item, &current_date, location.timezone.name());
         }
     }
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
@@ -147,13 +148,19 @@ pub(crate) fn align_structured_location_fields(
     }
 }
 
-fn align_environment_context(item: &mut Value, current_date: &str, timezone: &str) {
+fn align_time_context(item: &mut Value, current_date: &str, timezone: &str) {
     let Some(item) = item.as_object_mut() else {
         return;
     };
-    if item.get("role").and_then(Value::as_str) != Some("user") {
-        return;
-    }
+    // Desktop 将客户端时间放入独立 developer 上下文，不能只覆盖执行环境的 user 消息
+    let (context_tag, content_kind) = match item.get("role").and_then(Value::as_str) {
+        Some("user") => ("environment_context", ENVIRONMENT_CONTEXT_CONTENT_KIND),
+        Some("developer") => (
+            "codex_apps_client_time_context",
+            DESKTOP_TIME_CONTEXT_CONTENT_KIND,
+        ),
+        _ => return,
+    };
     let content_kinds = item
         .get("internal_chat_message_metadata_passthrough")
         .and_then(Value::as_object)
@@ -169,11 +176,10 @@ fn align_environment_context(item: &mut Value, current_date: &str, timezone: &st
         return;
     };
     for (index, part) in content.iter_mut().enumerate() {
-        if content_kinds
-            .as_ref()
-            .and_then(|kinds| kinds.get(index))
-            .and_then(Option::as_deref)
-            != Some(ENVIRONMENT_CONTEXT_CONTENT_KIND)
+        // 官方自定义 Provider 会移除内容分类，缺省时仍按角色与完整上下文识别
+        // 已有分类保持权威，不能覆盖显式标为普通文本或其他上下文的内容
+        if let Some(kinds) = &content_kinds
+            && kinds.get(index).and_then(Option::as_deref) != Some(content_kind)
         {
             continue;
         }
@@ -186,21 +192,27 @@ fn align_environment_context(item: &mut Value, current_date: &str, timezone: &st
         let Some(Value::String(text)) = part.get_mut("text") else {
             continue;
         };
-        if let Some(aligned) = aligned_environment_context(text, current_date, timezone) {
+        if let Some(aligned) = aligned_time_context(text, context_tag, current_date, timezone) {
             *text = aligned;
         }
     }
 }
 
-fn aligned_environment_context(text: &str, current_date: &str, timezone: &str) -> Option<String> {
+fn aligned_time_context(
+    text: &str,
+    context_tag: &str,
+    current_date: &str,
+    timezone: &str,
+) -> Option<String> {
     let trimmed = text.trim();
-    if !trimmed.starts_with("<environment_context>") || !trimmed.ends_with("</environment_context>")
+    if !trimmed.starts_with(&format!("<{context_tag}>"))
+        || !trimmed.ends_with(&format!("</{context_tag}>"))
     {
         return None;
     }
     let document = Document::parse(text).ok()?;
     let root = document.root_element();
-    if !root.has_tag_name("environment_context") {
+    if !root.has_tag_name(context_tag) {
         return None;
     }
     let mut replacements = root
@@ -600,6 +612,17 @@ fn metadata_string(request: &CodexResponsesRequest, key: &str) -> Option<String>
         .map(ToOwned::to_owned)
 }
 
+pub(crate) fn serialize_ascii_turn_metadata(value: &Value) -> Option<String> {
+    let mut bytes = Vec::new();
+    value
+        .serialize(&mut serde_json::Serializer::with_formatter(
+            &mut bytes,
+            AsciiTurnMetadataFormatter,
+        ))
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 pub(crate) fn scope_turn_metadata(
     raw: &str,
     installation_id: &str,
@@ -636,14 +659,7 @@ pub(crate) fn scope_turn_metadata(
     // Codex 的 turn metadata 同时承载于 HTTP header 与 WS client_metadata
     // 改写安装 ID 后仍须保持官方 to_ascii_json_string 的编码合同；普通
     // to_string 会把中文工作区路径还原成 UTF-8，触发上游 WS metadata 后 Close 1000
-    let mut bytes = Vec::new();
-    metadata
-        .serialize(&mut serde_json::Serializer::with_formatter(
-            &mut bytes,
-            AsciiTurnMetadataFormatter,
-        ))
-        .ok()?;
-    String::from_utf8(bytes).ok()
+    serialize_ascii_turn_metadata(&Value::Object(metadata))
 }
 
 struct AsciiTurnMetadataFormatter;
@@ -755,7 +771,7 @@ fn apply_protocol_context(request: &mut CodexResponsesRequest, context: &Map<Str
     }
 }
 
-fn decode_passthrough_headers(context: &Map<String, Value>) -> HeaderMap {
+pub(crate) fn decode_passthrough_headers(context: &Map<String, Value>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let Some(entries) = context
         .get(PASSTHROUGH_HEADERS_CONTEXT_KEY)

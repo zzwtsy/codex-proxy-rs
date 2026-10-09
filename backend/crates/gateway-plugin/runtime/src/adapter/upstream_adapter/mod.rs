@@ -26,6 +26,7 @@ use crate::{RpcSession, callback::PluginCallbacks};
 
 pub(crate) use registration::{prepare, unavailable_entries, validate_bindings};
 
+#[derive(Clone)]
 pub(crate) struct AdapterEntry {
     instance_id: String,
     scope: BindingScope,

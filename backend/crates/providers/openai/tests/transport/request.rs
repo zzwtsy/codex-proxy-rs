@@ -95,6 +95,188 @@ fn encoder_should_preserve_location_fields_when_no_override_is_configured() {
 }
 
 #[test]
+fn encoder_should_align_official_environment_context_without_content_kinds() {
+    let environment = "<environment_context>\n  <environments>\n    \
+        <environment id=\"local\" primary=\"true\"><cwd>/home/example/project</cwd><shell>bash</shell></environment>\n  \
+        </environments>\n  <current_date>2020-01-01</current_date>\n  \
+        <timezone>Asia/Shanghai</timezone>\n</environment_context>";
+    for metadata in [None, Some(json!({"create_time": 1789293131.822}))] {
+        let mut message = json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Please explain the current environment"},
+                {"type": "input_text", "text": environment}
+            ]
+        });
+        if let Some(metadata) = metadata {
+            message["internal_chat_message_metadata_passthrough"] = metadata;
+        }
+        let body = json!({"input": [message]})
+            .as_object()
+            .expect("request object")
+            .clone();
+        let before = Utc::now()
+            .with_timezone(&New_York)
+            .format("%Y-%m-%d")
+            .to_string();
+        let encoded = encode_generate_request(
+            &request(body.clone()),
+            "gpt-test",
+            Some(&CodexRequestLocation::default()),
+        )
+        .expect("encode unclassified official context");
+        let after = Utc::now()
+            .with_timezone(&New_York)
+            .format("%Y-%m-%d")
+            .to_string();
+        let encoded = Value::Object(encoded.body().clone());
+        let aligned = encoded
+            .pointer("/input/0/content/1/text")
+            .and_then(Value::as_str)
+            .expect("aligned environment");
+        assert!(aligned.contains("<timezone>America/New_York</timezone>"));
+        assert!([before, after].iter().any(|date| {
+            aligned
+                == environment
+                    .replace("2020-01-01", date)
+                    .replace("Asia/Shanghai", "America/New_York")
+        }));
+        let original = Value::Object(body.clone());
+        assert_eq!(
+            encoded.pointer("/input/0/content/0"),
+            original.pointer("/input/0/content/0")
+        );
+        assert_eq!(
+            encoded.pointer("/input/0/internal_chat_message_metadata_passthrough"),
+            original.pointer("/input/0/internal_chat_message_metadata_passthrough")
+        );
+
+        let unchanged = encode_generate_request(&request(body.clone()), "gpt-test", None)
+            .expect("encode without override");
+        assert_eq!(unchanged.body().get("input"), body.get("input"));
+    }
+}
+
+#[test]
+fn encoder_should_align_desktop_time_context_with_environment_dates() {
+    // Desktop Core 0.162.0-alpha.17.2 的应用附加上下文使用 developer role
+    let desktop = " <codex_apps_client_time_context><timezone>Asia/Shanghai</timezone>\n\
+        <current_date>2020-01-01</current_date>\n\
+        Use this client time context for user-facing dates, times, and schedules instead of the execution host's timezone and current date.\
+        </codex_apps_client_time_context>\n";
+    let environment = "<environment_context><current_date>2020-01-01</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+    for kinds in [
+        None,
+        Some(json!([
+            "developer.text",
+            "additional_content.codex_apps_client_time_context"
+        ])),
+    ] {
+        let mut message = json!({
+            "type": "message", "role": "developer",
+            "content": [
+                {"type": "input_text", "text": "Keep Asia/Shanghai in this instruction"},
+                {"type": "input_text", "text": desktop}
+            ],
+            "internal_chat_message_metadata_passthrough": {"create_time": 1789293131.822}
+        });
+        if let Some(kinds) = kinds {
+            message["internal_chat_message_metadata_passthrough"]["content_item_kinds"] = kinds;
+        }
+        let body = json!({"input": [
+            {"role": "user", "content": [{"type": "input_text", "text": environment}]},
+            message
+        ]})
+        .as_object()
+        .expect("request object")
+        .clone();
+        let before = Utc::now()
+            .with_timezone(&New_York)
+            .format("%Y-%m-%d")
+            .to_string();
+        let encoded = encode_generate_request(
+            &request(body.clone()),
+            "gpt-test",
+            Some(&CodexRequestLocation::default()),
+        )
+        .expect("encode Desktop time context");
+        let after = Utc::now()
+            .with_timezone(&New_York)
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(
+            [before, after].iter().any(|date| {
+                let mut expected = body["input"].clone();
+                expected[0]["content"][0]["text"] = json!(
+                    environment
+                        .replace("2020-01-01", date)
+                        .replace("Asia/Shanghai", "America/New_York")
+                );
+                expected[1]["content"][1]["text"] = json!(
+                    desktop
+                        .replace("2020-01-01", date)
+                        .replace("Asia/Shanghai", "America/New_York")
+                );
+                encoded.body().get("input") == Some(&expected)
+            }),
+            "both time contexts must agree while preserving other content and metadata"
+        );
+        let unchanged = encode_generate_request(&request(body.clone()), "gpt-test", None)
+            .expect("encode without override");
+        assert_eq!(unchanged.body().get("input"), body.get("input"));
+    }
+}
+
+#[test]
+fn encoder_should_preserve_text_outside_desktop_time_context() {
+    let desktop = "<codex_apps_client_time_context><timezone>Asia/Shanghai</timezone><current_date>2020-01-01</current_date></codex_apps_client_time_context>";
+    let input = json!([
+        {"role": "user", "content": [{"type": "input_text", "text": desktop}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": desktop}]},
+        {"type": "function_call_output", "call_id": "synthetic", "output": desktop},
+        {"role": "developer", "content": [{"type": "input_text", "text": desktop}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["user.text"]}},
+        {"role": "developer", "content": [{"type": "input_text", "text": desktop}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["environments.environment_context"]}},
+        {"role": "developer", "content": [{"type": "input_text", "text": desktop}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": []}},
+        {"role": "developer", "content": [{"type": "input_text", "text": format!("Example:\n{desktop}")}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": format!("{desktop}\nKeep this example")}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": "<codex_apps_client_time_context><timezone>Asia/Shanghai</codex_apps_client_time_context>"}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": "<other_context><timezone>Asia/Shanghai</timezone></other_context>"}]},
+        {"role": "developer", "content": [{"type": "output_text", "text": desktop}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": "<codex_apps_client_time_context><example><timezone>Asia/Shanghai</timezone><current_date>2020-01-01</current_date></example></codex_apps_client_time_context>"}]}
+    ]);
+    let encoded = encode_generate_request(
+        &request(Map::from_iter([("input".to_owned(), input.clone())])),
+        "gpt-test",
+        Some(&CodexRequestLocation::default()),
+    )
+    .expect("encode without changing unrelated content");
+    assert_eq!(encoded.body().get("input"), Some(&input));
+}
+
+#[test]
+fn encoder_should_preserve_classified_text_and_non_user_environment_items() {
+    let environment =
+        "<environment_context><timezone>Asia/Shanghai</timezone></environment_context>";
+    let input = json!([
+        {"role": "user", "content": [{"type": "input_text", "text": environment}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["user.text"]}},
+        {"role": "user", "content": [{"type": "input_text", "text": environment}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["future.context"]}},
+        {"role": "user", "content": [{"type": "input_text", "text": environment}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": []}},
+        {"role": "developer", "content": [{"type": "input_text", "text": environment}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": environment}]},
+        {"type": "function_call_output", "call_id": "synthetic", "output": environment},
+        {"role": "user", "content": [{"type": "input_text", "text": "<environment_context><timezone>Asia/Shanghai</timezone>"}]}
+    ]);
+    let encoded = encode_generate_request(
+        &request(Map::from_iter([("input".to_owned(), input.clone())])),
+        "gpt-test",
+        Some(&CodexRequestLocation::default()),
+    )
+    .expect("encode without changing non-environment content");
+    assert_eq!(encoded.body().get("input"), Some(&input));
+}
+
+#[test]
 fn encoder_should_preserve_openai_wire_fields_without_deriving_accountless_pool_identity() {
     let body = Map::from_iter([
         ("model".to_owned(), json!("client-model")),
@@ -185,6 +367,7 @@ fn encoder_should_patch_model_and_preserve_supported_generate_semantics() {
 fn encoder_should_align_structured_location_fields_without_rewriting_chat_text() {
     let normal_chat = "<environment_context>\n  <current_date>2026-09-13</current_date>\n  \
         <timezone>Asia/Shanghai</timezone>\n</environment_context>";
+    let quoted_context = format!("Please explain this example:\n```xml\n{normal_chat}\n```");
     let body = json!({
         "model": "client-model",
         "input": [
@@ -211,7 +394,7 @@ fn encoder_should_align_structured_location_fields_without_rewriting_chat_text()
             {
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": normal_chat}]
+                "content": [{"type": "input_text", "text": quoted_context}]
             }
         ],
         "tools": [
@@ -281,7 +464,7 @@ fn encoder_should_align_structured_location_fields_without_rewriting_chat_text()
     );
     assert_eq!(
         encoded.pointer("/input/2/content/0/text"),
-        Some(&json!(normal_chat))
+        Some(&json!(quoted_context))
     );
     assert_eq!(
         encoded.pointer("/input/0/internal_chat_message_metadata_passthrough/create_time"),

@@ -16,8 +16,9 @@ use gateway_admin::model::{
     PageSize,
     account_groups::{
         AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupColor, AccountGroupListQuery,
-        AccountGroupMutation, AccountGroupPage, AccountGroupRecord, AccountGroupUsage,
-        CreateAccountGroup, DeleteAccountGroup, SetAccountGroupEnabled, UpdateAccountGroup,
+        AccountGroupMutation, AccountGroupOptionsPage, AccountGroupPage, AccountGroupRecord,
+        AccountGroupUsage, CreateAccountGroup, DeleteAccountGroup, SetAccountGroupEnabled,
+        UpdateAccountGroup,
     },
 };
 use gateway_core::{account::FastMode, routing::AccountGroupId};
@@ -212,6 +213,38 @@ struct AccountGroupPageData {
     config_revision: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountGroupOptionsPageData {
+    items: Vec<AccountGroupRefView>,
+    page: PageMeta,
+    config_revision: u64,
+}
+
+impl From<AccountGroupOptionsPage> for AccountGroupOptionsPageData {
+    fn from(page: AccountGroupOptionsPage) -> Self {
+        let total_pages = if page.total == 0 {
+            0
+        } else {
+            page.total.div_ceil(u64::from(page.page_size))
+        };
+        Self {
+            items: page
+                .items
+                .into_iter()
+                .map(AccountGroupRefView::from)
+                .collect(),
+            page: PageMeta::new(
+                page.page,
+                u32::from(page.page_size),
+                page.total,
+                u32::try_from(total_pages).unwrap_or(u32::MAX),
+            ),
+            config_revision: page.config_revision.get(),
+        }
+    }
+}
+
 impl From<(AccountGroupPage, crate::time::TimePresenter)> for AccountGroupPageData {
     fn from((page, time): (AccountGroupPage, crate::time::TimePresenter)) -> Self {
         let total_pages = if page.total == 0 {
@@ -263,11 +296,32 @@ where
 {
     Router::new()
         .route("/api/admin/account-groups", get(list::<S>))
+        .route("/api/admin/account-groups/options", get(list_options::<S>))
         .route("/api/admin/account-groups/create", post(create::<S>))
         .route("/api/admin/account-groups/update", post(update::<S>))
         .route("/api/admin/account-groups/enable", post(enable::<S>))
         .route("/api/admin/account-groups/disable", post(disable::<S>))
         .route("/api/admin/account-groups/delete", post(delete::<S>))
+}
+
+async fn list_options<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<ListAccountGroupsQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let result = state
+        .admin_services()
+        .account_groups()
+        .list_options(query.into_command().map_err(map_wire_error)?)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(AccountGroupOptionsPageData::from(result)),
+    ))
 }
 
 async fn list<S>(

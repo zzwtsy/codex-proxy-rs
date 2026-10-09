@@ -539,7 +539,7 @@ pub(crate) async fn dashboard_account_usage(
                 mr.image_input_tokens, mr.image_output_tokens,
                 mr.image_generation_succeeded, mr.total_tokens, mr.cost_source,
                 mr.cost_currency, mr.cost_amount
-           from model_requests mr left join provider_accounts pa on pa.id = mr.provider_account_ref
+           from model_request_observations mr left join provider_accounts pa on pa.id = mr.provider_account_ref
           where mr.started_at_us >= ",
     );
     statement.push_bind(query_start_us);
@@ -706,7 +706,7 @@ pub(crate) async fn usage_overview(
     }
     let mut events = QueryBuilder::<Sqlite>::new(
         "select oe.failure_kind, oe.status_code from ops_events oe
-         join model_requests mr on mr.id = oe.model_request_id where ",
+         join model_request_observations mr on mr.id = oe.model_request_id where ",
     );
     push_range(&mut events, "mr", range);
     events.push(" and mr.recovered_at_us is null");
@@ -765,7 +765,7 @@ pub(crate) async fn usage_diagnostics(
     query.push(
         " as dimension_name, mr.*, account.provider_kind as account_provider_kind,
                 account.plan_type as account_plan_type, key.name as api_key_name
-           from model_requests mr
+           from model_request_observations mr
            left join provider_accounts account on account.id = mr.provider_account_ref
            left join client_api_keys key on key.id = mr.client_api_key_ref
           where ",
@@ -1103,7 +1103,7 @@ fn metric_records<'a>(
                     mr.total_tokens, mr.cost_source, mr.cost_amount, mr.cost_currency,
                     mr.latency_ms, mr.first_token_ms, mr.admission_decision_ms,
                     mr.account_selection_wait_ms, mr.capacity_used_slots, mr.capacity_total_slots
-               from model_requests mr where ",
+               from model_request_observations mr where ",
         );
         push_range(&mut query, "mr", range);
         query.push(" and mr.recovered_at_us is null");
@@ -1183,7 +1183,7 @@ pub(crate) async fn dashboard_totals(pool: &SqlitePool) -> StoreResult<Dashboard
                 coalesce(sum(case when {fact} then coalesce(input_tokens, 0) else 0 end), 0) as input_tokens,
                 coalesce(sum(case when {fact} then coalesce(cached_tokens, 0) else 0 end), 0) as cached_tokens,
                 coalesce(sum(case when {fact} then coalesce(total_tokens, 0) else 0 end), 0) as total_tokens
-           from model_requests mr where mr.recovered_at_us is null"
+           from model_request_observations mr where mr.recovered_at_us is null"
     )))
     .fetch_one(pool)
     .await
@@ -1191,7 +1191,7 @@ pub(crate) async fn dashboard_totals(pool: &SqlitePool) -> StoreResult<Dashboard
     let mut billing = gateway_core::metering::Decimal::ZERO;
     let mut has_billing = false;
     let mut costs = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "select mr.cost_amount from model_requests mr
+        "select mr.cost_amount from model_request_observations mr
           where mr.recovered_at_us is null and ({fact})
             and mr.cost_currency = 'USD' and mr.cost_amount is not null"
     )))
@@ -1228,7 +1228,7 @@ pub(crate) fn calculated_billing_facts(
             "select mr.started_at_us, mr.provider_kind, mr.upstream_model_id, mr.service_tier,
                     mr.input_tokens, mr.output_tokens, mr.cached_tokens, mr.cache_write_tokens,
                     mr.billing_snapshot_json, mr.cost_currency, mr.cost_amount
-               from model_requests mr where ",
+               from model_request_observations mr where ",
         );
         push_range(&mut query, "mr", range);
         query.push(" and mr.cost_source = 'calculated' and mr.cost_amount is not null

@@ -2,7 +2,7 @@
 import type { AccountAuthorizationView } from '../../composables/useAccountAuthorization'
 import type { AccountCreateForm, AccountImportMode } from '../../utils/accountCreate'
 
-import type { Account, AccountGroup } from '@/api'
+import type { Account, AccountGroupRef } from '@/api'
 import { Openai, Xai } from '@boxicons/vue'
 import { BaseButton, BaseIconButton, BaseModal, BaseSegmented } from '@codex-proxy/ui'
 import { Copy, LayoutGrid, Settings2 } from '@lucide/vue'
@@ -21,7 +21,7 @@ import AccountSetupFields from './AccountSetupFields.vue'
 import { resolveAccountCreatePresentation } from './presenter'
 
 const props = withDefaults(defineProps<{
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
   groupsLoading: boolean
   saving?: boolean
   oauthLoading?: boolean

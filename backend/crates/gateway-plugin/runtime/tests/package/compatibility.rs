@@ -43,9 +43,9 @@ fn host_compatibility_requires_the_trusted_middleware_contract() {
             .expect("compatibility JSON");
     assert!(!compatibility.supports_capability("middleware", 1));
     assert!(!compatibility.supports_capability("middleware", 2));
-    assert!(compatibility.supports_capability("middleware", 3));
+    assert!(!compatibility.supports_capability("middleware", 3));
     assert!(compatibility.supports_capability("middleware", 4));
-    assert!(compatibility.supports_capability("upstream_adapter", 1));
+    assert!(!compatibility.supports_capability("upstream_adapter", 1));
     assert!(compatibility.supports_capability("upstream_adapter", 2));
     assert!(!compatibility.supports_capability("openai", 1));
 }
@@ -81,7 +81,7 @@ async fn package_inspector_returns_static_requirements_without_starting_the_plug
 }
 
 #[tokio::test]
-async fn deprecated_contracts_are_loadable_and_only_old_versions_receive_notices() {
+async fn retired_contracts_remain_loadable_with_compatibility_warnings() {
     for legacy in [false, true] {
         let mut middleware = crate::support::contribution(
             Capability::Middleware,
@@ -105,13 +105,19 @@ async fn deprecated_contracts_are_loadable_and_only_old_versions_receive_notices
         );
         let inspector =
             PackageInspector::new(PackageLimits::default(), semver::Version::new(1, 0, 0));
-        let artifact = inspector.inspect(archive, None).await.unwrap();
+        let artifact = inspector.inspect(archive.clone(), None).await.unwrap();
         let notices = inspector.api_deprecations(&artifact.metadata).unwrap();
-        assert_eq!(notices.len(), if legacy { 2 } else { 0 });
-        for notice in notices {
-            assert!(notice.replacement_version > notice.version);
-            assert!(!notice.migration.is_empty());
-            assert!(notice.remaining_releases <= 7);
+        assert!(notices.is_empty());
+        let warning = inspector
+            .compatibility_warning(archive, artifact.metadata.sha256)
+            .await
+            .unwrap();
+        if legacy {
+            let warning = warning.expect("retired contracts must remain visible");
+            assert!(warning.contains("middleware v3"));
+            assert!(warning.contains("upstream_adapter v1"));
+        } else {
+            assert!(warning.is_none());
         }
     }
 }
@@ -136,4 +142,22 @@ async fn host_and_capability_version_mismatches_are_warnings_only() {
         .unwrap();
     assert!(warning.contains("middleware v99"));
     assert!(warning.contains("3.19.0"));
+}
+
+#[tokio::test]
+async fn compatibility_warning_rejects_invalid_packages_and_digest_mismatches() {
+    let inspector = PackageInspector::new(PackageLimits::default(), semver::Version::new(1, 0, 0));
+    let archive = crate::support::package_with_contributions(b"fixture", Contributions::new());
+    let error = inspector
+        .compatibility_warning(archive, "0".repeat(64))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Invalid);
+    let invalid: std::sync::Arc<[u8]> = b"invalid archive".as_slice().into();
+    let digest = hex::encode(Sha256::digest(invalid.as_ref()));
+    let error = inspector
+        .compatibility_warning(invalid, digest)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Invalid);
 }

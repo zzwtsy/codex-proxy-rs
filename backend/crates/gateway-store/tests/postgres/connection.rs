@@ -5,6 +5,90 @@ use std::error::Error as _;
 use super::*;
 
 #[tokio::test]
+async fn cancelled_transaction_begin_should_return_a_clean_connection_to_the_pool() {
+    let Some(database_url) = crate::support::test_env("CPR_TEST_DATABASE_URL") else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let observer = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let lock = i64::from_le_bytes(Uuid::new_v4().as_bytes()[..8].try_into().unwrap());
+    sqlx::query("select pg_advisory_lock($1)")
+        .bind(lock)
+        .execute(&observer)
+        .await
+        .unwrap();
+    let pending_pool = pool.clone();
+    let begin = tokio::spawn(async move {
+        pending_pool
+            .begin_with(sqlx::AssertSqlSafe(format!(
+                "begin; select pg_advisory_xact_lock({lock})"
+            )))
+            .await
+    });
+    // 等服务端进入 BEGIN 的同一次往返再取消，避免依赖客户端调度时机
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "select coalesce(wait_event = 'advisory', false) from pg_stat_activity where pid=$1",
+            )
+            .bind(pid)
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("BEGIN must reach PostgreSQL before cancellation");
+    begin.abort();
+    assert!(begin.await.unwrap_err().is_cancelled());
+    sqlx::query("select pg_advisory_unlock($1)")
+        .bind(lock)
+        .execute(&observer)
+        .await
+        .unwrap();
+
+    // 重新借出意味着池已处理被取消语句及待回滚帧；必须复用干净的原连接
+    let mut connection = tokio::time::timeout(Duration::from_secs(5), pool.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    let reused_pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("select state from pg_stat_activity where pid=$1")
+        .bind(pid)
+        .fetch_one(&observer)
+        .await
+        .unwrap();
+    drop(connection);
+    pool.close().await;
+    observer.close().await;
+
+    assert_eq!(reused_pid, pid);
+    assert_eq!(
+        state, "idle",
+        "cancelled BEGIN must not leak its transaction"
+    );
+}
+
+#[tokio::test]
 async fn invalid_postgres_options_preserve_the_sqlx_source() {
     let error = gateway_store::postgres::connect_and_migrate(
         "postgres://localhost:invalid-port/test",
@@ -159,6 +243,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "client_api_keys",
             "client_key_budget_windows",
             "client_key_charge_events",
+            "model_request_observations",
             "model_requests",
             "ops_events",
             "outbound_proxies",
@@ -187,14 +272,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
     assert_eq!(response_id_types, ["bytea", "bytea"]);
     assert!(!raw_response_id_index_exists);
     assert!(!legacy_key_provider_column_exists);
-    assert_eq!(
-        routing_history_columns,
-        [
-            "routing_group_names_snapshot",
-            "routing_group_refs",
-            "routing_scope",
-        ]
-    );
+    assert!(routing_history_columns.is_empty());
 }
 
 #[test]

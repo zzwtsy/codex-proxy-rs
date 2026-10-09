@@ -4,13 +4,14 @@ import type { UsageListRecord } from '@/api'
 import { Archive, ArrowDown, ArrowUp } from '@lucide/vue'
 
 import { computed } from 'vue'
+import { usageTokenDetails } from '@/components/usage/shared/presenter'
 import UsageDetailPopover from '@/components/usage/UsageDetailPopover.vue'
 
 const props = defineProps<{
   record: Pick<UsageListRecord, 'tokenDetails'>
 }>()
 
-const tokenDetails = computed(() => props.record.tokenDetails)
+const tokenDetails = computed(() => usageTokenDetails(props.record.tokenDetails))
 const tokenItems = computed(() => [
   { label: '输入 Token', value: tokenDetails.value.inputTokensDisplay },
   { label: '输出 Token', value: tokenDetails.value.outputTokensDisplay },

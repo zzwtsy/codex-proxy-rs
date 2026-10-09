@@ -132,7 +132,7 @@ fn installation_checks_protocol_engine_and_target() {
 fn capability_contract_versions_are_checked_independently_of_rpc_version() {
     let mut manifest = packaged_manifest();
     assert!(manifest.validate().is_ok());
-    for version in [0, 1, 2, 5, u32::MAX] {
+    for version in [0, 1, 2, 3, 5, u32::MAX] {
         manifest
             .contributes
             .get_mut(&Capability::Middleware)
@@ -152,6 +152,29 @@ fn capability_contract_versions_are_checked_independently_of_rpc_version() {
             output_formats: vec![],
         },
     );
+    assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
+}
+
+#[test]
+fn retired_upstream_contract_requires_an_author_upgrade() {
+    let mut manifest = source_manifest();
+    manifest.contributes.clear();
+    manifest.contributes.insert(
+        Capability::UpstreamAdapter,
+        ContributionDeclaration {
+            id: "9acme.request-tags.upstream".into(),
+            version: 2,
+            stages: vec![Stage::Upstream],
+            input_formats: vec!["openai".into()],
+            output_formats: vec!["openai".into()],
+        },
+    );
+    assert!(manifest.validate().is_ok());
+    manifest
+        .contributes
+        .get_mut(&Capability::UpstreamAdapter)
+        .unwrap()
+        .version = 1;
     assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
 }
 

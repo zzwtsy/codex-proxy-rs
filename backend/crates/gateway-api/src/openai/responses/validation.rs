@@ -209,6 +209,11 @@ impl ResponsesDeliveryValidator {
         transformed: bool,
         facts: &ResponseValidationFacts,
     ) -> Result<(), ResponseValidationError> {
+        // 未改写的未知载荷不参与本地关联判断，不能因旁路解析失败截断原流
+        // 插件实际改写的载荷仍须满足交付合同
+        if parsed.is_err() && !transformed {
+            return Ok(());
+        }
         if !self.active && !transformed {
             if parsed.and_then(|frame| self.state.apply(frame)).is_err() {
                 self.invalid_prefix = true;
@@ -253,7 +258,7 @@ impl ResponsesDeliveryValidator {
                     return Err(ResponseValidationError);
                 }
             }
-            ParsedFrame::Event { .. } | ParsedFrame::Done => {}
+            ParsedFrame::Event { .. } | ParsedFrame::Done | ParsedFrame::NonEvent => {}
         }
         self.state.apply(parsed)
     }
@@ -292,6 +297,7 @@ impl ResponsesDeliveryValidator {
 enum ParsedFrame {
     Event { event_type: String, value: Value },
     Done,
+    NonEvent,
 }
 
 impl ParsedFrame {
@@ -301,6 +307,10 @@ impl ParsedFrame {
             return Ok(Self::Done);
         }
         let mut events = parse_sse_events(frame).map_err(|_| ResponseValidationError)?;
+        // 注释和仅含 SSE 元数据的帧不承载响应业务事实
+        if events.is_empty() {
+            return Ok(Self::NonEvent);
+        }
         if events.len() != 1 {
             return Err(ResponseValidationError);
         }
@@ -363,6 +373,9 @@ struct DeliveryState {
 
 impl DeliveryState {
     fn apply(&mut self, frame: ParsedFrame) -> Result<(), ResponseValidationError> {
+        if matches!(frame, ParsedFrame::NonEvent) {
+            return Ok(());
+        }
         if self.done {
             return Err(ResponseValidationError);
         }

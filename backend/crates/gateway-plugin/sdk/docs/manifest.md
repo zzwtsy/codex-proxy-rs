@@ -18,8 +18,7 @@
 
 作者清单不能包含 `package`。使用 `Manifest::from_author_slice()` 校验并规范化；直接反序列化的 `Manifest`
 不会执行作者清单的 ID 与固定阶段推导，声明的可选字段仍使用其默认值。打包后，`main` 和所有资源都必须进入 `package.files`；宿主用
-`package_for(host, os, architecture)` 检查版本与平台。运行模式仅为 `trustedProcess`：插件拥有与宿主
-相同的系统身份，**不是进程沙箱**
+`package_for(host, os, architecture)` 检查版本与平台。运行模式为 `trustedProcess`，信任边界见[完整信任](#完整信任)
 
 宿主实际开放的合同由 [plugin-host-compatibility.json](../../runtime/plugin-host-compatibility.json)
 声明，SDK 的 `Capability::contract_versions()` 只表示 SDK 能描述的行为版本，不能代替宿主支持检查
@@ -33,28 +32,25 @@
 
 `capabilities` 使用扩展能力标识；Provider、模型和账号 ID 不属于这个集合
 
-当前清单、进程协议和宿主兼容声明的格式版本均为 `2`。清单不接受 `permissions` 字段；使用其他格式版本的包须用匹配的 SDK 和 CLI 重新构建
+清单、进程协议和宿主兼容声明的格式版本均为 `2`；清单不接受 `permissions` 字段
 
 安装包清单校验与已安装元数据读取是两个边界：清单拒绝未知字段，并检查必需字段、类型和版本；
-数据库元数据允许的字段增减见[持久化规则](../../../../../docs/architecture.md#发布与执行边界)，不改变清单或 RPC 合同。
-插件依赖新增接口或字段时，应通过 `engines.codex-proxy-rs` 声明所需宿主版本。宿主范围和能力版本不匹配时持续提示风险，仍可尝试启动；包结构、平台与 RPC 封装校验失败仍阻止加载。CLI 的作者校验保持严格，不支持的能力合同须使用匹配的 SDK 构建
+数据库元数据的读取规则见[制品与发布](../../../../../docs/architecture.md#制品配置与发布)，不改变清单或 RPC 合同。
+`engines.codex-proxy-rs` 声明插件所需的宿主范围。范围或能力版本不匹配时持续提示风险，允许尝试启动；包结构、平台与 RPC 封装校验失败阻止加载。CLI 严格校验作者声明是否符合 SDK 支持的合同
 
 ## 接口弃用
 
-新合同与旧合同并行提供，管理端和插件加载日志会提示旧合同及迁移方式。新合同首次正式发布后，旧合同至少再兼容 7 个正式版本；主版本、次版本和补丁版本各计一次，alpha、beta、rc、exp 及同版本重试不计
+当前支持范围由[宿主兼容声明](../../runtime/plugin-host-compatibility.json)给出，弃用状态、剩余兼容窗口及作者说明以[弃用清单](../../runtime/plugin-api-deprecations.json)为准，管理端和加载日志展示同一提示
 
-剩余窗口由宿主发行物中的 [弃用清单](../../runtime/plugin-api-deprecations.json) 给出，不通过版本号差值推算。窗口内提供旧合同转换；窗口结束后移除转换和支持声明，所有旧合同插件都应升级 SDK、处理器与清单再重新打包。仍允许尝试启动，但不再保证兼容，不按实际读取过哪些字段判断
+执行设置与来源使用 `fast_mode` 的 `default`、`enabled`、`disabled` 三态，宿主不转换旧 `disable_fast` 字段。
+使用 `middleware v3` 或 `upstream_adapter v1` 的插件需按当前 SDK 更新字段处理、升级能力版本并重新构建，仅修改版本声明不能替代迁移
 
-| 旧合同 | 替代合同 | 迁移内容 |
-| --- | --- | --- |
-| middleware v3 | middleware v4 | 执行设置及 `settings_sources.execution` 中的 `disable_fast` 改为 `fast_mode` 三态 |
-| upstream_adapter v1 | upstream_adapter v2 | 使用新版 `UpstreamAdapterRequest.fast_mode`，同步更新 SDK 和贡献版本 |
-
-旧布尔投影仅在 `disabled` 时为 `true`，`default` 和 `enabled` 均为 `false`。旧中间件原样回传布尔值时保留实际三态，修改其他设置不会丢失 `enabled`；实际从 `true` 改为 `false` 时设为 `default`。旧接口不能表达强制开启，需升级合同使用三态
+兼容窗口自替代合同首次正式发布起至少覆盖 7 个后续正式版本；主版本、次版本和补丁版本各计一次，预发行与同标签重试不计。
+窗口内提供适配，窗口外不保证兼容；是否使用过特定字段不改变判断，版本号差值也不能代替清单中的计数
 
 ## 扩展项简写
 
-作者声明可以省略 `id` 和固定阶段；默认版本为 `1`，新中间件显式选择版本 `4`，新版上游适配器 SDK 使用版本 `2`：
+作者声明可以省略 `id` 和固定阶段；普通能力的版本默认为 `1`，`middleware` 显式声明版本 `4`，`upstream_adapter` 显式声明版本 `2`：
 
 ```json
 {
@@ -71,7 +67,7 @@
 }
 ```
 
-默认扩展项 ID 为 `<publisher>.<name>.<capability-kebab>`。middleware v3 与 upstream_adapter v1 在[弃用窗口](#接口弃用)内仍可加载。除 `middleware` 外，阶段由
+默认扩展项 ID 为 `<publisher>.<name>.<capability-kebab>`。除 `middleware` 外，阶段由
 capability 固定并由工具生成：
 
 | 阶段 | 能力 |
@@ -83,7 +79,7 @@ capability 固定并由工具生成：
 | `management` / `command_line` | `management` / `command_line` |
 | `maintenance` | `maintenance` |
 
-`observer` 使用一个处理器接收完成与上游 WebSocket 事件，实例绑定按 `event` 选择订阅类型；具体合同见[观察事件](capabilities.md#路由调度与观察)。宿主仅接受 `observer` 声明；使用 `request_lifecycle`、`usage` 或 `web_socket_observer` 声明的插件须更新清单、处理器与绑定后重新打包
+`observer` 使用一个处理器接收完成与上游 WebSocket 事件，实例绑定按 `event` 选择订阅类型；具体合同见[观察事件](capabilities.md#路由调度与观察)
 
 `middleware` 必须从 `http`、`websocket`、`service`、`request`、`attempt` 中显式选择挂载；同一处理器可覆盖多个边界，协议格式等真实业务选择也不能省略。
 安装清单若携带不同的固定阶段会被拒绝，而不是在加载时静默改写

@@ -127,9 +127,9 @@ fn host_config_derives_update_paths_from_runtime_data_dir() {
 }
 
 #[test]
-fn host_config_rejects_zero_drain_window() {
+fn host_config_rejects_zero_worker_shutdown_window() {
     let mut config = valid_config();
-    config.drain_timeout_seconds = 0;
+    config.worker_shutdown_timeout_seconds = 0;
 
     assert!(
         config
@@ -223,7 +223,6 @@ fn valid_config() -> HostConfig {
             request_dump_retention_days: 1,
         },
         system_update,
-        drain_timeout_seconds: 30,
         worker_shutdown_timeout_seconds: 30,
     }
 }

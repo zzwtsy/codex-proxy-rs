@@ -55,6 +55,13 @@ export interface UsageBilling {
 }
 
 export interface UsageLatencyDetails {
+  upstreamResponseMs?: number
+  upstreamApiOverheadMs?: number
+  upstreamEngineMs?: number
+  upstreamEngineIapiTtftMs?: number
+  upstreamEngineServiceTtftMs?: number
+  upstreamEngineIapiTbtMs?: number
+  upstreamEngineServiceTbtMs?: number
   admissionDecisionMs?: number
   accountSelectionWaitMs?: number
   capacityUsedSlots?: number
@@ -65,7 +72,6 @@ export interface UsageLatencyDetails {
   firstEventMs?: number
   firstReasoningMs?: number
   firstTextMs?: number
-  firstTokenMs?: number
   openaiProcessingMs?: number
 }
 
@@ -140,7 +146,6 @@ export interface UsageRecord {
   responseId: string | null
   upstreamRequestId: string | null
   latencyMs: number | null
-  firstTokenMs: number | null
   inputTokens: number | null
   outputTokens: number | null
   cachedTokens: number | null
@@ -164,7 +169,6 @@ export interface UsageRecord {
   costs: UsageCost[]
   costCoverage: UsageCostCoverage
   firstTokenLatencyMs: number | null
-  firstTokenLatencyMsDisplay: string
   latencyMsDisplay: string
   logicalOutcome: string
 }

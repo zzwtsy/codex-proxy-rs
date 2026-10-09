@@ -11,18 +11,6 @@ pub(super) struct ToolNormalizer {
     server_search_eager: bool,
 }
 
-pub(super) struct NormalizedInputItems {
-    items: Vec<Value>,
-    loaded_tools: Vec<Value>,
-    visible_tools: Vec<Value>,
-}
-
-pub(super) struct NormalizedToolSearchOutput {
-    history: Map<String, Value>,
-    loaded_tools: Vec<Value>,
-    visible_tools: Vec<Value>,
-}
-
 impl ToolNormalizer {
     pub(super) fn new() -> Self {
         Self {
@@ -55,10 +43,13 @@ impl ToolNormalizer {
     ) -> Result<GrokResponseTransform, GrokRequestEncodeError> {
         let (tools, had_tools) =
             optional_array(payload.get("tools")).map_err(|error| error.at_field("tools"))?;
-        if had_tools {
-            self.response.visible_tools.clone_from(&tools);
-        }
-        let client_search = inspect_tool_search(&tools).map_err(|error| error.at_field("tools"))?;
+        // 先收敛历史中的增量声明，再生成别名和响应转换事实，避免旧 schema 残留
+        let input_tools = collect_input_tool_declarations(payload.get("input"))
+            .map_err(|error| error.at_field("input"))?;
+        self.response.visible_tools =
+            merge_tool_declarations(tools.iter().chain(&input_tools).cloned().collect());
+        let client_search = inspect_tool_search(&tools).map_err(|error| error.at_field("tools"))?
+            || inspect_tool_search(&input_tools).map_err(|error| error.at_field("input"))?;
         self.normalize_client_search_parallel(payload, client_search)
             .map_err(|error| error.at_field("parallel_tool_calls"))?;
 
@@ -69,14 +60,18 @@ impl ToolNormalizer {
                     .map_err(|error| error.at_field("tools"))?,
             );
         }
+        for raw_tool in &input_tools {
+            normalized_tools.extend(
+                self.normalize_tool(raw_tool, "", client_search, true)
+                    .map_err(|error| error.at_field("input"))?,
+            );
+        }
 
         if let Some(Value::Array(items)) = payload.get("input") {
             let normalized = self
                 .normalize_input_items(items)
                 .map_err(|error| error.at_field("input"))?;
-            normalized_tools.extend(normalized.loaded_tools);
-            self.response.visible_tools.extend(normalized.visible_tools);
-            payload.insert("input".to_owned(), Value::Array(normalized.items));
+            payload.insert("input".to_owned(), Value::Array(normalized));
         } else if payload
             .get("input")
             .is_some_and(|input| !input.is_null() && !input.is_string())
@@ -251,6 +246,8 @@ impl ToolNormalizer {
         let alias = self.alias(ToolIdentity::new(ToolKind::Function, namespace, name));
         if let Some(schema) = function_schema {
             self.response.function_schemas.insert(alias.clone(), schema);
+        } else {
+            self.response.function_schemas.remove(&alias);
         }
         converted.insert("name".to_owned(), Value::String(alias));
         Ok(vec![Value::Object(converted)])
@@ -513,11 +510,70 @@ pub(super) fn short_tool_hash(value: &str) -> String {
 
 pub(super) fn dedupe_normalized_tools(tools: Vec<Value>) -> Vec<Value> {
     let mut result = Vec::with_capacity(tools.len());
-    let mut seen = BTreeSet::new();
+    let mut positions = BTreeMap::new();
     for tool in tools {
-        if normalized_tool_dedupe_key(&tool).is_none_or(|key| seen.insert(key)) {
-            result.push(tool);
+        if let Some(key) = normalized_tool_dedupe_key(&tool) {
+            if let Some(&index) = positions.get(&key) {
+                result[index] = tool;
+                continue;
+            }
+            positions.insert(key, result.len());
         }
+        result.push(tool);
+    }
+    result
+}
+
+fn collect_input_tool_declarations(
+    input: Option<&Value>,
+) -> Result<Vec<Value>, GrokRequestEncodeError> {
+    let mut declarations = Vec::new();
+    for item in input.and_then(Value::as_array).into_iter().flatten() {
+        if !matches!(
+            item.get("type").and_then(Value::as_str).map(str::trim),
+            Some("additional_tools" | "tool_search_output")
+        ) {
+            continue;
+        }
+        let tools = item
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or(GrokRequestEncodeError::InvalidRequestNormalization)?;
+        declarations.extend(tools.iter().cloned());
+    }
+    Ok(merge_tool_declarations(declarations))
+}
+
+/// 官方增量声明按名字覆盖，namespace 只更新本次声明的成员，保留其他成员
+fn merge_tool_declarations(tools: Vec<Value>) -> Vec<Value> {
+    let mut result: Vec<Value> = Vec::with_capacity(tools.len());
+    let mut positions = BTreeMap::<String, usize>::new();
+    for mut tool in tools {
+        let key = match tool.get("type").and_then(Value::as_str) {
+            Some("namespace" | "function" | "custom") => tool
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| format!("name:{name}")),
+            _ => normalized_tool_dedupe_key(&tool),
+        };
+        if let Some(key) = key {
+            if let Some(&index) = positions.get(&key) {
+                let previous = &result[index];
+                if previous.get("type").and_then(Value::as_str) == Some("namespace")
+                    && tool.get("type").and_then(Value::as_str) == Some("namespace")
+                    && let Some(previous_members) = previous.get("tools").and_then(Value::as_array)
+                    && let Some(members) = tool.get_mut("tools").and_then(Value::as_array_mut)
+                {
+                    let mut combined = previous_members.clone();
+                    combined.append(members);
+                    *members = merge_tool_declarations(combined);
+                }
+                result[index] = tool;
+                continue;
+            }
+            positions.insert(key, result.len());
+        }
+        result.push(tool);
     }
     result
 }
@@ -918,10 +974,8 @@ impl ToolNormalizer {
     fn normalize_input_items(
         &mut self,
         items: &[Value],
-    ) -> Result<NormalizedInputItems, GrokRequestEncodeError> {
+    ) -> Result<Vec<Value>, GrokRequestEncodeError> {
         let mut rewritten = Vec::with_capacity(items.len());
-        let mut loaded_tools = Vec::new();
-        let mut visible_tools = Vec::new();
         for raw_item in items {
             let Some(item) = raw_item.as_object() else {
                 rewritten.push(raw_item.clone());
@@ -960,10 +1014,7 @@ impl ToolNormalizer {
                     rewritten.push(Value::Object(self.normalize_tool_search_call(item)?));
                 }
                 "tool_search_output" => {
-                    let normalized = self.normalize_tool_search_output(item)?;
-                    rewritten.push(Value::Object(normalized.history));
-                    loaded_tools.extend(normalized.loaded_tools);
-                    visible_tools.extend(normalized.visible_tools);
+                    rewritten.push(Value::Object(self.normalize_tool_search_output(item)?));
                 }
                 "custom_tool_call" => {
                     rewritten.push(Value::Object(self.normalize_custom_tool_call_input(item)?));
@@ -988,22 +1039,14 @@ impl ToolNormalizer {
                 "compaction_trigger" => {
                     return Err(GrokRequestEncodeError::InvalidRequestNormalization);
                 }
-                "additional_tools" => {
-                    let (tools, visible) = self.normalize_additional_tools_input(item)?;
-                    loaded_tools.extend(tools);
-                    visible_tools.extend(visible);
-                }
+                "additional_tools" => {}
                 "" => rewritten.push(raw_item.clone()),
                 unsupported => {
                     rewritten.push(unsupported_input_history_boundary(item, unsupported))
                 }
             }
         }
-        Ok(NormalizedInputItems {
-            items: rewritten,
-            loaded_tools,
-            visible_tools,
-        })
+        Ok(rewritten)
     }
 
     fn normalize_message_input(
@@ -1269,7 +1312,7 @@ impl ToolNormalizer {
     fn normalize_tool_search_output(
         &mut self,
         item: &Map<String, Value>,
-    ) -> Result<NormalizedToolSearchOutput, GrokRequestEncodeError> {
+    ) -> Result<Map<String, Value>, GrokRequestEncodeError> {
         let execution = string_field(item, "execution").trim().to_ascii_lowercase();
         if !matches!(execution.as_str(), "" | "client" | "server") {
             return Err(GrokRequestEncodeError::InvalidRequestNormalization);
@@ -1279,10 +1322,6 @@ impl ToolNormalizer {
             .get("tools")
             .and_then(Value::as_array)
             .ok_or(GrokRequestEncodeError::InvalidRequestNormalization)?;
-        let mut normalized = Vec::new();
-        for tool in tools {
-            normalized.extend(self.normalize_tool(tool, "", false, true)?);
-        }
         let message = format!(
             "Tool search completed; {} selected tool definitions are now available.",
             tools.len()
@@ -1300,11 +1339,7 @@ impl ToolNormalizer {
             self.server_search_eager = true;
             boundary_message(&message)
         };
-        Ok(NormalizedToolSearchOutput {
-            history,
-            loaded_tools: normalized,
-            visible_tools: tools.clone(),
-        })
+        Ok(history)
     }
 
     fn normalize_apply_patch_call_input(
@@ -1323,21 +1358,6 @@ impl ToolNormalizer {
             ("name".to_owned(), Value::String(alias)),
             ("arguments".to_owned(), Value::String(arguments)),
         ]))
-    }
-
-    fn normalize_additional_tools_input(
-        &mut self,
-        item: &Map<String, Value>,
-    ) -> Result<(Vec<Value>, Vec<Value>), GrokRequestEncodeError> {
-        let tools = item
-            .get("tools")
-            .and_then(Value::as_array)
-            .ok_or(GrokRequestEncodeError::InvalidRequestNormalization)?;
-        let mut normalized = Vec::new();
-        for raw_tool in tools {
-            normalized.extend(self.normalize_tool(raw_tool, "", false, true)?);
-        }
-        Ok((normalized, tools.clone()))
     }
 }
 

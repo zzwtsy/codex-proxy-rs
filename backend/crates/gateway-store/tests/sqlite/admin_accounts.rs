@@ -732,17 +732,10 @@ async fn sqlite_account_usage_aggregates_exact_costs_and_sorts_accounts() {
         let start = now - 60_000_000;
         sqlx::query(
             "insert into model_requests (
-               id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-               client_transport, requested_model_id, provider_kind, upstream_model_id,
-               provider_account_ref, upstream_transport, attempt_count, upstream_send_state,
-               downstream_committed_at_us, outcome, client_status_code, input_tokens,
-               output_tokens, total_tokens, cost_source, cost_amount, cost_currency,
-               started_at_us, deadline_at_us, completed_at_us, routing_scope
+               id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, upstream_model_id, provider_account_ref, upstream_transport, attempt_count, upstream_send_state, downstream_committed_at_us, outcome, client_status_code, input_tokens, output_tokens, total_tokens, cost_source, cost_amount, cost_currency, started_at_us, deadline_at_us, completed_at_us, request_observation_json
              ) values (
-               ?1, 'key_test', 1, 'openai', 'generate', '/v1/responses',
-               'http_sse', 'public-model', 'example', 'upstream-model',
-               ?2, 'websocket', 1, 'sent', ?3, 'succeeded', 200, ?4,
-               0, ?4, 'provider_reported', ?5, 'USD', ?6, ?7, ?7, 'all'
+               ?1, 'key_test', 'generate', 'http_sse', 'public-model', 'example', 'upstream-model', ?2, 'websocket', 1, 'sent', ?3, 'succeeded', 200, ?4, 0, ?4, 'provider_reported', ?5, 'USD', ?6, ?7, ?7,
+               json_object('request', json_object('configRevision', 1, 'protocol', 'openai', 'endpoint', '/v1/responses', 'compact', json('false')), 'routing', json_object('scope', 'all', 'groupRefs', json('[]'), 'groupNamesSnapshot', json('[]')))
              )",
         )
         .bind(request_id)

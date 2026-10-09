@@ -86,7 +86,6 @@ fn request_feature(
 
 pub(crate) struct MiddlewareInvocation {
     instance_id: String,
-    settings_contract: crate::compatibility::FastSettings,
     capabilities_allowed: bool,
     transport: ClientTransport,
     state: Mutex<InvocationState>,
@@ -141,28 +140,27 @@ impl MiddlewareInvocation {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .original_request
-            .settings()
-            .map(|settings| self.settings_contract.execution(settings))
-            .unwrap_or(Ok(serde_json::Value::Null))
+        serde_json::to_value(
+            state
+                .original_request
+                .settings()
+                .and_then(|settings| settings.execution_values()),
+        )
+        .map_err(|_| invalid())
     }
 
-    pub(crate) fn settings_sources(&self) -> Result<serde_json::Value, PluginFault> {
+    pub(crate) fn settings_sources(&self) -> serde_json::Value {
         self.request_settings()
-            .map(|settings| self.settings_contract.sources(&settings))
-            .unwrap_or(Ok(serde_json::Value::Null))
+            .map_or(serde_json::Value::Null, |settings| settings.inspect())
     }
     pub(crate) fn new(
         context: &MiddlewareContext,
         request: MiddlewareRequest,
         next: MiddlewareNext,
         instance_id: String,
-        settings_contract: crate::compatibility::FastSettings,
     ) -> Arc<Self> {
         Arc::new(Self {
             instance_id,
-            settings_contract,
             capabilities_allowed: context.mount()
                 == gateway_core::engine::middleware::MiddlewareMount::Request
                 && context.operation() == Some(gateway_core::operation::OperationKind::Generate),
@@ -343,7 +341,7 @@ impl MiddlewareInvocation {
                     "execution settings are not available at this middleware boundary",
                 )
             })?;
-            let values = self.settings_contract.decode(settings, current)?;
+            let values = serde_json::from_value(settings).map_err(|_| invalid())?;
             let updated = current
                 .replace_execution(&values, &self.instance_id)
                 .map_err(|_| invalid())?;

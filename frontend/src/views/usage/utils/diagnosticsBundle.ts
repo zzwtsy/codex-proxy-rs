@@ -1,6 +1,12 @@
 import type { OpsError, UsageRecordDetail } from '@/api'
 import { failureClassText } from './opsErrorPresentation'
 
+const precommitReleaseReasons = new Set(['semantic_output', 'terminal', 'byte_limit', 'grace_timeout', 'eof'])
+
+function nonNegativeInteger(value: unknown) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
 export function requestDiagnosticsBundle(
   requestId: string,
   detail: UsageRecordDetail | null,
@@ -14,7 +20,7 @@ export function requestDiagnosticsBundle(
   const request = record ?? error
 
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     source: 'usage.request_diagnostics',
     exportPolicy: 'allowlisted_fields_without_payloads',
     request: {
@@ -53,7 +59,7 @@ export function requestDiagnosticsBundle(
           createdAt: error.createdAt,
         }
       : null,
-    // 只导出 Core 从错误类型生成的分类，正文与其他事件 data 不进入诊断包
+    // 只导出失败分类与缓存释放事实的白名单，正文与任意事件 data 不进入诊断包
     trace: trace
       ? {
           schemaVersion: trace.schemaVersion,
@@ -76,6 +82,15 @@ export function requestDiagnosticsBundle(
                   stage: event.data.diagnostic?.stage ?? null,
                   code: event.data.diagnostic?.code ?? null,
                   upstreamStatus: event.data.upstreamStatus,
+                }
+              : null,
+            precommitRelease: event.stage === 'provider.precommit.released'
+              ? {
+                  reason: typeof event.data.reason === 'string' && precommitReleaseReasons.has(event.data.reason)
+                    ? event.data.reason
+                    : null,
+                  prefetchedBytes: nonNegativeInteger(event.data.prefetchedBytes),
+                  waitMs: nonNegativeInteger(event.data.waitMs),
                 }
               : null,
           })),
@@ -111,8 +126,8 @@ export function requestDiagnosticsBundle(
         ? 'unknown'
         : !trace
             ? 'not_recorded'
-            : trace.events.some(event => event.stage === 'attempt.failed')
-              ? 'stages_and_failure_classifications'
+            : trace.events.some(event => event.stage === 'attempt.failed' || event.stage === 'provider.precommit.released')
+              ? 'stages_and_allowlisted_facts'
               : 'stages_only',
       traceEventsDropped: trace?.droppedEvents ?? null,
       attemptsComplete: record?.attemptsComplete ?? null,
@@ -126,16 +141,16 @@ export function requestDiagnosticsBundle(
       'attempts.providerErrorCode',
       'request.message',
       'request.metadata',
-      'trace.events.data_except_failure_classification',
+      'trace.events.data_except_failure_classification_and_precommit_release',
       'request_and_response_headers_and_bodies',
       'user_supplied_model_names',
       'account_names_emails_and_credential_names',
       'client_ip_user_agent_and_api_key',
     ],
     notes: [
-      'schemaVersion 3 仅供人工排障，null 表示未知或未采集，不代表没有发生错误',
+      'schemaVersion 4 仅供人工排障，null 表示未知、未采集或未通过导出校验，不代表没有发生错误',
       '错误摘要只使用稳定分类，不含上游错误码或原文，error 为 null 时请结合 attempts 的分类与状态',
-      '时间线导出阶段、顺序、计时及 Core 记录的失败分类，不含错误原文和其他事件 data',
+      '时间线导出阶段、顺序、计时、Core 记录的失败分类和 Provider 缓存释放的原因、预取字节数及等待毫秒数，不含错误原文和其他事件 data',
       'attemptsComplete 不为 true 时，尝试列表不完整，没有时间线的旧记录无法补回未采集事件',
       '未自动采集网关版本、客户端版本、部署环境和故障发生时区，请另行补充',
       '关联 ID 仍可能属于内部信息，分享前请审阅，原始错误、正文和日志需另行审阅脱敏，勿直接公开',

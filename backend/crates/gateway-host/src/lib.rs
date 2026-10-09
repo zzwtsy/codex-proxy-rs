@@ -164,7 +164,7 @@ impl HostBundle {
         Ok(())
     }
 
-    /// 进程唯一阻塞点；返回前完成 HTTP drain 与 worker join
+    /// 进程唯一阻塞点；停止 HTTP 监听后完成 worker join
     pub async fn serve(self, router: Router) -> Result<(), HostError> {
         let result = serve_router(
             router,
@@ -172,7 +172,6 @@ impl HostBundle {
             self.config.listen.port,
             self.cancellation.clone(),
             Arc::clone(&self.connections),
-            self.config.drain_timeout(),
         )
         .await;
         self.cancellation.cancel();
@@ -181,7 +180,7 @@ impl HostBundle {
             .await;
         match &result {
             Ok(()) => {
-                tracing::info!(target: "gateway_shutdown", pid = std::process::id(), "HTTP 服务与后台任务已停止")
+                tracing::info!(target: "gateway_shutdown", pid = std::process::id(), "HTTP 监听已关闭，后台任务已结束")
             }
             Err(error) => {
                 tracing::error!(target: "gateway_shutdown", pid = std::process::id(), %error, "HTTP 服务异常停止，后台任务已清理")

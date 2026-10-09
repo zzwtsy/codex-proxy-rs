@@ -132,7 +132,7 @@ async fn sqlite_retention_purges_bounded_batches_for_all_persistent_targets() {
             .expect("purge admin audit events"),
         1
     );
-    let request_count: i64 = sqlx::query_scalar("select count(*) from model_requests")
+    let request_count: i64 = sqlx::query_scalar("select count(*) from model_request_observations")
         .fetch_one(&pool)
         .await
         .unwrap();

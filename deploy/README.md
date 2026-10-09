@@ -7,9 +7,9 @@
 | 任务 | 入口 |
 | --- | --- |
 | 安装与启动 | [手动安装](#手动安装) · [启动](#启动) · [公网访问](#公网访问) |
-| 接入客户端 | [客户端配置](#客户端配置) · [登录与生图排查](#登录与生图排查) |
+| 接入客户端 | [客户端配置](#客户端配置) · [时区与客户端环境信息](#时区与客户端环境信息) · [登录与生图排查](#登录与生图排查) |
 | 日常运维 | [运行设置](#启动后的运行设置) · [小内存优化](#小内存优化) · [持久化与日志](#持久化与备份) · [请求排查](#请求错误排查) · [密码轮换](#密码语义) |
-| 更新与恢复 | [镜像升级](#镜像升级与源码构建) · [在线更新](#管理端在线更新) · [备份与恢复](#备份与恢复) · [优雅关停](#优雅关停) |
+| 更新与恢复 | [镜像升级](#镜像升级与源码构建) · [在线更新](#管理端在线更新) · [备份与恢复](#备份与恢复) · [停止与重启](#停止与重启) |
 | 运行源码 | [开发与源码联调](../docs/development.md) |
 
 ## 配置归属
@@ -68,8 +68,8 @@ services:
       GLIBC_TUNABLES: 'glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072'
 ```
 
-已有部署使用当前 Compose 模板时，需将 `config.example.yaml` 的 `app-runtime` 段合并到现有 `services` 下，保留 PostgreSQL 和 Redis 的桥接配置。
-即使不开启优化，也保留该段并将值设为 `''`；Compose 从这里取得参数，无需在 `compose.yaml` 重复填写
+Compose 从 `services.app-runtime` 取得参数；不开启优化时保留该段并将值设为 `''`。
+PostgreSQL 和 Redis 的凭据桥接配置与该段并列，无需在 `compose.yaml` 重复填写参数
 
 校验并重建应用容器使配置生效；`docker compose restart` 不会更新容器环境变量：
 
@@ -149,20 +149,21 @@ CPR_DATABASE_PASSWORD=<第一个 48 位十六进制密码>
 CPR_REDIS_PASSWORD=<第二个 48 位十六进制密码>
 ```
 
-设置文件权限并另行填写 `deploy/config.yaml` 中的 `admin.default_password`：
+设置文件权限：
 
 ```bash
 chmod 0600 .env
 ```
 
-管理员初始密码至少需要 12 个字符，不能是常见弱口令，也不能包含 `$`。
-管理员的 `admin.session_ttl_minutes` 控制不活动期限，`admin.session_absolute_ttl_minutes` 控制从登录起计算的最长有效期，
-后者省略时为 43200 分钟（30 天）。配置模板分别为 10080 分钟（7 天）和 43200 分钟；已有配置保留自己的不活动期限。
-页面仅在接口报告会话失效时尝试续期，已过期或撤销的会话需要重新登录；续期不能超过最长有效期。
-修改配置需重启，已有会话的最长有效期不会因此延长。
-缺少最长有效期记录的会话保持原有固定期限，重新登录后应用续期策略。
-`client.session_ttl_minutes` 控制密钥身份的固定有效期，默认 1440 分钟，不随活动续期。
-两种身份共用一个 Cookie，成功登录替换当前浏览器的旧会话；不改变 `/v1/*` 鉴权和限额
+另行设置 `admin.default_password`：至少 12 个字符，不能使用常见弱口令或包含 `$`
+
+| 会话配置 | 含义 | 配置模板 / 默认值 |
+| --- | --- | --- |
+| `admin.session_ttl_minutes` | 管理员不活动期限 | 模板为 10080 分钟（7 天） |
+| `admin.session_absolute_ttl_minutes` | 从登录起计算的最长有效期 | 模板及省略时均为 43200 分钟（30 天） |
+| `client.session_ttl_minutes` | 密钥身份固定有效期，不随活动续期 | 默认 1440 分钟（1 天） |
+
+修改配置需重启，不能延长已建立会话的最长有效期。浏览器会话与续期规则见[认证 API](../docs/api.md#统一登录与会话)，独立于 `/v1/*` 鉴权和限额
 
 应用要求 PostgreSQL 密码非空，接受任意字符串；Redis 密码可留空或省略，留空时连接 URL 不包含密码认证。
 默认 Compose 的内置 PostgreSQL 与 Redis 仍要求密码，安装器为它们生成 48 位十六进制值并据此校验
@@ -234,6 +235,16 @@ curl -i http://127.0.0.1:8080/healthz
 
 `204 No Content` 表示应用及当前存储 backend 和后台任务的健康检查通过，不代表每个上游账号都可用
 
+`503 Service Unavailable` 的失败组件与原因保存在运维错误记录中，组件为 `health`，关联标识以
+`probe:` 或 `worker:` 开头；探针超时也会指明组件。连续相同故障去重，恢复后再次失败重新记录，
+应用日志记录故障与恢复摘要。健康响应保持空正文，详情沿用有界观测队列，队列或存储故障时可能缺失
+
+HTTP 在数据库迁移和初始化完成后才监听。PostgreSQL 迁移期间启动日志每 15 秒报告已等待时间，
+包含执行迁移和等待迁移锁的时间，不代表完成比例；不要因暂时无法访问而反复重启。
+镜像和 Compose 默认提供 5 分钟健康检查启动宽限期，探测成功后立即转为健康，无需等满宽限期。
+历史数据较多时应提前延长 `healthcheck.start_period` 和部署工具的等待超时；只修改 Compose
+文件不会改变已创建容器的检查配置，需要在维护窗口重新创建容器
+
 不要把未脱敏的 `docker compose config` 或 `docker inspect` 输出上传到工单；PostgreSQL + Redis Compose 会包含服务密码。日常校验使用 `config --quiet`
 
 ### 启动后的运行设置
@@ -296,7 +307,7 @@ HTTP 传输不加密，公网部署仍建议使用 HTTPS。
 并设置 `X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform`。
 反向代理仍需允许这些响应头生效；首个事件到达前的等待也需要足够的读取超时
 
-网关默认不限制模型请求的总执行时长。OpenAI 上游流默认有 300 秒空闲超时，持续收到数据不会因总时长超过 600 秒而中断。
+网关默认不限制模型请求的总执行时长；OpenAI 上游流默认有 300 秒空闲超时。
 `api.request_timeout_seconds` 默认 `null`，只控制 HTTP 路由返回响应前的等待，不是流式正文或 WebSocket 每轮执行的总时限。
 排队、插件显式执行期限与客户端断开的边界见 [请求期限](../docs/api.md#请求期限)
 
@@ -312,10 +323,14 @@ SSE 注释保活用于防止传输链路空闲断开，不会重置 Codex 等待
 
 ## 客户端配置
 
-在管理端创建客户端密钥，打开「使用密钥」，按操作系统复制 `config.toml` 和 `auth.json`，
-或通过 CCSwitch 导入。已有文件先备份，合并后完全退出并重启 Codex。
-CCSwitch 导入同时配置当前 Key 的日／周额度查询，当前 Provider 默认每 30 分钟刷新。
-查询地址和凭据随导入生成，在 CCSwitch 中修改 Provider 的地址或 Key 后，需重新导入以同步用量查询
+在管理端创建客户端密钥，打开「使用密钥」，按操作系统复制 `config.toml`。
+已有配置先备份，合并后完全退出并重启 Codex。代理密钥由 Provider 配置提供，
+不需要另写 `auth.json`，已有官方登录文件可以保留
+
+管理端生成的 CC Switch 一键导入包含连接信息和当前 Key 的日／周额度查询，默认每 30 分钟刷新。
+查询地址和凭据随导入生成，在 CC Switch 中修改 Provider 的地址或 Key 后，需重新导入以同步用量查询。
+导入不包含下方模板的远程压缩、原生生图和 WebSocket 设置。需要这些设置时，使用下方配置直连 CPR，
+避免 CC Switch 切换或接管后重写 Provider 配置
 
 Linux/macOS 默认目录为 `~/.codex/`，Windows 为 `%USERPROFILE%\.codex\`；
 设置过 `CODEX_HOME` 时以该目录为准。Provider 设置应写入用户配置，不要只写到项目目录。
@@ -341,6 +356,10 @@ requires_openai_auth = false
 # 填写代理密钥，真实账号由服务端管理。
 experimental_bearer_token = "<client-api-key>"
 
+[model_providers.OpenAI.capabilities]
+# Codex 0.162.0+ 显式启用 V2 远程压缩，不依赖 Provider 名称识别
+remote_compaction = "v2"
+
 [model_providers.OpenAI.http_headers]
 # 供客户端识别服务端托管认证，本身不是密钥。
 X-OpenAI-Actor-Authorization = "proxy-managed"
@@ -352,23 +371,14 @@ goals = true
 
 `OpenAI` 是自定义 Provider ID，大小写要与 `model_provider` 一致。合并配置时修改已有表，
 不要重复添加 `[features]` 或 Provider 表。更换模型时也要检查其支持的推理强度。
-密钥以明文保存，文件仅供本人读取，不要提交到 Git
+密钥以明文保存，文件仅供本人读取，不要提交到 Git。接入代理不需要扩大命令沙箱的联网或文件权限
+
+V2 远程压缩通过 Responses 接口发送 `compaction_trigger`，网关和上游需支持该协议。
+若 Provider ID 改为 `custom`，相应能力配置也要改到 `[model_providers.custom.capabilities]`
 
 需要指定完整模型目录时，在账号的模型列表中导出所选 Codex 模型，并在 `config.toml` 顶层设置
 `model_catalog_json = "/absolute/path/to/cpr-model-catalog.json"`。导出文件不含账号凭据；
 它是一次目录快照，调整选择或上游模型能力变化后需重新导出
-
-### auth.json
-
-```json
-{
-  "OPENAI_API_KEY": "<client-api-key>"
-}
-```
-
-使用 `auth.json` 读取密钥的客户端或 CCSwitch 可保留这份文件。上述 Provider 配置从
-`experimental_bearer_token` 读取代理密钥，可与仅含 API Key 的 `auth.json` 共存。
-真实 OpenAI OAuth 账号文件用于管理端账号导入，不要当作代理配置分发给客户端
 
 ### 生图和 WebSocket
 
@@ -385,27 +395,43 @@ goals = true
 OpenAI OAuth 账号的上游传输方式默认 WS；固定为 SSE 的账号不承接必须依赖 WS 的预热及连接内续接。
 仅使用这类账号时，客户端保持 `supports_websockets = false`，避免先尝试 WS 再回退
 
-### 客户端配置兼容
+### 时区与客户端环境信息
 
-仅含代理密钥的 `auth.json` 配合 `requires_openai_auth = true` 仍可用于已有请求，
-但 API Key 登录本身不会启用原生生图。需要生图时换用上述 Provider 配置
+要覆盖模型请求中的位置和时区，在管理端启用全局自定义位置，或为账号关联的代理设置位置；
+代理位置优先。`host.timezone` 控制部署日历和管理端时间展示，不代替请求位置设置。
+覆盖字段与环境消息识别条件见 [代理位置合同](../docs/api.md#独立代理管理--managed-proxies)
 
-使用 Codex 0.153.4 时，旧配置中的以下字段需删除或替换：
+Codex 回答仍显示本机时区时，先核对请求是否使用了预期账号和代理，再区分时间上下文与工具结果：
 
-| 字段 | 处理 |
-| --- | --- |
-| 顶层 `disable_response_storage` | 无有效配置定义，删除 |
-| 顶层 `network_access = "enabled"` | 无有效配置定义，删除；不是客户端 API 的联网开关 |
-| `features.responses_websockets_v2` | 已标记移除，使用 Provider 的 `supports_websockets` |
+- 使用新会话询问环境上下文中的时区，避免已有工具输出或历史回答影响判断
+- 检查 `environment_context` 和 Desktop 的 `codex_apps_client_time_context` 是否满足[时间上下文识别条件](../docs/api.md#独立代理管理--managed-proxies)；显式普通文本分类或非法 XML 不会被覆盖
+- 若模型调用 `date` 等工具查询本机，工具结果仍反映真实系统时区，覆盖不会修改客户端操作系统
 
-`image_generation` 和 `goals` 仍有效。不要为了接入代理，顺带扩大命令沙箱的联网或文件权限
+网关的请求头画像和位置覆盖不提供完整匿名化。正文与工作区 metadata 的保留范围见
+[正文兼容](../docs/api.md#正文兼容)，xAI 请求不应用 OpenAI 的请求位置覆盖
+
+Codex 客户端还有独立的出站请求。analytics 使用 `chatgpt_base_url`，可以包含真实系统类型、
+系统版本和架构；模型 Provider 的 `base_url` 不改变该地址。官方发行配置默认启用 Statsig 指标，目标为
+`https://ab.chatgpt.com/otlp/v1/metrics`，不由网关上游画像控制
+
+需要关闭这两类遥测时，将以下字段合并到客户端 `config.toml`，避免重复创建已有表，完全退出并重启 Codex：
+
+```toml
+[analytics]
+enabled = false
+
+[otel]
+metrics_exporter = "none"
+```
+
+这两个开关不清理模型请求中的工作目录、Git metadata、用户内容或工具结果。
 
 ### 登录与生图排查
 
 - 仍提示登录：确认实际读取的用户配置目录、选中的 Provider 和客户端版本，再完全退出重启。
   新 Provider 使用 `requires_openai_auth = false`，不依赖本地 ChatGPT 登录
-- 没有生图工具：检查配置是否被覆盖、Actor 标记是否保留、模型是否支持图片输入。
-  官方客户端还会检查缓存登录状态；已核验版本在本地账号为 Free 时会隐藏生图。
+- 没有生图工具：核对 Codex 实际读取的 Provider 配置，确认 Actor 标记、`requires_openai_auth = false` 和图片输入能力，
+  不只检查导出模板；CC Switch 导入不包含生图设置。客户端缓存的本地 Free 账号也可能影响工具展示。
   先备份并区分本地真实账号文件与代理密钥文件，不要直接删除全部登录状态
 - 已调用生图但失败：查看服务端账号的凭据、权限、额度和请求错误，不能只凭文本对话成功判断
 - `401`：检查代理密钥是否正确、是否启用；Actor 标记不能代替密钥
@@ -417,16 +443,14 @@ OpenAI OAuth 账号的上游传输方式默认 WS；固定为 SSE 的账号不�
 其他客户端使用 Responses API、`/v1` Base URL 和代理密钥即可，不需要 Actor 标记。
 路由与请求格式见 [API 参考](../docs/api.md#3-openai-数据面与模型目录)
 
-## 优雅关停
+## 停止与重启
 
-收到停止信号后，应用先停止接收新连接并 drain 存量连接；整个 drain 共享一个从停止信号
-起算的绝对截止点（`host.drain_timeout_seconds`，默认 30 秒），逾期放弃等待，存量连接随
-进程退出终止。drain 结束后才关停后台 worker，预算为
-`host.worker_shutdown_timeout_seconds`（默认 30 秒），两段预算按最坏情况串联
+管理端重启、SIGTERM 和 SIGINT 使用同一关闭策略：停止接收新连接，不等待现有 HTTP、SSE、
+WebSocket 会话完成，进程退出时强制断开剩余连接。已入队的观测写入与后台清理保留
+`host.worker_shutdown_timeout_seconds`（默认 30 秒）的收尾预算；客户端在新进程就绪后重新连接
 
-Compose 的 `stop_grace_period` 为 75 秒，覆盖默认 30 秒 HTTP drain、30 秒 worker 收尾和额外调度
-余量。若调大任一应用超时，也必须把 `stop_grace_period` 调到大于两段超时之和；否则 Docker 会在
-宽限期结束时 SIGKILL
+Compose 的 `stop_grace_period` 为 75 秒，覆盖默认 30 秒后台收尾及进程清理余量。
+调大后台关闭预算时，也必须同步预留容器停止宽限期，否则 Docker 会在宽限期结束时 SIGKILL
 
 ## 本地开发
 
@@ -466,11 +490,9 @@ Compose 使用以下绑定目录：
 `application`、`oauth-recovery`、`request-dump`。专用 tracing target 为 `oauth_recovery` 和
 `request_dump`；普通日志保留各 Rust 模块的 target，便于按模块过滤。
 程序只管理上述规范名称的日志，其他命名的文件由运维手动清理。
-普通日志未配置 `retention_days` 时默认使用 7 天，显式配置优先
 
 日志时间戳采用部署时区并携带数字偏移，文件按该时区的日期轮转和整组保留：例如 9 月 8 日配置 1 天，会保留 9 月 7 日全天及 9 月 8 日的所有分片，
-到 9 月 9 日才允许清理 9 月 7 日。这会略多保留，保证跨午夜及高流量时不留下半天日志。
-配置 7 天同理，保留前 7 个完整自然日及当天，夏令时日期允许为 23 或 25 小时。切换时区不重命名历史文件；
+到 9 月 9 日才允许清理 9 月 7 日，避免留下半天日志。夏令时日期允许为 23 或 25 小时。切换时区不重命名历史文件；
 按文件名日期与部署时区中的实际修改日期取较近值，旧日期分片近期被写入时整组延后删除。
 `max_file_size_mb` 仅决定分片大小（默认 20 MiB），不决定保存时长，单条大记录不会被截断。
 关闭的分片压缩为 `.log.gz`；成功压缩、同步并发布归档后才删除原文件，保留原修改时间。
@@ -561,15 +583,6 @@ Redis 和应用容器，不需要删除 Redis 数据目录。
 权限设为 `0600`。保持密码值不变，不需要修改 PostgreSQL 用户密码或删除 Redis 数据。
 一键安装器遇到已有 `config.yaml` 会保留旧部署文件，不执行此迁移；请按本节手动升级步骤操作。
 
-按现有配置和接入方式检查以下升级条件：
-
-| 适用条件 | 升级操作 |
-| --- | --- |
-| `config.yaml` 含 `openai.wire_profile.location` | 该字段会被忽略，可删除；如需继续覆盖请求位置，将值填入管理端全局请求位置并开启开关，数据库初始化不会自动导入 |
-| `config.yaml` 含 `host.logging.file.max_files` | 该字段会被忽略，可删除；日志按 `retention_days` 保留，`max_file_size_mb` 只控制分片大小 |
-| 使用带 `app-runtime` 继承的 Compose，现有 `config.yaml` 缺少对应段 | 合并模板中的 `services.app-runtime`，保留原凭据桥接；不开启内存优化时将 `GLIBC_TUNABLES` 设为 `''`，见 [小内存优化](#小内存优化) |
-| 使用旧管理员认证接口或 Cookie | 改用 `/api/auth/*` 并重新登录；会话合同见 [认证 API](../docs/api.md#4-浏览器认证) |
-
 更新部署文件后，从安装目录拉取目标版本镜像并重建应用容器：
 
 ```bash
@@ -603,14 +616,14 @@ docker compose --env-file .env -f deploy/compose.yaml build codex-proxy-rs
 
 | 通道 | 命名示例 | 接收的版本 |
 | --- | --- | --- |
-| Stable | `3.12.0` | 正式版 |
-| RC | `3.12.0-rc.1` | RC、正式版 |
-| Beta | `3.12.0-beta.1` | Beta、RC、正式版 |
-| Alpha | `3.12.0-alpha.1` | Alpha、Beta、RC、正式版 |
-| Exp | `3.10.0-exp.1` | 同一轮实验中编号更高的 exp，仅实验实例可选 |
+| Stable | `X.Y.Z` | 正式版 |
+| RC | `X.Y.Z-rc.N` | RC、正式版 |
+| Beta | `X.Y.Z-beta.N` | Beta、RC、正式版 |
+| Alpha | `X.Y.Z-alpha.N` | Alpha、Beta、RC、正式版 |
+| Exp | `X.Y.Z-exp.N` | 同一轮实验中编号更高的 exp，仅实验实例可选 |
 
 普通通道在同一大版本内持续接收更高版本，包括后续小版本和补丁版本的预发行。
-切回 Stable 不会降级：例如运行 `3.16.0-beta.2` 时，不能安装 `3.15.1`，需要等待 `3.16.0` 或更高正式版。
+切换通道不会降级，Stable 候选也必须高于当前运行版本。
 下载、安装或待重启期间不能切换通道
 
 同一 `X.Y.Z-exp.N` 系列只用于同一轮实验，不能混用不同实验分支；变更基线即进入另一实验线，需手动迁移。
@@ -629,6 +642,8 @@ alpha、beta、rc、exp 在 GitHub 标记为 Pre-release，不覆盖 GitHub Late
 ### 管理端在线更新
 
 官方构建按上述规则在线更新；源码等非官方构建返回不支持原因，不提供可用更新。
+最低受支持的在线升级起点为 **v3.18.1**。更旧版本需手动安装 v3.18.1 或新版完整发行包／镜像，
+不能依赖旧更新页面直接升级到最新版或选择已不是最新版的过渡版本。
 点击「下载并更新」后，操作日志显示下载、校验与安装过程，完成后显示「待重启」及待生效版本，重启后才使用新程序。
 「当前版本」始终表示正在运行的版本，「通道最新」表示所选通道的检查结果
 
@@ -665,7 +680,7 @@ Compose 提供以下在线更新运行参数：
 - `CPR_ENABLE_SELF_RESTART=true`：更新或回滚完成后允许管理端请求重启；Docker 进程退出后由
   Compose 的 `restart: unless-stopped` 拉起新进程
 
-`CPR_UPDATE_CHANNEL` 不参与版本选择，配置中存在该变量时可删除
+管理端自重启遵循统一的[停止与重启](#停止与重启)策略，客户端需在新进程完成迁移与初始化后重新连接
 
 Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.tar.gz` 与
 `checksums.txt`。服务会在替换前再次查询远端最新版本，校验下载 host、声明大小、SHA-256 和
@@ -681,7 +696,7 @@ Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.ta
 ### 插件兼容与发行目录
 
 教学示例在 `codex-proxy-plugins` 独立构建和发布，通过[插件管理](../docs/plugins.md)安装。
-宿主发行物当前不内置插件，但仍包含用于兼容检查的封口清单
+宿主发行物不内置插件，包含用于兼容检查的封口清单
 
 | 文件或目录 | 用途 |
 | --- | --- |
@@ -693,11 +708,7 @@ Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.ta
 - 非空官方清单中的包经身份、平台和摘要校验后幂等导入；导入不确认信任、不创建配置、不启用，也不删除旧包。管理员确认信任后才执行默认配置流程；重复摘要保留首次安装出处
 - `sealed` 是构建封口标记，不是密码学签名。普通上传、URL 或 GitHub 安装不能获得 `builtin` 身份，独立教学示例也不例外
 
-已安装制品的元数据读取允许未知字段，可选字段缺失时使用已定义的默认值；无需仅为这些字段差异重新安装。
-废弃字段由启动迁移统一清理，制品摘要、包体、接受事实与实例配置继续保留。缺失必需身份、数据类型错误、
-清单或协议不兼容不会因此被忽略，仍需按具体错误处理；不要手动删除元数据字段或修改迁移 checksum 来绕过检查
-
-使用不支持 `plugins/official` 目录的更新器时，须完整解压平台发行包或更新正式容器镜像，确保发行文件齐全。
+部署须保留完整的二进制、Web 资源与官方插件目录；不要手动修改制品元数据或迁移 checksum 绕过校验。
 macOS arm64 提供构建产物；部署前需验证目标平台的插件运行与上游调用，不能只以打包成功判断可用
 
 ## 备份与恢复

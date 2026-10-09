@@ -94,7 +94,7 @@ flowchart LR
 | 状态 | [`stores/modules/theme.ts`](../frontend/src/stores/modules/theme.ts) | 持久化配置、系统明暗偏好、切换动作与动画 |
 | 编辑器状态 | [`useThemeEditor.ts`](../frontend/src/views/theme/composables/useThemeEditor.ts) | 草稿、修改计数、恢复与保存 |
 
-独立仓库 `codex-proxy-ui` 是管理端和官方插件页面的共享组件源码；组件不得反向依赖管理端 Store、路由或 API。管理端通过 `@codex-proxy/ui` 公开入口消费组件，插件页面把组件和样式编译进自身静态资源，不在运行时借用宿主模块。
+`codex-proxy-ui` 的组件与主题不依赖宿主 Store、路由或 API。应用通过上述公开入口消费；插件页面把 UI、Vue 和 Tailwind CSS 4 样式编译进包内静态资源，不借用宿主运行时模块。
 插件页面的标题与副标题由宿主呈现，内容区只渲染业务；主题变化通过宿主桥同步，接入方式见
 [SDK 页面与宿主桥](../backend/crates/gateway-plugin/sdk/docs/capabilities.md#页面宿主桥-v2)。
 `theme/` 根目录只保留公开入口 `index.ts` 和唯一类型文件 `types.ts`；内部实现按 `core/`、`derive/`、`runtime/` 分层，不增加嵌套 barrel。
@@ -242,8 +242,7 @@ Token 直接覆盖时不会自动重算同组件的其他状态；需要保持�
 
 明暗模式分别派生，但共用组件合同。表格背景过渡覆盖普通行、选中行和固定列，尊重减少动态效果偏好
 
-Theme Editor 只开放真正由对应组件消费的 Component Token。全局 Alias 不放进组件目录，避免一次覆盖同时改变
-多个无关组件
+可编辑字段与覆盖限制见[主题编辑器](#编辑能力)
 
 应用内品牌图标使用 [`AppBrandMark.vue`](../frontend/src/components/AppBrandMark.vue)：浅色模式取
 `colorBgSpotlight`，深色模式取 `colorBgElevated`，保持中性暗面与白色图形；浏览器 favicon 继续使用固定黑白
@@ -330,7 +329,7 @@ Theme Store 统一读取持久化配置并初始化主题，首个 Vue 组件渲
 | 组件 | Action、Form、Surface、Data Display、Navigation、Layout |
 | 工作流 | 搜索、单项恢复、撤销草稿、恢复默认、保存并应用 |
 
-Component Token 只开放白名单字段，且不允许在组件目录覆盖全局 Alias。未覆盖项使用全局 Seed 与
+Component Token 只开放对应组件实际消费的白名单字段，不允许在组件目录覆盖全局 Alias。未覆盖项使用全局 Seed 与
 Alias 算法，避免主题配置逐渐退化成一份无法维护的完整 CSS 快照。
 Input、Button Secondary 与 Icon Button Secondary 的三个背景 Token 支持 HEX Alpha 编辑和保存；Seed、容器与表格背景仍只接受实色。
 透明填充先合成再参与默认文字对比度计算，用户显式覆盖 Component Token 时仍由用户负责整组状态的搭配
@@ -364,9 +363,9 @@ Store 在其他入口发生变化时更新保存基线；没有未保存修改�
 - 全局 Token：`--cp-color-bg-container`、`--cp-font-size`
 - Component Token：`--cp-table-row-hover-bg`、`--cp-input-active-shadow`
 - Preset Color Token：`--cp-color-purple-container-strong`、`--cp-color-cyan-on-container`
-- 主题层禁止业务域命名；套餐、模型或页面只能消费通用 Alias、Preset 或 Component Token
+- 业务组件按[通用颜色消费](#通用颜色消费)选择角色，不在主题层声明业务域名称
 - Map 与 Component 字段由 `theme/core/tokens.ts` 统一生成 CSS Token；禁止在解析器中再写平行的逐项映射表
-- 禁止继续引入 `accent`、`soft`、`current`、`subtle` 等与现有角色重叠的平行词汇
+- 不使用 `accent`、`soft`、`current`、`subtle` 等与现有角色重叠的平行词汇
 
 ### Vue 与 Tailwind CSS 4
 

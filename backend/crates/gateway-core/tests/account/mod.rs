@@ -15,13 +15,12 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value};
 
 use gateway_core::account::{
-    AccountAttemptFeedback, AccountCandidate, AccountConcurrency, AccountConcurrencyLimit,
-    AccountEligibilityPolicy, AccountFeedbackStats, AccountQuotaSignals, AccountRuntimeSignals,
-    AccountSchedulingBlocker, AccountSelectionContext, AccountSelectionPolicy, AccountSelector,
-    AccountStatus, AccountWeight, CredentialCasUpdate, CredentialRevision, CredentialState,
-    OpaqueProviderData, PlaintextCredential, PreferredAccountSelection, ProviderAccount,
-    ProviderAccountId, ProviderAccountIdentity, ProviderAccountUpdate, QuotaEvidence, QuotaState,
-    RotationStrategy,
+    AccountAttemptFeedback, AccountCandidate, AccountConcurrencyLimit, AccountEligibilityPolicy,
+    AccountFeedbackStats, AccountQuotaSignals, AccountRuntimeSignals, AccountSchedulingBlocker,
+    AccountSelectionContext, AccountSelectionPolicy, AccountSelector, AccountStatus, AccountWeight,
+    CredentialCasUpdate, CredentialRevision, CredentialState, OpaqueProviderData,
+    PlaintextCredential, PreferredAccountSelection, ProviderAccount, ProviderAccountId,
+    ProviderAccountIdentity, ProviderAccountUpdate, QuotaEvidence, QuotaState, RotationStrategy,
 };
 use gateway_core::routing::{
     ClientRoutingScope, FrozenAccountScope, ProviderKind, RuntimeAccount, RuntimeAccountDirectory,
@@ -1099,40 +1098,57 @@ fn due_probe_freeze_blocks_scheduling_and_remains_visible_as_rate_limited() {
 }
 
 #[test]
-fn reserved_concurrency_only_blocks_requests_that_cannot_use_the_reserved_slots() {
+fn reserved_concurrency_uses_its_own_limit_without_reducing_normal_capacity() {
+    let normal = context(RotationStrategy::Smart);
     let candidates = [candidate_with_concurrency("acct_reserved", 4, 5)];
-    let mut normal = context(RotationStrategy::Smart);
-    normal.reserved_concurrency = 1;
-    assert_eq!(normal.concurrency_limit(&candidates[0].account).get(), 4);
-    assert!(AccountSelector.select(&candidates, &normal).is_none());
+    assert!(AccountSelector.select(&candidates, &normal).is_some());
     let capacity = AccountSelector
         .capacity_snapshot(&candidates, &normal)
         .unwrap();
-    assert_eq!((capacity.used_slots(), capacity.total_slots()), (4, 4));
-    // 预留造成的暂满仍是可等待的容量约束，不能被当成不可用账号
-    assert_eq!(
-        AccountSelector.wait_candidates(&candidates, &normal).len(),
-        1
-    );
-
-    let prioritized = context(RotationStrategy::Smart);
-    let capacity = AccountSelector
-        .capacity_snapshot(&candidates, &prioritized)
-        .unwrap();
     assert_eq!((capacity.used_slots(), capacity.total_slots()), (4, 5));
-    let selected = AccountSelector
-        .select(&candidates, &prioritized)
-        .expect("reserved slot available");
-    assert_eq!(selected.candidate().account.id().as_str(), "acct_reserved");
-    let full = [candidate_with_concurrency("acct_reserved", 5, 5)];
-    assert!(AccountSelector.select(&full, &prioritized).is_none());
 
-    // 预留不能让普通请求失去全部名额，也不改变不限并发
-    let mut oversized = context(RotationStrategy::Smart);
-    oversized.reserved_concurrency = 10;
-    assert_eq!(oversized.concurrency_limit(&candidates[0].account).get(), 1);
+    let mut reserved = normal.clone();
+    reserved.reserved_concurrency = 3;
+    let candidates = [candidate_with_concurrency("acct_reserved", 2, 5)];
+    assert!(AccountSelector.select(&candidates, &reserved).is_some());
+    let capacity = AccountSelector
+        .capacity_snapshot(&candidates, &reserved)
+        .unwrap();
+    assert_eq!((capacity.used_slots(), capacity.total_slots()), (2, 3));
+    let full = [candidate_with_concurrency("acct_reserved", 3, 5)];
+    assert!(AccountSelector.select(&full, &reserved).is_none());
+    assert_eq!(AccountSelector.wait_candidates(&full, &reserved).len(), 1);
+    assert!(AccountSelector.select(&full, &normal).is_some());
+
+    // 独立额度可以大于账号普通上限，极值不能回绕成无限并发
+    reserved.reserved_concurrency = u32::MAX;
     assert_eq!(
-        AccountConcurrency::Unlimited.excluding_reserved(2),
-        AccountConcurrency::Unlimited
+        reserved.concurrency_limit(&candidates[0].account).get(),
+        u32::MAX
     );
+    assert_eq!(normal.concurrency_limit(&candidates[0].account).get(), 5);
+}
+
+#[test]
+fn reserved_capacity_stays_bounded_when_normal_concurrency_is_unlimited() {
+    let candidates = [candidate("acct_unlimited", 3, None)];
+    let mut normal = context(RotationStrategy::Smart);
+    normal.policy = AccountSelectionPolicy::new(
+        RotationStrategy::Smart,
+        gateway_core::account::AccountConcurrency::Unlimited,
+        Duration::ZERO,
+    );
+    assert!(AccountSelector.select(&candidates, &normal).is_some());
+    assert!(
+        AccountSelector
+            .capacity_snapshot(&candidates, &normal)
+            .is_none()
+    );
+    let mut reserved = normal;
+    reserved.reserved_concurrency = 3;
+    assert!(AccountSelector.select(&candidates, &reserved).is_none());
+    let capacity = AccountSelector
+        .capacity_snapshot(&candidates, &reserved)
+        .unwrap();
+    assert_eq!((capacity.used_slots(), capacity.total_slots()), (3, 3));
 }

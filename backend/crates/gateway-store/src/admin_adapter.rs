@@ -414,6 +414,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 "provider_request_profiles_json".to_owned(),
                 "request_location_enabled".to_owned(),
                 "request_location_json".to_owned(),
+                "codex_privacy_policy_json".to_owned(),
                 "model_mappings_json".to_owned(),
                 "refresh_margin_seconds".to_owned(),
                 "refresh_concurrency".to_owned(),
@@ -490,6 +491,7 @@ pub(crate) fn admin_runtime_settings(
     settings: crate::runtime_settings::RuntimeSettings,
 ) -> AdminStoreResult<AdminRuntimeSettings> {
     let values = gateway_admin::model::settings::RuntimeSettingsValues {
+        codex_privacy_policy: settings.codex_privacy_policy,
         request_location_enabled: settings.request_location_enabled,
         request_location: settings.request_location,
         refresh_margin_seconds: settings.refresh_margin_seconds,
@@ -594,6 +596,7 @@ fn store_runtime_settings_update(command: ReplaceRuntimeSettings) -> RuntimeSett
     let values = command.values;
     RuntimeSettingsUpdate {
         request_profile_updates: command.request_profile_updates,
+        codex_privacy_policy: values.codex_privacy_policy,
         request_location_enabled: values.request_location_enabled,
         request_location: values.request_location,
         refresh_margin_seconds: values.refresh_margin_seconds,
@@ -637,6 +640,7 @@ fn postgres_runtime_settings_update(
         rotation_strategy: settings.rotation_strategy,
         model_mappings: settings.model_mappings,
         values: gateway_admin::model::settings::RuntimeSettingsValues {
+            codex_privacy_policy: settings.codex_privacy_policy,
             request_location_enabled: settings.request_location_enabled,
             request_location: settings.request_location,
             refresh_margin_seconds: settings.refresh_margin_seconds,

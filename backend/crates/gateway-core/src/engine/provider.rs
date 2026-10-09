@@ -605,10 +605,15 @@ fn provider_event_to_middleware_frame(
         ClientTransport::WebSocket
         | ClientTransport::InternalProbe
         | ClientTransport::InternalPlugin => (
-            serde_json::to_vec(wire.data())
-                .map(Bytes::from)
+            wire.raw_websocket_message()
+                .map(|raw| Bytes::copy_from_slice(raw.as_bytes()))
+                .map_or_else(|| serde_json::to_vec(wire.data()).map(Bytes::from), Ok)
                 .map_err(|_| middleware_protocol_error(UpstreamSendState::Sent))?,
-            MiddlewareFraming::JsonDocument,
+            if wire.raw_websocket_message().is_some() && !wire.has_json_data() {
+                MiddlewareFraming::RawBytes
+            } else {
+                MiddlewareFraming::JsonDocument
+            },
         ),
     };
     Ok(MiddlewareFrame::from_provider_event(
@@ -631,10 +636,19 @@ fn encode_sse_wire_event(wire: &ProtocolWireEvent) -> Result<Bytes, ProviderErro
         encoded.extend_from_slice(event_type.as_bytes());
         encoded.push(b'\n');
     }
-    encoded.extend_from_slice(b"data: ");
-    serde_json::to_writer(&mut encoded, wire.data())
-        .map_err(|_| middleware_protocol_error(UpstreamSendState::Sent))?;
-    encoded.extend_from_slice(b"\n\n");
+    if let Some(raw) = wire.raw_websocket_message() {
+        for line in raw.split('\n') {
+            encoded.extend_from_slice(b"data: ");
+            encoded.extend_from_slice(line.as_bytes());
+            encoded.push(b'\n');
+        }
+        encoded.push(b'\n');
+    } else {
+        encoded.extend_from_slice(b"data: ");
+        serde_json::to_writer(&mut encoded, wire.data())
+            .map_err(|_| middleware_protocol_error(UpstreamSendState::Sent))?;
+        encoded.extend_from_slice(b"\n\n");
+    }
     Ok(Bytes::from(encoded))
 }
 
@@ -701,12 +715,19 @@ fn middleware_frame_to_provider_event(
                 .raw_json_body()
                 .or_else(|| wire.raw_http_body_bytes())
                 .cloned()
+                .or_else(|| {
+                    wire.raw_websocket_message()
+                        .map(|raw| Bytes::copy_from_slice(raw.as_bytes()))
+                })
                 .or_else(|| serde_json::to_vec(wire.data()).ok().map(Bytes::from)),
             MiddlewareFraming::SseEvent => wire
                 .raw_sse_frame()
                 .cloned()
                 .or_else(|| encode_sse_wire_event(wire).ok()),
-            MiddlewareFraming::RawBytes => wire.raw_http_body_bytes().cloned(),
+            MiddlewareFraming::RawBytes => wire.raw_http_body_bytes().cloned().or_else(|| {
+                wire.raw_websocket_message()
+                    .map(|raw| Bytes::copy_from_slice(raw.as_bytes()))
+            }),
         };
         if original.as_ref() == Some(&bytes)
             && let Some(mut event) = envelope.take()
@@ -944,6 +965,20 @@ impl fmt::Debug for ProviderRequest {
 /// 新的 attempt 再次调用
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Provider 解释自己的隐私规则，Core 仅冻结编译结果
+    fn compile_privacy_policy(
+        &self,
+        _policy: &crate::settings::privacy::CodexPrivacyPolicy,
+    ) -> Result<
+        Arc<dyn crate::settings::privacy::CompiledPrivacyPolicy>,
+        crate::settings::privacy::PrivacyError,
+    > {
+        Err(crate::settings::privacy::PrivacyError {
+            rule_index: 0,
+            reason: "Provider 不支持隐私策略",
+        })
+    }
+
     /// 从已冻结的配置解析请求身份；只读取本地发布资料，不执行网络请求
     fn resolve_request_profile(
         &self,
@@ -1174,5 +1209,33 @@ impl ProviderCatalogPort for ProviderRegistry {
                 .await
                 .map_err(|_| ProviderCatalogUnavailable)
         })
+    }
+}
+
+impl std::fmt::Debug for ProviderRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRegistry")
+            .field("providers", &self.providers.keys())
+            .finish()
+    }
+}
+
+impl crate::settings::privacy::PrivacyPolicyCompiler for ProviderRegistry {
+    fn compile(
+        &self,
+        policy: &crate::settings::privacy::CodexPrivacyPolicy,
+    ) -> Result<
+        Arc<dyn crate::settings::privacy::CompiledPrivacyPolicy>,
+        crate::settings::privacy::PrivacyError,
+    > {
+        self.providers
+            .iter()
+            .find(|(kind, _)| kind.as_str() == "openai")
+            .ok_or(crate::settings::privacy::PrivacyError {
+                rule_index: 0,
+                reason: "OpenAI Provider 不可用",
+            })?
+            .1
+            .compile_privacy_policy(policy)
     }
 }

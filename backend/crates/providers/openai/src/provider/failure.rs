@@ -84,10 +84,8 @@ pub(super) async fn wait_for_replay_grace(deadline: Option<Instant>) {
 
 /// 提交边界前的上游事件预取
 ///
-/// 原始 chunk 计数而不是重编码后的 event 大小
-/// 时间与字节阈值共同限定无感换号
-/// 窗口；任一边界到达都会提交已缓存 wire，不能因网关私有资源规则伪造上游协议
-/// 失败
+/// 结构事件保留到宽限期结束、语义输出、终态或 EOF，再提交已缓存 wire
+/// 大段配置回显不应提前结束无感换号窗口，原始 chunk 字节数只用于诊断
 /// 一旦提交，后续事件不再具备无痕重放资格
 pub(super) struct PreCommitClientEvents {
     pending: Vec<ProviderEvent>,
@@ -102,7 +100,6 @@ pub(super) struct PreCommitClientEvents {
 pub(super) enum PreCommitReleaseReason {
     SemanticOutput,
     Terminal,
-    ByteLimit,
     GraceTimeout,
     Eof,
 }
@@ -140,9 +137,6 @@ impl PreCommitClientEvents {
         }
         if completed {
             return self.commit_pending(PreCommitReleaseReason::Terminal);
-        }
-        if self.prefetched_bytes > MAX_STREAM_PREFETCH_BYTES {
-            return self.commit_pending(PreCommitReleaseReason::ByteLimit);
         }
         if starts_replay_grace && self.replay_grace_started_at.is_none() {
             self.replay_grace_started_at = Some(Instant::now());
@@ -896,6 +890,13 @@ pub(super) fn map_client_error(
     let connect_retry = !local_connection_capacity
         && matches!(&error, CodexClientError::Http(error) if transient_http_connect(error));
     let mut failure = match &error {
+        CodexClientError::Privacy(_) => MappedProviderFailure::plain(
+            provider_error(
+                ProviderErrorKind::InvalidRequest,
+                UpstreamSendState::NotSent,
+            )
+            .with_retry_prohibited(),
+        ),
         CodexClientError::ConnectionBudgetExhausted => MappedProviderFailure::plain(
             provider_error(ProviderErrorKind::Timeout, UpstreamSendState::NotSent)
                 .with_connection_retry(gateway_core::engine::AttemptTransport::Fallback),
@@ -1120,6 +1121,11 @@ fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
             "decode",
             "invalid_sse",
             "OpenAI HTTP returned an invalid Responses event stream".to_owned(),
+        ),
+        CodexClientError::Privacy(error) => (
+            "prepare",
+            "privacy_policy_rejected",
+            format!("Privacy rule {}: {}", error.rule_index + 1, error.reason),
         ),
         CodexClientError::InvalidHeaderName(_) => (
             "prepare",

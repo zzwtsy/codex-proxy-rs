@@ -1,8 +1,9 @@
-//! Codex Responses SSE 到核心 canonical event 的单一解码边界
+//! Codex Responses 原始 SSE 与 WebSocket 文本的旁路事实解码
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -22,11 +23,17 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::protocol::responses::{
-    ResponseEventSignals, ResponsesSseFailure, response_event_signals,
+    ResponseEventSignals, ResponseTimingMetrics, ResponsesSseFailure, response_duration_ms,
+    response_event_signals,
 };
 use super::usage::{
     OpenAiBillingUsage, WebSearchPricing, normalize_service_tier, web_search_pricing,
 };
+
+enum RawResponseFrame {
+    Sse(Bytes),
+    WebSocket(Arc<str>),
+}
 
 const CONTENTS_PER_OUTPUT: u32 = 1_024;
 
@@ -49,6 +56,8 @@ pub struct CodexCanonicalDecoder {
     semantic_output_seen: bool,
     requested_service_tier: Option<String>,
     response_service_tier: Option<String>,
+    upstream_response_ms: Option<u64>,
+    upstream_timing_metrics: ResponseTimingMetrics,
     response_model: ResponseModelObservation,
     reported_model: Option<String>,
     web_search_pricing: Option<WebSearchPricing>,
@@ -158,6 +167,8 @@ impl CodexCanonicalDecoder {
             semantic_output_seen: false,
             requested_service_tier: None,
             response_service_tier: None,
+            upstream_response_ms: None,
+            upstream_timing_metrics: ResponseTimingMetrics::default(),
             response_model: ResponseModelObservation::default(),
             reported_model: None,
             web_search_pricing: None,
@@ -174,6 +185,23 @@ impl CodexCanonicalDecoder {
     pub fn with_raw_sse_passthrough(mut self) -> Self {
         self.raw_sse_passthrough = true;
         self
+    }
+
+    /// 消费完整 WebSocket 文本，保留原文并旁路提取 canonical facts
+    pub fn push_websocket(&mut self, message: &str) -> CodexCanonicalOutcome {
+        self.timing_signals = ResponseEventSignals::default();
+        let mut output = Vec::new();
+        let event = SseEvent {
+            event: None,
+            data: message.to_owned(),
+            id: None,
+            retry: None,
+        };
+        let raw = Some(RawResponseFrame::WebSocket(Arc::from(message)));
+        match self.decode_one(event, raw, &mut output) {
+            Ok(()) => CodexCanonicalOutcome::Events(output),
+            Err(error) => self.failure(output, error),
+        }
     }
 
     /// 使用最终发送给上游的请求档位估算费用，不由响应回显覆盖
@@ -241,6 +269,16 @@ impl CodexCanonicalDecoder {
         self.response_service_tier.as_deref()
     }
 
+    /// 返回当前 attempt 的官方响应耗时，缺少完成响应时间戳时保留未知
+    #[must_use]
+    pub const fn upstream_response_ms(&self) -> Option<u64> {
+        self.upstream_response_ms
+    }
+
+    pub(crate) const fn upstream_timing_metrics(&self) -> ResponseTimingMetrics {
+        self.upstream_timing_metrics
+    }
+
     /// 真实 HTTP 响应头提供初始报告；流内请求级报告可覆盖它
     #[must_use]
     pub fn with_reported_model(mut self, model: Option<&str>) -> Self {
@@ -289,7 +327,7 @@ impl CodexCanonicalDecoder {
                 continue;
             }
             for (index, event) in events.into_iter().enumerate() {
-                let raw_sse_frame = (index == 0).then(|| raw.clone());
+                let raw_sse_frame = (index == 0).then(|| RawResponseFrame::Sse(raw.clone()));
                 if let Err(error) = self.decode_one(event, raw_sse_frame, &mut output) {
                     return self.failure(output, error);
                 }
@@ -301,18 +339,27 @@ impl CodexCanonicalDecoder {
     fn decode_one(
         &mut self,
         event: SseEvent,
-        raw_sse_frame: Option<Bytes>,
+        raw_sse_frame: Option<RawResponseFrame>,
         output: &mut Vec<ProviderEvent>,
     ) -> Result<(), CodexCanonicalError> {
-        if event.data.trim() == "[DONE]" {
+        if event.data.trim() == "[DONE]"
+            && !matches!(raw_sse_frame, Some(RawResponseFrame::WebSocket(_)))
+        {
             return Ok(());
         }
         let value = match serde_json::from_str::<Value>(&event.data) {
             Ok(value) => value,
             Err(_) => {
-                if let Some(raw_sse_frame) = raw_sse_frame
-                    && let Ok(wire) = ProtocolWireEvent::raw_sse("openai", raw_sse_frame)
-                {
+                let wire = match raw_sse_frame {
+                    Some(RawResponseFrame::Sse(raw)) => {
+                        ProtocolWireEvent::raw_sse("openai", raw).ok()
+                    }
+                    Some(RawResponseFrame::WebSocket(raw)) => {
+                        ProtocolWireEvent::raw_websocket("openai", raw).ok()
+                    }
+                    None => None,
+                };
+                if let Some(wire) = wire {
                     output.push(ProviderEvent::wire(wire));
                 }
                 return Ok(());
@@ -326,6 +373,21 @@ impl CodexCanonicalDecoder {
             // HTTP 传输已将此控制帧投影为本地额度事实
             // 此帧不能成为客户端输出，也不能启动首个输出计时
             return Ok(());
+        }
+        if event_type == Some("responsesapi.websocket_timing") && self.started && !self.completed {
+            // 无 ID 的官方计时帧仅属于当前已开始的响应，复用连接的尾帧不能跨边界归属
+            let response_ids = [
+                value.get("response_id"),
+                value.pointer("/response/id"),
+                value.pointer("/timing_metrics/response_id"),
+            ];
+            if response_ids.into_iter().flatten().all(|id| {
+                id.as_str()
+                    .is_some_and(|id| Some(id) == self.response_id.as_deref())
+            }) {
+                self.upstream_timing_metrics
+                    .merge(ResponseTimingMetrics::from_event(&value));
+            }
         }
         self.observe_response_service_tier(&value);
         self.response_model.observe(event_type, &value);
@@ -400,19 +462,27 @@ impl CodexCanonicalDecoder {
     fn wire_for_event(
         event: SseEvent,
         value: Value,
-        raw_sse_frame: Option<Bytes>,
+        raw_sse_frame: Option<RawResponseFrame>,
     ) -> Option<ProtocolWireEvent> {
-        let event_type = event.event;
+        let event_type = event
+            .event
+            .or_else(|| value.get("type").and_then(Value::as_str).map(str::to_owned));
         let sse_id = event.id;
         match raw_sse_frame {
-            Some(raw_sse_frame) => ProtocolWireEvent::json_with_raw_sse_metadata(
-                "openai",
-                event_type,
-                value,
-                raw_sse_frame,
-                sse_id,
-                event.retry,
-            ),
+            Some(RawResponseFrame::WebSocket(raw)) => {
+                ProtocolWireEvent::json("openai", event_type, value)
+                    .map(|wire| wire.with_raw_websocket_message(raw))
+            }
+            Some(RawResponseFrame::Sse(raw_sse_frame)) => {
+                ProtocolWireEvent::json_with_raw_sse_metadata(
+                    "openai",
+                    event_type,
+                    value,
+                    raw_sse_frame,
+                    sse_id,
+                    event.retry,
+                )
+            }
             None => ProtocolWireEvent::json_with_sse_metadata(
                 "openai",
                 event_type,
@@ -885,6 +955,9 @@ impl CodexCanonicalDecoder {
         if !self.started || self.response_id.as_deref() != Some(response_id.as_str()) {
             self.completed = true;
             return Ok(());
+        }
+        if event_type == "response.completed" {
+            self.upstream_response_ms = response_duration_ms(value);
         }
         if let Some(items) = response.get("output").and_then(Value::as_array) {
             for (output_index, item) in items.iter().enumerate() {

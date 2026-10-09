@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BaseCard, BaseForm, BaseFormItem, BaseInput, BasePopover } from '@codex-proxy/ui'
+import { BaseCard, BaseForm, BaseFormItem, BaseIconButton, BaseInput, BasePopover } from '@codex-proxy/ui'
 
 import { CircleAlert, Gauge, Timer } from '@lucide/vue'
 
@@ -58,21 +58,21 @@ const openaiGuardianReservedConcurrency = defineModel<string>('openaiGuardianRes
       <BaseFormItem label="排队超时（秒）" description="密钥队列与账号队列共用的等待时限，从首次入队起计时，1～120 秒">
         <BaseInput v-model="concurrencyWaitTimeoutSeconds" aria-label="排队超时（秒）" type="number" min="1" max="120" step="1" />
       </BaseFormItem>
-      <BaseFormItem label="自动审批预留并发" description="为 Codex 自动审批预留每账号名额，0 表示关闭">
+      <BaseFormItem label="自动审批独立并发" description="每个账号额外的审批名额，0 表示共用普通并发">
         <template #label-extra>
           <BasePopover class="-my-1" trigger="hover-click" placement="top-start">
             <template #trigger="{ open }">
-              <button type="button" aria-label="自动审批预留并发说明" :aria-expanded="open" class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-cp-sm border-0 bg-transparent p-0 text-cp-text-tertiary outline-none transition-colors hover:text-cp-text focus-visible:ring-2 focus-visible:ring-cp-control-outline motion-reduce:transition-none">
+              <BaseIconButton label="自动审批独立并发说明" :title="undefined" :aria-expanded="open" class="size-6! hover:bg-transparent! active:bg-transparent!">
                 <CircleAlert class="size-3.5" aria-hidden="true" />
-              </button>
+              </BaseIconButton>
             </template>
             <div class="max-w-72 space-y-2 px-3 py-2 text-cp-sm leading-relaxed text-cp-text-secondary">
-              <p>仅对 OpenAI 账号生效，普通请求可用并发会相应减少，至少保留 1 个名额，不限并发的账号不扣减</p>
-              <p>大于 0 且开启账号排队时，审批请求优先等待，可超过账号队列容量，仍受总等待容量、排队超时与密钥限额约束</p>
+              <p>仅对 OpenAI 账号生效，普通并发为 10、审批名额为 3 时，两类请求分别最多运行 10 个和 3 个，互不占用名额</p>
+              <p>开启独立额度后，审批请求单独排队，可超过账号队列容量，仍受总等待容量、排队超时、请求间隔与密钥限额约束</p>
             </div>
           </BasePopover>
         </template>
-        <BaseInput v-model="openaiGuardianReservedConcurrency" aria-label="自动审批预留并发" type="number" min="0" max="4294967295" step="1" />
+        <BaseInput v-model="openaiGuardianReservedConcurrency" aria-label="自动审批独立并发" type="number" min="0" max="4294967295" step="1" />
       </BaseFormItem>
     </BaseForm>
   </BaseCard>

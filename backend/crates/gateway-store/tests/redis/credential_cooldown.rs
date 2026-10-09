@@ -347,7 +347,21 @@ async fn capacity_freeze_survives_due_time_and_runtime_restart_until_probe_succe
         .await
         .expect("write due freeze");
     let runtime = runtime_store(&repository, connection.clone(), &namespace);
-    let snapshot = runtime.active_rate_limits().await.expect("status snapshot");
+    let snapshot = runtime.active_rate_limits().await.unwrap_or_else(|error| {
+        // 来源默认不参与 Debug；只输出错误类别，保留诊断线索且不展开连接信息
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        while let Some(cause) = source {
+            if let Some(redis_error) = cause.downcast_ref::<redis::RedisError>() {
+                panic!(
+                    "status snapshot: Redis {:?}, timeout={}",
+                    redis_error.kind(),
+                    redis_error.is_timeout()
+                );
+            }
+            source = cause.source();
+        }
+        panic!("status snapshot: {error}");
+    });
     assert!(snapshot.cooldown[&frozen.provider_account_id].is_active(SystemTime::now()));
     assert!(
         snapshot.cooldown[&frozen.provider_account_id]

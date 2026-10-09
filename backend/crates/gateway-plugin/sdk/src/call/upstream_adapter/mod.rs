@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use super::model::ExecutionEvent;
 
 mod codec;
-pub use codec::encode_request_metadata;
 
 pub const REGISTER_METHOD: &str = "upstream_adapter.register";
 pub const EXECUTE_METHOD: &str = "upstream_adapter.execute";

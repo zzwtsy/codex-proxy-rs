@@ -309,7 +309,7 @@ impl ProviderAccountUsageQuery {
 
 pub use gateway_admin::model::observability::DashboardTotals;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DashboardObservation {
     pub range: ObservabilityRange,
     pub totals: DashboardTotals,

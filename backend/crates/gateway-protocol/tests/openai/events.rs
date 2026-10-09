@@ -406,14 +406,14 @@ fn retry_after_should_read_nested_error_delay() {
 }
 
 #[test]
-fn retry_after_should_read_case_insensitive_header_array() {
+fn retry_after_should_ignore_header_arrays() {
     let body = json!({
         "type": "error",
         "headers": {"Retry-After": ["37"]}
     })
     .to_string();
 
-    assert_eq!(retry_after_seconds_from_body(&body), Some(37));
+    assert_eq!(retry_after_seconds_from_body(&body), None);
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn retry_after_should_reject_malformed_json() {
 
 #[test]
 fn retry_after_should_prioritize_nested_headers_over_other_advice() {
-    for header in [json!(30), json!("30"), json!(["30"])] {
+    for header in [json!(30), json!("30")] {
         for wrap_response in [false, true] {
             let error = json!({
                 "code": "rate_limit_exceeded", "message": "Try again in 2s",
@@ -478,6 +478,33 @@ fn retry_after_should_prioritize_nested_headers_over_other_advice() {
                 json!({"type":"error", "error":error, "headers":{"retry-after":"20"}})
             };
             assert_eq!(retry_after_seconds_from_body(&body.to_string()), Some(30));
+        }
+    }
+}
+
+#[test]
+fn retry_after_should_validate_http_values_before_resolving_duplicates() {
+    for (headers, expected) in [
+        (json!("invalid"), 12),
+        (json!({"retry-after":"\n5\n"}), 12),
+        (json!({"retry-after":"\t5\t"}), 5),
+        (json!({"Retry-After":"5", "retry-after":"30"}), 30),
+        (json!({"Retry-After":"5", "retry-after":"invalid"}), 12),
+        (json!({"Retry-After":"5", "retry-after":"\n30\n"}), 5),
+        (json!({"Retry-After":"5", "retry-after":["30"]}), 5),
+        (json!({"Retry-After":"5", "retry-after":false}), 12),
+    ] {
+        for wrap_response in [false, true] {
+            let error = json!({"code":"rate_limit_exceeded", "headers":headers});
+            let body = if wrap_response {
+                json!({"type":"response.failed", "response":{"error":error}, "headers":{"retry-after":"12"}})
+            } else {
+                json!({"type":"error", "error":error, "headers":{"retry-after":"12"}})
+            };
+            assert_eq!(
+                retry_after_seconds_from_body(&body.to_string()),
+                Some(expected)
+            );
         }
     }
 }

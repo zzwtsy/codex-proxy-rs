@@ -34,7 +34,6 @@ export interface SystemUpdateDetail {
   notes: string | null
   cached: boolean
   updateSupported: boolean
-  restartConfirmationSupported?: boolean
   unsupportedReason: string | null
   warning: string | null
 }

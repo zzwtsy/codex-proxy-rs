@@ -202,6 +202,20 @@ pub(super) struct RecordView {
 #[serde(rename_all = "camelCase")]
 struct OutputTimingView {
     #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_response_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_api_overhead_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_engine_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_engine_iapi_ttft_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_engine_service_ttft_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_engine_iapi_tbt_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_engine_service_tbt_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     first_event_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     first_reasoning_ms: Option<u64>,
@@ -226,6 +240,13 @@ fn success_record(value: UsageListRecord, time: crate::time::TimePresenter) -> R
         latency_ms: value.latency_ms,
         first_token_latency_ms: value.first_token_ms,
         latency_details: OutputTimingView {
+            upstream_response_ms: value.upstream_response_ms,
+            upstream_api_overhead_ms: value.upstream_api_overhead_ms,
+            upstream_engine_ms: value.upstream_engine_ms,
+            upstream_engine_iapi_ttft_ms: value.upstream_engine_iapi_ttft_ms,
+            upstream_engine_service_ttft_ms: value.upstream_engine_service_ttft_ms,
+            upstream_engine_iapi_tbt_ms: value.upstream_engine_iapi_tbt_ms,
+            upstream_engine_service_tbt_ms: value.upstream_engine_service_tbt_ms,
             first_event_ms: value.first_event_ms,
             first_reasoning_ms: value.first_reasoning_ms,
             first_text_ms: value.first_text_ms,

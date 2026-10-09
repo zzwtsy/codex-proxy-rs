@@ -1,3 +1,5 @@
+//! 验证 SQLite 请求生命周期、恢复与上游性能观测
+
 use std::{
     num::NonZeroU32,
     time::{Duration, SystemTime},
@@ -35,11 +37,12 @@ async fn sqlite_merged_first_attempt_is_atomic_and_retries_keep_sent_state() {
             .await
             .is_err()
     );
-    let rolled_back: i64 =
-        sqlx::query_scalar("select count(*) from model_requests where id = 'req_atomic_merged'")
-            .fetch_one(&pool)
-            .await
-            .expect("count rolled-back request");
+    let rolled_back: i64 = sqlx::query_scalar(
+        "select count(*) from model_request_observations where id = 'req_atomic_merged'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count rolled-back request");
     assert_eq!(rolled_back, 0);
 
     store
@@ -47,7 +50,7 @@ async fn sqlite_merged_first_attempt_is_atomic_and_retries_keep_sent_state() {
         .await
         .expect("create request and first attempt in one transaction");
     let persisted: (i64, String) = sqlx::query_as(
-        "select attempt_count, upstream_send_state from model_requests where id = ?1",
+        "select attempt_count, upstream_send_state from model_request_observations where id = ?1",
     )
     .bind(request.id.as_str())
     .fetch_one(&pool)
@@ -65,7 +68,7 @@ async fn sqlite_merged_first_attempt_is_atomic_and_retries_keep_sent_state() {
         .expect("record retry");
     let persisted: (i64, String, Option<String>) = sqlx::query_as(
         "select attempt_count, upstream_send_state, provider_account_ref
-         from model_requests where id = ?1",
+         from model_request_observations where id = ?1",
     )
     .bind(request.id.as_str())
     .fetch_one(&pool)
@@ -100,12 +103,13 @@ async fn sqlite_running_request_lease_is_renewed_without_a_request_timeout() {
     let _lease = store.maintain_request(&request.id, request.deadline_at);
     let renewed_deadline_us = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let deadline_us: i64 =
-                sqlx::query_scalar("select deadline_at_us from model_requests where id = ?1")
-                    .bind(request.id.as_str())
-                    .fetch_one(&pool)
-                    .await
-                    .expect("load request recovery lease");
+            let deadline_us: i64 = sqlx::query_scalar(
+                "select deadline_at_us from model_request_observations where id = ?1",
+            )
+            .bind(request.id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("load request recovery lease");
             if deadline_us > stale_deadline_us {
                 break deadline_us;
             }
@@ -150,7 +154,7 @@ async fn sqlite_downstream_commit_status_is_not_replaced_by_finalization() {
         .expect("finalize request");
     let persisted: (Option<i64>, Option<i64>) = sqlx::query_as(
         "select downstream_committed_at_us, client_status_code
-         from model_requests where id = ?1",
+         from model_request_observations where id = ?1",
     )
     .bind(request.id.as_str())
     .fetch_one(&pool)
@@ -203,7 +207,7 @@ async fn sqlite_finalization_keeps_fixed_point_cost_and_rejects_duplicate_termin
     ) = sqlx::query_as(
         "select cost_source, cost_amount, cost_currency,
                     input_tokens, output_tokens, total_tokens
-             from model_requests where id = ?1",
+             from model_request_observations where id = ?1",
     )
     .bind(request.id.as_str())
     .fetch_one(&pool)
@@ -253,7 +257,7 @@ async fn sqlite_deadline_recovery_and_continuation_retry_are_persisted() {
     assert_eq!(first_recovery.requests, 1);
     assert_eq!(second_recovery.requests, 0);
     let recovered: (String, i64, Option<i64>) = sqlx::query_as(
-        "select outcome, completed_at_us, started_at_us from model_requests where id = ?1",
+        "select outcome, completed_at_us, started_at_us from model_request_observations where id = ?1",
     )
     .bind(expired.id.as_str())
     .fetch_one(&pool)
@@ -302,7 +306,7 @@ async fn sqlite_deadline_recovery_and_continuation_retry_are_persisted() {
     let recovery: (Option<String>, Option<i64>, Option<i64>, i64) = sqlx::query_as(
         "select recovery_request_id, recovered_at_us, recovery_retry_delay_ms,
                 recovery_attempt_count
-         from model_requests where id = ?1",
+         from model_request_observations where id = ?1",
     )
     .bind(original.id.as_str())
     .fetch_one(&pool)
@@ -319,6 +323,40 @@ async fn database(path: &std::path::Path) -> SqlitePool {
     sqlite::connect_and_migrate(path, &SqliteStoreConfig::default())
         .await
         .expect("create SQLite test database")
+}
+
+#[tokio::test]
+async fn upstream_timings_preserve_fractional_precision_and_separate_clock_domains() {
+    let root = tempfile::tempdir().unwrap();
+    let pool = database(&root.path().join("timings.sqlite3")).await;
+    let store = SqliteExecutionStore::new(pool.clone());
+    let request = request("req_upstream_timings", SystemTime::now());
+    store
+        .create_model_request_with_attempt(request.clone(), attempt(&request.id, 1, "acct_timings"))
+        .await
+        .unwrap();
+    let mut terminal = make_finalization(&request.id, ExecutionOutcome::Succeeded);
+    terminal.timings.latency_ms = Some(10);
+    terminal.timings.provider_processing_ms = Some(12);
+    terminal.timings.upstream_response_ms = Some(42);
+    terminal.timings.upstream_api_overhead_ms = Some(1.25);
+    terminal.timings.upstream_engine_ms = Some(2.5);
+    terminal.timings.upstream_engine_iapi_ttft_ms = Some(0.125);
+    terminal.timings.upstream_engine_service_ttft_ms = Some(0.25);
+    terminal.timings.upstream_engine_iapi_tbt_ms = Some(0.0625);
+    terminal.timings.upstream_engine_service_tbt_ms = Some(0.5);
+    store.finalize_model_request(terminal).await.unwrap();
+    let measured: (i64, i64, f64, f64, f64, f64, f64, f64) = sqlx::query_as(
+        "select provider_processing_ms, upstream_response_ms, upstream_api_overhead_ms,
+                upstream_engine_ms, upstream_engine_iapi_ttft_ms, upstream_engine_service_ttft_ms,
+                upstream_engine_iapi_tbt_ms, upstream_engine_service_tbt_ms
+         from model_request_observations where id = 'req_upstream_timings'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(measured, (12, 42, 1.25, 2.5, 0.125, 0.25, 0.0625, 0.5));
+    pool.close().await;
 }
 
 fn request(id: &str, started_at: SystemTime) -> NewModelRequest {

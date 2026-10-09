@@ -18,9 +18,10 @@ use gateway_admin::{
         MutationContext, Revision,
         account_groups::{
             AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupColor,
-            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-            AccountGroupRecord, AccountGroupUsage, DeleteAccountGroup, NewAccountGroup,
-            SetAccountGroupEnabled, UpdateAccountGroup,
+            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+            AccountGroupOptionsPage, AccountGroupPage, AccountGroupRecord, AccountGroupRef,
+            AccountGroupUsage, DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled,
+            UpdateAccountGroup,
         },
         accounts::{
             AccountListQuery, AccountPage, AccountPageItem, AccountRuntimeSnapshot,
@@ -600,6 +601,7 @@ impl SettingsStore for MemorySettingsStore {
             rotation_strategy: command.rotation_strategy,
             updated_at: Utc::now(),
             values: gateway_admin::model::settings::RuntimeSettingsValues {
+                codex_privacy_policy: command.values.codex_privacy_policy,
                 request_location_enabled: command.values.request_location_enabled,
                 request_location: command.values.request_location,
                 refresh_margin_seconds: command.values.refresh_margin_seconds,
@@ -783,6 +785,48 @@ impl AccountGroupStore for MemoryAccountGroupStore {
             .saturating_mul(page_size);
         let items = matching.into_iter().skip(offset).take(page_size).collect();
         Ok(AccountGroupPage {
+            config_revision: state.revision,
+            items,
+            total,
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
+    }
+
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage> {
+        let state = self.state.lock().expect("account groups");
+        let search = query.search.as_ref().map(|value| value.to_lowercase());
+        let mut matching = state
+            .groups
+            .values()
+            .filter(|record| {
+                query
+                    .enabled
+                    .is_none_or(|enabled| record.enabled == enabled)
+            })
+            .filter(|record| {
+                search
+                    .as_ref()
+                    .is_none_or(|search| record.name.to_lowercase().contains(search))
+            })
+            .map(|record| AccountGroupRef {
+                id: record.id.clone(),
+                name: record.name.clone(),
+                color: record.color.clone(),
+                enabled: record.enabled,
+            })
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| left.name.cmp(&right.name));
+        let total = matching.len() as u64;
+        let page_size = usize::from(query.page_size.get());
+        let offset = usize::try_from(query.page.saturating_sub(1))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(page_size);
+        let items = matching.into_iter().skip(offset).take(page_size).collect();
+        Ok(AccountGroupOptionsPage {
             config_revision: state.revision,
             items,
             total,
@@ -1631,6 +1675,7 @@ fn test_runtime_settings() -> RuntimeSettings {
         rotation_strategy: RotationStrategy::Smart,
         updated_at: Utc::now(),
         values: gateway_admin::model::settings::RuntimeSettingsValues {
+            codex_privacy_policy: Default::default(),
             request_location_enabled: false,
             request_location: Default::default(),
             refresh_margin_seconds: 3_600,

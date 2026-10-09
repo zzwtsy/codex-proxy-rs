@@ -235,16 +235,15 @@ impl Execution {
                 .collect(),
             continuation: previous.map(|state| state.continuation),
         };
-        let payload = crate::compatibility::FastSettings::upstream_request(
-            &self.adapter.session,
-            request,
-            invocation
-                .operation
-                .middleware_body()
-                .map_err(|source| invalid().with_source(source))?
-                .to_vec(),
-        )
-        .map_err(|source| invalid().with_source(source))?;
+        let payload = request
+            .encode(
+                invocation
+                    .operation
+                    .middleware_body()
+                    .map_err(|source| invalid().with_source(source))?
+                    .to_vec(),
+            )
+            .map_err(|source| invalid().with_source(source))?;
         invocation.context.trace().record("plugin.upstream", serde_json::json!({ "instanceId": self.adapter.instance_id, "adapterId": declaration.id, "generation": context.generation, "transport": declaration.transport.as_str() }));
         let stream = tokio::select! {
             biased;

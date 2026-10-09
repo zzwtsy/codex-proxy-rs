@@ -206,6 +206,7 @@ impl AccountSelectionPolicy {
 /// Store 提供并发事实，Provider 叠加自己解释的额度事实；全部信号均可重建
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRuntimeSignals {
+    /// 本次调度容量池的在途数，不合并其他独立池
     pub in_flight: u32,
     pub last_started_at: Option<SystemTime>,
     pub quota_reset_at: Option<SystemTime>,
@@ -523,7 +524,7 @@ pub struct AccountSelectionContext {
     pub round_robin_cursor: u64,
     pub eligibility: AccountEligibilityPolicy,
     pub account_scope: Option<std::sync::Arc<crate::account::scope::FrozenAccountScope>>,
-    /// 本请求不可占用的每账号预留并发名额，由 Provider 按请求类别决定；0 表示不预留
+    /// 本请求使用的独立预留池上限，由 Provider 按请求类别决定；0 表示使用普通账号池
     pub reserved_concurrency: u32,
 }
 
@@ -531,9 +532,11 @@ impl AccountSelectionContext {
     /// 本请求在该账号上可使用的并发上限；资格判断、租约与策略投影必须共用这一口径
     #[must_use]
     pub fn concurrency_limit(&self, account: &ProviderAccount) -> AccountConcurrency {
-        account
-            .effective_concurrency(self.policy.max_concurrent_per_account())
-            .excluding_reserved(self.reserved_concurrency)
+        if self.reserved_concurrency > 0 {
+            AccountConcurrency::new(self.reserved_concurrency)
+        } else {
+            account.effective_concurrency(self.policy.max_concurrent_per_account())
+        }
     }
 }
 
@@ -723,7 +726,6 @@ impl AccountSelector {
 
         let candidate = match context.policy.strategy() {
             RotationStrategy::QuotaResetPriority => {
-                let default_concurrency = context.policy.max_concurrent_per_account();
                 eligible.sort_by(|left, right| {
                     (
                         left.signals.quota_reset_at.is_none(),
@@ -734,8 +736,8 @@ impl AccountSelector {
                             right.signals.quota_reset_at,
                         ))
                         .then_with(|| {
-                            capacity_utilization(left, default_concurrency)
-                                .total_cmp(&capacity_utilization(right, default_concurrency))
+                            capacity_utilization(left, context)
+                                .total_cmp(&capacity_utilization(right, context))
                         })
                         .then_with(|| {
                             left.signals
@@ -751,13 +753,7 @@ impl AccountSelector {
                 let index = context.round_robin_cursor as usize % eligible.len();
                 eligible.get(index).copied()?
             }
-            RotationStrategy::Smart => select_smart_candidate(
-                &eligible,
-                context.policy.max_concurrent_per_account(),
-                context.round_robin_cursor,
-                context.policy.smart_scheduling(),
-                context.now,
-            )?,
+            RotationStrategy::Smart => select_smart_candidate(&eligible, context)?,
             RotationStrategy::Sticky => {
                 eligible.sort_by_key(|candidate| {
                     (
@@ -843,17 +839,7 @@ impl AccountSelector {
         // 账号信号在队列锁外评分，锁内只读取实时队长并查表，避免扫描候选阻塞其他等待者
         let scores = candidates
             .iter()
-            .map(|candidate| {
-                (
-                    candidate.account.id(),
-                    smart_score(
-                        candidate,
-                        context.policy.max_concurrent_per_account(),
-                        config,
-                        context.now,
-                    ),
-                )
-            })
+            .map(|candidate| (candidate.account.id(), smart_score(candidate, context)))
             .collect::<HashMap<_, _>>();
         waiting
             .wait_with_priority(keys, |key, count| {
@@ -914,13 +900,9 @@ const SMART_LATENCY_HALF_SCORE_MS: f64 = 10_000.0;
 // 距重置一小时时得分减半；未知和已过期时间不提供重置奖励
 const SMART_RESET_HALF_SCORE_SECONDS: f64 = 3_600.0;
 
-fn capacity_utilization(
-    candidate: &AccountCandidate,
-    default_concurrency: AccountConcurrency,
-) -> f64 {
-    candidate
-        .account
-        .effective_concurrency(default_concurrency)
+fn capacity_utilization(candidate: &AccountCandidate, context: &AccountSelectionContext) -> f64 {
+    context
+        .concurrency_limit(&candidate.account)
         .limit()
         .map_or(0.0, |limit| {
             f64::from(candidate.signals.in_flight) / f64::from(limit.get())
@@ -929,38 +911,29 @@ fn capacity_utilization(
 
 fn select_smart_candidate<'a>(
     candidates: &[&'a AccountCandidate],
-    default_concurrency: AccountConcurrency,
-    cursor: u64,
-    config: SmartSchedulingConfig,
-    now: SystemTime,
+    context: &AccountSelectionContext,
 ) -> Option<&'a AccountCandidate> {
     let mut ranked = candidates
         .iter()
-        .map(|candidate| {
-            (
-                *candidate,
-                smart_score(candidate, default_concurrency, config, now),
-            )
-        })
+        .map(|candidate| (*candidate, smart_score(candidate, context)))
         .collect::<Vec<_>>();
     let best_score = ranked
         .iter()
         .map(|(_, score)| *score)
         .max_by(f64::total_cmp)?;
-    ranked.retain(|(_, score)| best_score - score <= config.score_tolerance());
+    ranked.retain(|(_, score)| {
+        best_score - score <= context.policy.smart_scheduling().score_tolerance()
+    });
     // 轮换顺序保持稳定，避免分数轻微交错与 cursor 同步后仍反复命中同一账号
     ranked.sort_unstable_by(|(left, _), (right, _)| left.account.id().cmp(right.account.id()));
-    let index = (cursor % ranked.len() as u64) as usize;
+    let index = (context.round_robin_cursor % ranked.len() as u64) as usize;
     Some(ranked[index].0)
 }
 
-pub(crate) fn smart_score(
-    candidate: &AccountCandidate,
-    default_concurrency: AccountConcurrency,
-    config: SmartSchedulingConfig,
-    now: SystemTime,
-) -> f64 {
-    let load = 1.0 - capacity_utilization(candidate, default_concurrency).clamp(0.0, 1.0);
+pub(crate) fn smart_score(candidate: &AccountCandidate, context: &AccountSelectionContext) -> f64 {
+    let config = context.policy.smart_scheduling();
+    let now = context.now;
+    let load = 1.0 - capacity_utilization(candidate, context).clamp(0.0, 1.0);
     let quota = candidate
         .signals
         .quota_remaining_rank

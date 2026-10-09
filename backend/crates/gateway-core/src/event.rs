@@ -203,6 +203,7 @@ pub struct ProtocolWireEvent {
     data: Value,
     has_json_data: bool,
     raw_sse_frame: Option<Bytes>,
+    raw_websocket_message: Option<Arc<str>>,
     raw_json_body: Option<Bytes>,
     raw_http_body: Option<Bytes>,
     sse_id: Option<String>,
@@ -245,6 +246,7 @@ impl ProtocolWireEvent {
             data,
             has_json_data: true,
             raw_sse_frame: None,
+            raw_websocket_message: None,
             raw_json_body: None,
             raw_http_body: None,
             sse_id,
@@ -293,11 +295,39 @@ impl ProtocolWireEvent {
             data: Value::Null,
             has_json_data: false,
             raw_sse_frame: Some(raw_sse_frame),
+            raw_websocket_message: None,
             raw_json_body: None,
             raw_http_body: None,
             sse_id: None,
             sse_retry: None,
         })
+    }
+
+    /// 创建原始 WebSocket 文本；JSON 解析失败不影响交付
+    ///
+    /// # Errors
+    ///
+    /// 协议名不满足 wire 安全约束时返回错误
+    pub fn raw_websocket(
+        protocol: impl Into<String>,
+        message: impl Into<Arc<str>>,
+    ) -> Result<Self, IdentifierError> {
+        let mut wire = Self::json(protocol, None, Value::Null)?;
+        wire.has_json_data = false;
+        Ok(wire.with_raw_websocket_message(message))
+    }
+
+    /// 绑定同一事件未经改写的 WebSocket 文本，解析视图只用于旁路事实
+    #[must_use]
+    pub fn with_raw_websocket_message(mut self, message: impl Into<Arc<str>>) -> Self {
+        self.raw_websocket_message = Some(message.into());
+        self
+    }
+
+    /// 返回未经改写的 WebSocket 文本
+    #[must_use]
+    pub fn raw_websocket_message(&self) -> Option<&str> {
+        self.raw_websocket_message.as_deref()
     }
 
     /// 创建未经改写的完整 JSON 响应正文
@@ -319,6 +349,7 @@ impl ProtocolWireEvent {
             data: Value::Null,
             has_json_data: false,
             raw_sse_frame: None,
+            raw_websocket_message: None,
             raw_json_body: Some(raw_json_body),
             raw_http_body: None,
             sse_id: None,
@@ -343,6 +374,7 @@ impl ProtocolWireEvent {
             data: Value::Null,
             has_json_data: false,
             raw_sse_frame: None,
+            raw_websocket_message: None,
             raw_json_body: None,
             raw_http_body: Some(raw_http_body),
             sse_id: None,
@@ -431,6 +463,10 @@ impl fmt::Debug for ProtocolWireEvent {
             .field("event_type", &self.event_type)
             .field("has_json_data", &self.has_json_data)
             .field("has_raw_sse_frame", &self.raw_sse_frame.is_some())
+            .field(
+                "has_raw_websocket_message",
+                &self.raw_websocket_message.is_some(),
+            )
             .field("has_raw_json_body", &self.raw_json_body.is_some())
             .field("has_raw_http_body", &self.raw_http_body.is_some())
             .field("has_sse_id", &self.sse_id.is_some())
@@ -479,12 +515,14 @@ impl UpstreamHttpVersion {
     }
 }
 
-/// Provider transport 边界测得的时间
+/// Provider transport 观测与上游返回的响应耗时
 ///
 /// `first_*_ms` 是相对 `AttemptContext::timing_started_at()` 的请求级偏移，
-/// 与 Core 总耗时使用同一起点并包含选号与重试等待；其余字段是各阶段独立耗时
+/// 与 Core 总耗时使用同一起点并包含选号与重试等待
+/// `upstream_response_ms` 使用上游的响应计时边界，其余字段是各阶段独立耗时
+/// 首事件与输出阶段时间由 Provider 独占采集，Core 不从 canonical 事件补记
 /// 首字边界由 Provider 协议定义，缺失时保留 `None`，不使用首包代替
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ProviderResponseTimings {
     pub transport_decision_wait_ms: Option<u64>,
     pub connect_ms: Option<u64>,
@@ -494,6 +532,16 @@ pub struct ProviderResponseTimings {
     pub first_text_ms: Option<u64>,
     pub first_token_ms: Option<u64>,
     pub provider_processing_ms: Option<u64>,
+    /// 上游返回的单次响应创建到完成耗时，不使用本地时钟补齐
+    pub upstream_response_ms: Option<u64>,
+    /// 上游排除引擎与客户端工具时间后的 API 耗时
+    pub upstream_api_overhead_ms: Option<f64>,
+    /// 上游响应级引擎耗时；以下专项指标保留毫秒小数及各自内部计量层级
+    pub upstream_engine_ms: Option<f64>,
+    pub upstream_engine_iapi_ttft_ms: Option<f64>,
+    pub upstream_engine_service_ttft_ms: Option<f64>,
+    pub upstream_engine_iapi_tbt_ms: Option<f64>,
+    pub upstream_engine_service_tbt_ms: Option<f64>,
 }
 
 /// Provider 已筛选的响应观测 JSON
@@ -572,7 +620,7 @@ impl fmt::Debug for ProviderResponseHeader {
 }
 
 /// Core 消费的 Provider 执行观测，不会原样进入客户端响应
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderResponseObservation {
     transport: UpstreamTransport,
     http_version: Option<UpstreamHttpVersion>,

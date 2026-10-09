@@ -2,6 +2,7 @@
 
 mod audit;
 mod breaker;
+mod control;
 mod coordinator;
 mod error;
 mod exchange;
@@ -23,7 +24,7 @@ pub use self::{
     error::{CodexWebSocketCloseError, CodexWebSocketExchangeError, CodexWebSocketUpstreamError},
     exchange::{
         CodexWebSocketRateLimitUpdates, CodexWebSocketResponseMetadataUpdates,
-        CodexWebSocketSseStream, CodexWebSocketStreamingExchange,
+        CodexWebSocketStreamingExchange, CodexWebSocketTextStream,
     },
     handshake::responses_websocket_endpoint,
     model::{

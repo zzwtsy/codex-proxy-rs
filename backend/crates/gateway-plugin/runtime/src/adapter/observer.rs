@@ -34,6 +34,7 @@ use crate::{RpcSession, adapter::scope::BindingScope};
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(2);
 const OBSERVATION_ENVELOPE_RESERVE: usize = 16 * 1024;
 
+#[derive(Clone)]
 pub(crate) struct ObserverEntry {
     order: i32,
     plugin_id: String,
@@ -446,6 +447,9 @@ async fn dispatch_websocket_queue(
 }
 
 fn websocket_payload(observation: &WebSocketResponseObservation) -> Result<Vec<u8>, ()> {
+    if let Some(raw) = observation.wire().raw_websocket_message() {
+        return Ok(raw.as_bytes().to_vec());
+    }
     if let Some(raw) = observation.wire().raw_json_body() {
         return Ok(raw.to_vec());
     }
@@ -553,6 +557,13 @@ fn wire_timings(observation: &RequestObservation) -> RequestTimings {
         first_text_ms: timings.first_text_ms,
         first_token_ms: timings.first_token_ms,
         provider_processing_ms: timings.provider_processing_ms,
+        upstream_response_ms: timings.upstream_response_ms,
+        upstream_api_overhead_ms: timings.upstream_api_overhead_ms,
+        upstream_engine_ms: timings.upstream_engine_ms,
+        upstream_engine_iapi_ttft_ms: timings.upstream_engine_iapi_ttft_ms,
+        upstream_engine_service_ttft_ms: timings.upstream_engine_service_ttft_ms,
+        upstream_engine_iapi_tbt_ms: timings.upstream_engine_iapi_tbt_ms,
+        upstream_engine_service_tbt_ms: timings.upstream_engine_service_tbt_ms,
         latency_ms: timings.latency_ms,
     }
 }

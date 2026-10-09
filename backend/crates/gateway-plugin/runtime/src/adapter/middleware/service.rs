@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::super::MiddlewareEntry;
+use super::MiddlewareEntry;
 use crate::callback::services::Invocation;
 use gateway_admin::model::plugins::instances::PluginFailurePolicy;
 use gateway_core::engine::middleware::service as core;

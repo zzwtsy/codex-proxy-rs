@@ -6,6 +6,36 @@ use provider_openai::encode_generate_request;
 use super::super::*;
 
 #[test]
+fn encoder_should_preserve_lite_input_without_top_level_instructions_or_tools() {
+    let body = json!({
+        "model": "gpt-test",
+        "store": false,
+        "input": [
+            {"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "Base instructions."}
+            ]},
+            {"type": "additional_tools", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+            ]},
+            {"type": "message", "role": "assistant", "phase": "partial_answer",
+             "content": [{"type": "output_text", "text": "Still working."}]},
+            {"type": "message", "role": "user", "content": "Continue."}
+        ]
+    });
+    let encoded = encode_downstream_request(body.clone());
+
+    assert_eq!(Value::Object(encoded.body().clone()), body);
+    let websocket =
+        provider_openai::transport::protocol::websocket::websocket_response_create_payload_text(
+            &encoded,
+        )
+        .expect("encode Lite WebSocket request");
+    let mut expected = body;
+    expected["type"] = json!("response.create");
+    assert_eq!(serde_json::from_str::<Value>(&websocket).unwrap(), expected);
+}
+
+#[test]
 fn encoder_should_adapt_pi_responses_parameters_without_losing_codex_fields() {
     // 对照本机 Pi 0.79.0 普通 Responses 适配在 onPayload 阶段生成的正文；
     // maxTokens、temperature 和长缓存选项最终会产生下面三个顶层字段

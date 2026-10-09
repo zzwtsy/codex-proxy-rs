@@ -22,7 +22,7 @@ const columns = computed(() => defineTableColumns<KeyUsageRecord>([
   { key: 'tokenDetails', label: 'TOKEN', kind: 'numeric', size: 'xl' },
   { key: 'billing', label: '费用', kind: 'numeric', size: 'xl' },
   { key: 'latency', label: '延迟', kind: 'numeric', size: 'xl' },
-  { key: 'performance', label: '性能', kind: 'numeric', size: 'lg' },
+  { key: 'performance', label: '速率', kind: 'numeric', size: 'lg' },
   ...(kind.value === 'error' ? [{ key: 'statusCode', label: '状态', kind: 'status' as const }] : []),
   { key: 'createdAt', label: '时间', kind: 'datetime' },
   { key: 'clientIp', label: 'IP', kind: 'custom', size: '3xl' },

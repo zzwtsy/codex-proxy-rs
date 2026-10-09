@@ -175,12 +175,13 @@ pub trait PluginDistribution: Send + Sync {
 /// Runtime 只解释插件包格式；安装事务与来源选择归 Admin
 #[async_trait]
 pub trait PluginPackageInspector: Send + Sync {
-    /// 可解析但版本范围未经宿主承诺的诊断，不决定启动资格
+    /// 完整校验包并返回版本范围诊断；校验失败与可加载但未经宿主承诺的提醒分开
     async fn compatibility_warning(
         &self,
-        _archive: Arc<[u8]>,
-        _expected_sha256: String,
+        archive: Arc<[u8]>,
+        expected_sha256: String,
     ) -> Result<Option<String>, AdminError> {
+        self.inspect(archive, Some(expected_sha256)).await?;
         Ok(None)
     }
 

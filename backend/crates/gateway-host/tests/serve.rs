@@ -1,4 +1,4 @@
-//! 验证宿主服务关闭时的连接排空、超时与并发唤醒
+//! 验证统一关闭入口跳过会话等待、保留后台落盘及清理超时
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -6,17 +6,19 @@ use std::time::Duration;
 
 use axum::{Router, routing::get};
 use futures::future::BoxFuture;
+use gateway_admin::ports::system::{
+    SystemOperationError, SystemRestartPreflight, SystemUpdateCandidate,
+};
 use gateway_core::diagnostics::{OperationalDiagnostics, OperationalFailure};
 use gateway_core::lifecycle::CancellationToken;
-use gateway_core::lifecycle::ConnectionLifecycle as _;
 use gateway_core::task::{
     DaemonRestartPolicy, DaemonTask, WorkerContribution, WorkerId, WorkerKind,
     WorkerLeaderLeasePort, WorkerLeaseAcquisition, WorkerLeaseError, WorkerLeaseRequest,
     WorkerRegistration, WorkerRunnable, WorkerTaskError,
 };
 use gateway_host::HostBundle;
-use gateway_host::serve::{ConnectionTracker, bind_listener};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use gateway_host::serve::bind_listener;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::support::host::{configuration, run_in_child};
@@ -26,65 +28,6 @@ fn host_bundle_serve_is_a_consuming_process_entrypoint() {
     let _serve = HostBundle::serve;
 
     assert_eq!(std::mem::size_of_val(&_serve), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn wait_until_idle_should_return_immediately_without_active_connections() {
-    let tracker = ConnectionTracker::new(CancellationToken::new());
-    let started = tokio::time::Instant::now();
-
-    tracker.wait_until_idle(Duration::from_secs(30)).await;
-
-    assert_eq!(started.elapsed(), Duration::ZERO);
-}
-
-#[tokio::test(start_paused = true)]
-async fn wait_until_idle_should_give_up_at_timeout_while_connections_remain() {
-    let tracker = ConnectionTracker::new(CancellationToken::new());
-    let _guard = tracker.try_register().expect("register connection");
-    let started = tokio::time::Instant::now();
-
-    tracker.wait_until_idle(Duration::from_secs(30)).await;
-
-    assert_eq!(started.elapsed(), Duration::from_secs(30));
-}
-
-#[tokio::test]
-async fn wait_until_idle_should_wake_when_last_guard_drops_after_first_poll() {
-    let tracker = ConnectionTracker::new(CancellationToken::new());
-    let guard = tracker.try_register().expect("register connection");
-    let mut wait = Box::pin(tracker.wait_until_idle(Duration::from_secs(30)));
-    assert!(futures::poll!(wait.as_mut()).is_pending());
-
-    drop(guard);
-
-    tokio::time::timeout(Duration::from_secs(2), wait)
-        .await
-        .expect("woken by last guard drop instead of waiting out the timeout");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wait_until_idle_should_observe_guard_drop_racing_the_idle_check() {
-    // 回归约束：notified 必须在读取活跃计数前完成注册（enable），否则最后
-    // 一个 guard 在计数检查与首次 poll 之间 drop 时唤醒丢失，只能等满整个
-    // 超时
-    // 多线程反复交错，任何一次丢唤醒都会撞上 2s 超时并触发断言
-    for _ in 0..256 {
-        let tracker = Arc::new(ConnectionTracker::new(CancellationToken::new()));
-        let guard = tracker.try_register().expect("register connection");
-        let waiter = tokio::spawn({
-            let tracker = Arc::clone(&tracker);
-            async move { tracker.wait_until_idle(Duration::from_secs(2)).await }
-        });
-        let dropper = std::thread::spawn(move || drop(guard));
-        let started = std::time::Instant::now();
-        waiter.await.expect("waiter completes");
-        dropper.join().expect("dropper completes");
-        assert!(
-            started.elapsed() < Duration::from_millis(1_900),
-            "idle wakeup was lost and the waiter slept until the drain timeout"
-        );
-    }
 }
 
 #[tokio::test]
@@ -110,74 +53,146 @@ async fn bind_listener_should_retry_until_previous_listener_releases_port() {
 }
 
 #[test]
-fn http_drain_keeps_writer_running_until_the_request_finishes() {
+fn cancellation_skips_connections_but_flushes_and_joins_workers() {
     run_in_child(
-        "serve::http_drain_keeps_writer_running_until_the_request_finishes",
-        async {
-            let directory = tempfile::tempdir().unwrap();
-            let (host, address) = listening_host(directory.path()).await;
-            let cancellation = host.cancellation();
-            let connections = host.connection_lifecycle();
-            let probe = start_workers(&host, false);
-            probe.started.cancelled().await;
-            let (router, entered, finish_request) = request_router(&host, &probe);
-            let server = tokio::spawn(host.serve(router));
-            let mut client = connect_request(address).await;
-            entered.cancelled().await;
-
-            cancellation.cancel();
-            wait_for_draining(connections.as_ref()).await;
-            assert!(connections.try_register().is_err());
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), probe.cancelled.cancelled())
-                    .await
-                    .is_err(),
-                "writer cancelled before the in-flight request finished"
-            );
-            finish_request.add_permits(1);
-            let mut response = String::new();
-            client.read_to_string(&mut response).await.unwrap();
-            server.await.unwrap().unwrap();
-
-            assert!(response.starts_with("HTTP/1.1 200 OK"));
-            assert_eq!(*probe.writes.lock().unwrap(), [1]);
-            assert!(probe.finished.is_cancelled());
-        },
+        "serve::cancellation_skips_connections_but_flushes_and_joins_workers",
+        shutdown_with_pending_request(ShutdownTrigger::Cancellation),
     );
 }
 
 #[test]
-fn drain_timeout_starts_a_separate_worker_shutdown_phase() {
+fn self_restart_skips_connections_but_flushes_and_joins_workers() {
     run_in_child(
-        "serve::drain_timeout_starts_a_separate_worker_shutdown_phase",
+        "serve::self_restart_skips_connections_but_flushes_and_joins_workers",
+        shutdown_with_pending_request(ShutdownTrigger::SelfRestart),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_skips_connections_but_flushes_and_joins_workers() {
+    run_in_child(
+        "serve::sigterm_skips_connections_but_flushes_and_joins_workers",
+        shutdown_with_pending_request(ShutdownTrigger::Signal("-TERM")),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_skips_connections_but_flushes_and_joins_workers() {
+    run_in_child(
+        "serve::sigint_skips_connections_but_flushes_and_joins_workers",
+        shutdown_with_pending_request(ShutdownTrigger::Signal("-INT")),
+    );
+}
+
+enum ShutdownTrigger {
+    Cancellation,
+    SelfRestart,
+    #[cfg(unix)]
+    Signal(&'static str),
+}
+
+async fn shutdown_with_pending_request(trigger: ShutdownTrigger) {
+    let directory = tempfile::tempdir().unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    let mut config = configuration(directory.path());
+    config.listen.port = address.port();
+    config.system_update.deployment_mode = "docker".to_owned();
+    config.system_update.build_type = "source".to_owned();
+    config.system_update.self_restart_enabled = true;
+    config.system_update.update_lock_file = directory.path().join("update.lock");
+    let host = gateway_host::initialize(config).await.unwrap();
+    drop(reservation);
+    let system = host.system_operations();
+    let cancellation = host.cancellation();
+    let connections = host.connection_lifecycle();
+    let guard = connections.try_register().unwrap();
+    let probe = start_workers(&host, true);
+    probe.started.cancelled().await;
+    let (router, entered, _finish_request) = request_router(&host, &probe);
+    let server = tokio::spawn(host.serve(router));
+    let client = connect_request(address).await;
+    entered.cancelled().await;
+    probe.sender.send(7).unwrap();
+
+    match trigger {
+        ShutdownTrigger::Cancellation => cancellation.cancel(),
+        ShutdownTrigger::SelfRestart => {
+            system.restart(Arc::new(AllowRestart)).await.unwrap();
+        }
+        #[cfg(unix)]
+        ShutdownTrigger::Signal(signal) => {
+            // 真实请求进入后信号监听已被 poll，只向隔离的当前测试子进程发送信号
+            assert!(
+                std::process::Command::new("kill")
+                    .args([signal, &std::process::id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(2), probe.cancelled.cancelled())
+        .await
+        .expect("shutdown must not wait for the blocked HTTP request or live guard");
+    assert!(connections.is_draining());
+    assert!(connections.try_register().is_err());
+    drop(guard);
+    assert!(connections.try_register().is_err());
+    assert!(
+        tokio::net::TcpStream::connect(address).await.is_err(),
+        "listener must close before worker cleanup finishes"
+    );
+    assert!(
+        !server.is_finished(),
+        "worker cleanup still needs to finish"
+    );
+    probe.finish_shutdown.add_permits(1);
+    server.await.unwrap().unwrap();
+    assert_eq!(*probe.writes.lock().unwrap(), [7]);
+    assert!(probe.finished.is_cancelled());
+    // 请求仍未结束，独立进程退出时终止连接和挂起 handler
+    drop(client);
+}
+
+#[test]
+fn shutdown_aborts_workers_that_exceed_the_cleanup_budget() {
+    run_in_child(
+        "serve::shutdown_aborts_workers_that_exceed_the_cleanup_budget",
         async {
             let directory = tempfile::tempdir().unwrap();
             let (host, address) = listening_host(directory.path()).await;
             let cancellation = host.cancellation();
-            let connections = host.connection_lifecycle();
             let probe = start_workers(&host, true);
             probe.started.cancelled().await;
-            let (router, entered, finish_request) = request_router(&host, &probe);
+            let (router, entered, _finish_request) = request_router(&host, &probe);
             let server = tokio::spawn(host.serve(router));
             let client = connect_request(address).await;
             entered.cancelled().await;
-
-            let started = tokio::time::Instant::now();
             cancellation.cancel();
-            wait_for_draining(connections.as_ref()).await;
-            probe.cancelled.cancelled().await;
-            assert!(started.elapsed() >= Duration::from_secs(1));
-            assert!(!server.is_finished(), "worker cleanup was not joined");
-            assert!(!probe.finished.is_cancelled());
-            probe.finish_shutdown.add_permits(1);
-            server.await.unwrap().unwrap();
-            assert!(probe.finished.is_cancelled());
 
-            // 超时后真实连接可以仍在 axum 任务中；释放测试端，避免遗留挂起 handler
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .expect("worker cleanup budget must bound process shutdown")
+                .unwrap()
+                .unwrap();
+            probe.dropped.cancelled().await;
+            assert!(probe.cancelled.is_cancelled());
+            assert!(!probe.finished.is_cancelled());
             drop(client);
-            finish_request.add_permits(1);
         },
     );
+}
+
+struct AllowRestart;
+
+#[async_trait::async_trait]
+impl SystemRestartPreflight for AllowRestart {
+    async fn prepare(&self, _: Option<SystemUpdateCandidate>) -> Result<(), SystemOperationError> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -291,12 +306,6 @@ async fn connect_request(address: std::net::SocketAddr) -> tokio::net::TcpStream
     client
 }
 
-async fn wait_for_draining(connections: &dyn gateway_core::lifecycle::ConnectionLifecycle) {
-    while !connections.is_draining() {
-        tokio::task::yield_now().await;
-    }
-}
-
 fn request_router(
     host: &HostBundle,
     probe: &WriterProbe,
@@ -319,7 +328,7 @@ fn request_router(
                     let _connection = connections.try_register().unwrap();
                     entered.cancel();
                     finish.acquire().await.unwrap().forget();
-                    // 对应请求结束后写入终态的时机；drain 超时后的写入允许被拒绝
+                    // 对应请求结束后写入终态的时机；关闭开始后的写入允许被拒绝
                     if sender.send(1).is_ok() {
                         "recorded"
                     } else {

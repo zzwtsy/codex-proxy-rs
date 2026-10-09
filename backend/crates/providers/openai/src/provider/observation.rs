@@ -8,7 +8,7 @@ pub(super) fn endpoint_requested_model(
     if payload.protocol() != PROVIDER_NAME {
         return None;
     }
-    // 只读取 model，避免把编辑请求中的整张图片复制到观测数据
+    // 选号与观测共用模型提取，跳过编辑请求中的图片且不改写原始正文
     #[derive(Deserialize)]
     struct RequestModel {
         model: Option<Value>,
@@ -153,7 +153,7 @@ impl OpenAiResponseObservationState {
         started_at: Instant,
     ) -> bool {
         let mut changed = false;
-        // 首字观测包含非前导结构事件，真实推理与正文仍分别计时
+        // 首字采用官方输出项边界，真实推理与正文仍分别计时
         if signals.output_start {
             changed |= insert_first_timing(&mut self.timings.first_token_ms, started_at);
         }
@@ -175,6 +175,43 @@ impl OpenAiResponseObservationState {
         }
         self.upstream_service_tier = Some(service_tier);
         true
+    }
+
+    pub(super) fn observe_upstream_response_ms(&mut self, duration_ms: Option<u64>) -> bool {
+        let Some(duration_ms) = duration_ms else {
+            return false;
+        };
+        if self.timings.upstream_response_ms == Some(duration_ms) {
+            return false;
+        }
+        self.timings.upstream_response_ms = Some(duration_ms);
+        true
+    }
+
+    pub(super) fn observe_upstream_timing_metrics(
+        &mut self,
+        metrics: crate::transport::protocol::responses::ResponseTimingMetrics,
+    ) -> bool {
+        let previous = self.timings;
+        if metrics.upstream_api_overhead_ms.is_some() {
+            self.timings.upstream_api_overhead_ms = metrics.upstream_api_overhead_ms;
+        }
+        if metrics.upstream_engine_ms.is_some() {
+            self.timings.upstream_engine_ms = metrics.upstream_engine_ms;
+        }
+        if metrics.upstream_engine_iapi_ttft_ms.is_some() {
+            self.timings.upstream_engine_iapi_ttft_ms = metrics.upstream_engine_iapi_ttft_ms;
+        }
+        if metrics.upstream_engine_service_ttft_ms.is_some() {
+            self.timings.upstream_engine_service_ttft_ms = metrics.upstream_engine_service_ttft_ms;
+        }
+        if metrics.upstream_engine_iapi_tbt_ms.is_some() {
+            self.timings.upstream_engine_iapi_tbt_ms = metrics.upstream_engine_iapi_tbt_ms;
+        }
+        if metrics.upstream_engine_service_tbt_ms.is_some() {
+            self.timings.upstream_engine_service_tbt_ms = metrics.upstream_engine_service_tbt_ms;
+        }
+        self.timings != previous
     }
 
     pub(super) fn merge_rate_limit_headers(&mut self, updates: &[(String, String)]) -> bool {

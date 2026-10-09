@@ -24,6 +24,7 @@ use gateway_core::{
     engine::{
         execution::{AuthenticatedClient, ClientTransport},
         middleware::{FrozenMiddlewarePlan, MiddlewareError},
+        response_control::ResponseControl,
     },
     lifecycle::{ConnectionGuard, ConnectionLifecycle},
     operation::OperationKind,
@@ -46,11 +47,12 @@ use super::{
 };
 use connection::{ConnectionEvent, FramePhase, ResponsesWebSocketConnection, WriteContext};
 use forward::{
-    ConnectionReplaySnapshot, ForwardOutcome, execution_response, forward_response,
-    new_replay_capture, send_gateway_error, send_middleware_error, send_protocol_error,
+    ConnectionReplaySnapshot, ForwardOutcome, execution_response, forward_control_event,
+    forward_response, new_replay_capture, send_control, send_gateway_error, send_middleware_error,
+    send_protocol_error,
 };
-use protocol::connection_limit_event;
 pub use protocol::{ResponseCreateFrameError, decode_response_create_with_context};
+use protocol::{connection_limit_event, is_response_create};
 
 const TEXT_FRAMES_ONLY: &str = "Responses WebSocket accepts text frames only";
 const CONNECTION_LIMIT_CLOSE_REASON: &str = "Responses websocket connection limit reached";
@@ -191,10 +193,20 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
     );
     let mut request_count = 0_u64;
     let mut replay = ConnectionReplaySnapshot::default();
+    let mut response_control = ResponseControl::default();
 
     loop {
-        let Some(event) = connection.next_event().await else {
-            break;
+        let event = tokio::select! {
+            event = connection.next_event() => {
+                let Some(event) = event else { break };
+                event
+            }
+            event = response_control.receive() => {
+                if forward_control_event(&mut connection, &response_control, event).await == ForwardOutcome::Disconnect {
+                    break;
+                }
+                continue;
+            }
         };
         let payload = match event {
             ConnectionEvent::Text(payload) => payload,
@@ -212,8 +224,22 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
             expire_connection(&mut connection).await;
             break;
         }
-        request_count = request_count.saturating_add(1);
         let correlation_id = Arc::<str>::from(service.next_request_id());
+        if !is_response_create(&payload) {
+            if send_control(
+                &mut connection,
+                &response_control,
+                &payload,
+                &correlation_id,
+            )
+            .await
+                == ForwardOutcome::Disconnect
+            {
+                break;
+            }
+            continue;
+        }
+        request_count = request_count.saturating_add(1);
         // 初步解码只保留路由事实，避免整份正文跨越准入等待和响应交付
         let model_hint = match decode_response_create_with_context(&payload, &request_headers) {
             Ok(decoded) => Some(decoded.metadata().requested_model().to_owned()),
@@ -251,6 +277,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
             expire_connection(&mut connection).await;
             break;
         }
+        response_control.clear();
         let execution = service.execution();
         let preparation = async {
             // 握手的显式改写可继承，Key 策略与宿主设置仍在每轮执行前刷新
@@ -291,7 +318,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
             }
         };
         let request_id = Arc::<str>::from(prepared.request_id().to_string());
-        let response_control = prepared.response_control();
+        response_control = prepared.response_control();
         let capture = new_replay_capture();
         let validation = ResponseValidationFacts::default();
         let input = RequestInput {
@@ -381,7 +408,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
             &mut replay,
             capture,
             validation,
-            response_control,
+            &response_control,
         )
         .await
             == ForwardOutcome::Disconnect

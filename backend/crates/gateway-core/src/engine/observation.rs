@@ -237,7 +237,7 @@ pub enum RequestObservationOutcome {
 }
 
 /// Core 在业务结果确定后产生的一次最终观察，不包含原始正文或凭据
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RequestObservation {
     event_id: String,
     request_id: ModelRequestId,
@@ -768,8 +768,6 @@ impl ResponseObservation {
     }
 
     pub(super) fn observe_event(&mut self, event: &GatewayEvent) {
-        let elapsed = self.elapsed_ms();
-        observe_event_timing(&mut self.timings, event, elapsed);
         if let GatewayEvent::Usage(observed) = event {
             self.usage.merge(observed);
         }
@@ -806,6 +804,13 @@ impl ResponseObservation {
         self.timings.first_text_ms = None;
         self.timings.first_token_ms = None;
         self.timings.provider_processing_ms = None;
+        self.timings.upstream_response_ms = None;
+        self.timings.upstream_api_overhead_ms = None;
+        self.timings.upstream_engine_ms = None;
+        self.timings.upstream_engine_iapi_ttft_ms = None;
+        self.timings.upstream_engine_service_ttft_ms = None;
+        self.timings.upstream_engine_iapi_tbt_ms = None;
+        self.timings.upstream_engine_service_tbt_ms = None;
     }
 
     pub(super) fn observe_response(&mut self, observation: &ProviderResponseObservation) {
@@ -834,26 +839,26 @@ impl ResponseObservation {
         if let Some(value) = observed.provider_processing_ms {
             self.timings.provider_processing_ms = Some(value);
         }
-    }
-}
-
-fn observe_event_timing(timings: &mut ModelRequestTimings, event: &GatewayEvent, elapsed_ms: u64) {
-    timings.first_event_ms.get_or_insert(elapsed_ms);
-    match event {
-        GatewayEvent::ReasoningDelta(delta) if !delta.text.is_empty() => {
-            timings.first_reasoning_ms.get_or_insert(elapsed_ms);
-            timings.first_token_ms.get_or_insert(elapsed_ms);
+        if let Some(value) = observed.upstream_response_ms {
+            self.timings.upstream_response_ms = Some(value);
         }
-        GatewayEvent::TextDelta(delta) if !delta.text.is_empty() => {
-            timings.first_text_ms.get_or_insert(elapsed_ms);
-            timings.first_token_ms.get_or_insert(elapsed_ms);
+        if let Some(value) = observed.upstream_api_overhead_ms {
+            self.timings.upstream_api_overhead_ms = Some(value);
         }
-        // `response.output_item.added` 会先投影一个空参数的 tool delta；它只是结构帧，
-        // 不能抢在真实工具参数之前成为首个可消费 token
-        GatewayEvent::ToolCallDelta(delta) if !delta.arguments_delta.is_empty() => {
-            timings.first_token_ms.get_or_insert(elapsed_ms);
+        if let Some(value) = observed.upstream_engine_ms {
+            self.timings.upstream_engine_ms = Some(value);
         }
-        GatewayEvent::CalculatedCost(_) | GatewayEvent::ProviderCost(_) => {}
-        _ => {}
+        if let Some(value) = observed.upstream_engine_iapi_ttft_ms {
+            self.timings.upstream_engine_iapi_ttft_ms = Some(value);
+        }
+        if let Some(value) = observed.upstream_engine_service_ttft_ms {
+            self.timings.upstream_engine_service_ttft_ms = Some(value);
+        }
+        if let Some(value) = observed.upstream_engine_iapi_tbt_ms {
+            self.timings.upstream_engine_iapi_tbt_ms = Some(value);
+        }
+        if let Some(value) = observed.upstream_engine_service_tbt_ms {
+            self.timings.upstream_engine_service_tbt_ms = Some(value);
+        }
     }
 }

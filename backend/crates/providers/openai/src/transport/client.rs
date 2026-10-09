@@ -195,6 +195,8 @@ impl fmt::Debug for CodexClientVisibleUpstreamResponse {
 /// Codex 上游 HTTP 客户端错误
 #[derive(Error)]
 pub enum CodexClientError {
+    #[error("privacy policy rejected the request: {0}")]
+    Privacy(#[from] gateway_core::settings::privacy::PrivacyError),
     #[error("connection recovery budget exhausted")]
     ConnectionBudgetExhausted,
     /// Reqwest 传输失败
@@ -279,6 +281,7 @@ impl fmt::Debug for CodexClientError {
             Self::ConnectionBudgetExhausted => {
                 formatter.write_str("CodexClientError::ConnectionBudgetExhausted")
             }
+            Self::Privacy(error) => std::fmt::Debug::fmt(error, formatter),
             Self::Http(_) => formatter.write_str("CodexClientError::Http([REDACTED])"),
             Self::HttpJson(_) => formatter.write_str("CodexClientError::HttpJson([REDACTED])"),
             Self::ErrorBodyRead {
@@ -345,7 +348,8 @@ impl CodexClientError {
             Self::Upstream { transport, .. } | Self::ErrorBodyRead { transport, .. } => {
                 Some(*transport)
             }
-            Self::ConnectionBudgetExhausted
+            Self::Privacy(_)
+            | Self::ConnectionBudgetExhausted
             | Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
             | Self::InvalidHeaderValue(_)
@@ -609,9 +613,9 @@ pub type CodexRateLimitUpdates = CodexWebSocketRateLimitUpdates;
 /// 响应头之后在 live 流中采集的请求级 metadata 更新
 pub type CodexResponseMetadataUpdates = CodexWebSocketResponseMetadataUpdates;
 
-/// Codex Responses 上游 live SSE 响应
+/// Codex Responses 上游流式响应
 pub struct CodexBackendStreamingResponse {
-    /// 上游 SSE 字节流
+    /// HTTP 为 SSE 字节块，WebSocket 为完整 UTF-8 文本消息
     pub body: CodexBackendSseStream,
     /// 实际使用的上游传输
     pub transport: CodexBackendTransport,
@@ -677,6 +681,10 @@ impl OpenAiUpstreamProtocol {
 /// Codex HTTP/SSE 上游客户端
 #[derive(Clone)]
 pub struct CodexBackendClient {
+    pub(super) privacy: Option<(
+        Arc<dyn gateway_core::settings::privacy::CompiledPrivacyPolicy>,
+        gateway_core::lifecycle::CancellationToken,
+    )>,
     pub(super) timezone: gateway_core::time::DeploymentTimeZone,
     pub(super) response_control: Option<gateway_core::engine::response_control::ResponseControl>,
     pub(super) connection_budget: Option<gateway_core::engine::connection::ConnectionBudget>,

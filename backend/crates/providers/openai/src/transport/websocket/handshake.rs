@@ -33,9 +33,10 @@ use super::{
     pump::{PumpKeepalive, PumpLogContext, PumpedWebSocket, RawWsStream},
 };
 
+use super::control::WEBSOCKET_SEND_TIMEOUT;
+
 const WEBSOCKET_EXTENSIONS: &str = "permessage-deflate; client_max_window_bits";
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 impl CodexWebSocketConnection {
     /// 构造 Responses WebSocket 连接描述

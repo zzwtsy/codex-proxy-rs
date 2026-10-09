@@ -95,13 +95,23 @@ impl OpenAiRequestHeaders {
         }
     }
 
-    /// 独立端点只消费会话身份与 turn metadata，不携带 Responses 的连接状态
+    /// 独立端点保留业务扩展头与会话身份，不携带 Responses 的连接状态
     pub(crate) fn session_context(&self) -> Map<String, Value> {
         let mut context = Map::new();
         insert_protocol_context(&mut context, "session_id", self.session_id.as_ref());
         insert_protocol_context(&mut context, "thread_id", self.thread_id.as_ref());
         insert_protocol_context(&mut context, "turn_metadata", self.turn_metadata.as_ref());
+        self.insert_passthrough_headers(&mut context);
         context
+    }
+
+    fn insert_passthrough_headers(&self, context: &mut Map<String, Value>) {
+        if !self.passthrough_headers.is_empty() {
+            context.insert(
+                PASSTHROUGH_HEADERS_CONTEXT_KEY.to_owned(),
+                Value::Array(self.passthrough_headers.clone()),
+            );
+        }
     }
 
     fn protocol_context(
@@ -153,12 +163,7 @@ impl OpenAiRequestHeaders {
         insert_protocol_context(&mut context, "turn_id", self.turn_id.as_ref());
         insert_protocol_context(&mut context, "responses_lite", self.responses_lite.as_ref());
         insert_protocol_context(&mut context, "memgen_request", self.memgen_request.as_ref());
-        if !self.passthrough_headers.is_empty() {
-            context.insert(
-                PASSTHROUGH_HEADERS_CONTEXT_KEY.to_owned(),
-                Value::Array(self.passthrough_headers.clone()),
-            );
-        }
+        self.insert_passthrough_headers(&mut context);
         if let Some(use_websocket) = use_websocket {
             context.insert("use_websocket".to_owned(), Value::Bool(use_websocket));
         }

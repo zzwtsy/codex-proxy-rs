@@ -28,6 +28,7 @@ use crate::{RpcSession, callback::PluginCallbacks};
 
 const IDENTIFIER_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub(crate) struct FrontendAuthenticationEntry {
     identities: BTreeMap<String, ClientApiKeyId>,
     exclusive: bool,

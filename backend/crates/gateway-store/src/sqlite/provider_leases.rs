@@ -14,7 +14,7 @@ use gateway_core::{
     lifecycle::REQUEST_LEASE_TTL,
     policy::ClientApiKeyId,
     provider_ports::{
-        ProviderLeaseAcquisition, ProviderLeasePort, ProviderLeaseRequest,
+        ProviderConcurrencyPool, ProviderLeaseAcquisition, ProviderLeasePort, ProviderLeaseRequest,
         ProviderRefreshCapacityRequest, ProviderSchedulingLeaseRequest, ProviderSchedulingState,
         ProviderStoreError, ProviderStoreErrorKind,
     },
@@ -73,6 +73,7 @@ impl SqliteProviderLeaseCoordinator {
     async fn load_signals(
         &self,
         accounts: &[ProviderAccountId],
+        pool: ProviderConcurrencyPool,
     ) -> Result<BTreeMap<ProviderAccountId, AccountRuntimeSignals>, ProviderStoreError> {
         let ids = accounts
             .iter()
@@ -80,7 +81,7 @@ impl SqliteProviderLeaseCoordinator {
             .collect::<Vec<_>>();
         let signals = self
             .repository
-            .credential_runtime_signals(&ids)
+            .runtime_signals(&ids, CredentialLeaseScope::scheduling(pool))
             .await
             .map_err(|_| unavailable("load scheduling signals"))?;
         signals
@@ -115,7 +116,7 @@ impl SqliteProviderLeaseCoordinator {
         let acquisition = self
             .repository
             .try_acquire_bounded_lease(&CredentialBoundedLeaseRequest {
-                scope: CredentialLeaseScope::ProviderAccount,
+                scope: CredentialLeaseScope::scheduling(request.concurrency_pool()),
                 resource_id: request.account_id().as_str().to_owned(),
                 owner_id: self.owner_id("request"),
                 max_concurrent: request.max_concurrent().get(),
@@ -164,9 +165,10 @@ impl ProviderLeasePort for SqliteProviderLeaseCoordinator {
         client_api_key_id: &'a ClientApiKeyId,
         provider_kind: &'a ProviderKind,
         accounts: &'a [ProviderAccountId],
+        pool: ProviderConcurrencyPool,
     ) -> futures::future::BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async move {
-            let signals = self.load_signals(accounts).await?;
+            let signals = self.load_signals(accounts, pool).await?;
             let cursor = self.next_cursor(client_api_key_id, provider_kind)?;
             Ok(ProviderSchedulingState::new(signals, cursor))
         })

@@ -47,7 +47,7 @@ const requestActivity = computed(() => requestActivityByBucket(
 const viewOptions = [
   { label: '总耗时', value: 'total' },
   { label: '首字', value: 'firstToken' },
-  { label: '吞吐', value: 'throughput' },
+  { label: '速率', value: 'throughput' },
   { label: '调度', value: 'scheduling' },
 ]
 
@@ -238,7 +238,7 @@ function formatThroughput(value: number | null) {
   <BaseCard
     as="article"
     title="响应速度"
-    description="延迟、吞吐与调度分位"
+    description="延迟、速率与调度分位"
     class="min-h-90 xl:h-full"
   >
     <template #actions>
@@ -265,7 +265,7 @@ function formatThroughput(value: number | null) {
             activeView === 'firstToken'
               ? '当前范围没有首字耗时样本'
               : activeView === 'throughput'
-                ? '当前范围没有吞吐样本'
+                ? '当前范围没有速率样本'
                 : activeView === 'scheduling'
                   ? '当前范围没有调度或容量样本'
                   : '当前范围没有总耗时样本'

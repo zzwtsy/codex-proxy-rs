@@ -1,5 +1,7 @@
 //! PostgreSQL 迁移屏障、连接池与会话级资源预算
 
+use std::time::Duration;
+
 use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -37,11 +39,34 @@ pub async fn connect_and_migrate(
         )
         .await
         .map_err(|source| postgres_unavailable("connect PostgreSQL for migrations", source))?;
-    if let Err(error) = MIGRATOR.run(&migration_pool).await {
-        migration_pool.close().await;
+    let started = tokio::time::Instant::now();
+    tracing::info!(target: "gateway_startup", "开始检查并执行数据库迁移");
+    let result = {
+        let migration = MIGRATOR.run(&migration_pool);
+        tokio::pin!(migration);
+        let progress_interval = Duration::from_secs(15);
+        let mut progress = tokio::time::interval_at(started + progress_interval, progress_interval);
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut migration => break result,
+                _ = progress.tick() => {
+                    // 迁移或迁移锁等待都不能被进度提示中断，不将已等待时间冒充完成比例
+                    tracing::info!(target: "gateway_startup", elapsed_seconds = started.elapsed().as_secs(),
+                        "数据库迁移仍在执行或等待锁，请等待完成，避免重复重启");
+                }
+            }
+        }
+    };
+    migration_pool.close().await;
+    if let Err(error) = result {
+        tracing::error!(target: "gateway_startup", elapsed_seconds = started.elapsed().as_secs_f64(),
+            "数据库迁移失败");
         return Err(postgres_unavailable("apply PostgreSQL migrations", error));
     }
-    migration_pool.close().await;
+    tracing::info!(target: "gateway_startup", elapsed_seconds = started.elapsed().as_secs_f64(),
+        "数据库迁移检查完成");
 
     connect_pool(connect_options, pool_config, false).await
 }

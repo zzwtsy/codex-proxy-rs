@@ -23,6 +23,7 @@ pub(crate) use registration::prepare;
 
 pub(crate) const MAXIMUM_BODY_BYTES: usize = 1024 * 1024;
 
+#[derive(Clone)]
 pub(crate) struct ManagementEntry {
     pub(crate) view: PluginManagementView,
     routes: Vec<ManagementRoute>,

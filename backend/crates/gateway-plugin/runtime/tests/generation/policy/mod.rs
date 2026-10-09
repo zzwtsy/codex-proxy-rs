@@ -3,6 +3,7 @@
 mod compatibility;
 mod facts;
 mod http;
+mod lifecycle;
 mod mounts;
 mod service;
 mod websocket;
@@ -704,6 +705,13 @@ fn middleware_context(transport: ClientTransport) -> MiddlewareContext {
 }
 
 fn attempt_middleware_context(effects: Arc<ExecutionEffects>) -> MiddlewareContext {
+    attempt_middleware_context_for_transport(effects, ClientTransport::HttpJson)
+}
+
+fn attempt_middleware_context_for_transport(
+    effects: Arc<ExecutionEffects>,
+    transport: ClientTransport,
+) -> MiddlewareContext {
     MiddlewareContext::new(
         MiddlewareTarget {
             request_id: ModelRequestId::new("req_attempt_http").unwrap(),
@@ -711,7 +719,7 @@ fn attempt_middleware_context(effects: Arc<ExecutionEffects>) -> MiddlewareConte
             attempt_index: Some(NonZeroU32::MIN),
             operation: Some(OperationKind::Generate),
             endpoint: "/v1/responses".into(),
-            transport: ClientTransport::HttpJson,
+            transport,
             provider: Some(ProviderKind::new("openai").unwrap()),
             model: Some("public-a".into()),
             account_id: Some(ProviderAccountId::new("acct_openai").unwrap()),

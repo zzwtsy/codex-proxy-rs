@@ -972,7 +972,7 @@ async fn websocket_execute_response_create_request_should_capture_internal_metad
 
     let response = execute_response_create_request(&prepared)
         .await
-        .expect("internal events should update metadata without forwarding");
+        .expect("metadata should be forwarded while rate limits remain local");
     server.await.unwrap();
 
     assert_eq!(response.turn_state.as_deref(), Some("turn-from-metadata"));
@@ -981,7 +981,7 @@ async fn websocket_execute_response_create_request_should_capture_internal_metad
         Some("gpt-internal-report")
     );
     assert!(!response.body.contains("codex.rate_limits"));
-    assert!(!response.body.contains("response.metadata"));
+    assert!(response.body.contains("response.metadata"));
     assert!(response.body.contains("event: response.completed"));
     assert!(
         response
@@ -1043,7 +1043,7 @@ async fn websocket_codex_metadata_should_capture_first_turn_state_without_changi
 
     assert_eq!(response.turn_state.as_deref(), Some("turn-first"));
     assert!(response.body.contains("event: codex.response.metadata"));
-    assert!(!response.body.contains("event: response.metadata\n"));
+    assert!(response.body.contains("event: response.metadata\n"));
     assert!(response.body.contains("event: response.completed"));
 }
 
@@ -1929,7 +1929,8 @@ async fn codex_backend_client_stream_should_preserve_burst_during_downstream_bac
     server.await.unwrap();
 
     assert_eq!(
-        body.matches("event: response.output_text.delta").count(),
+        body.matches("\"type\":\"response.output_text.delta\"")
+            .count(),
         BURST_FRAMES + 1
     );
     assert!(body.contains("initial;"));

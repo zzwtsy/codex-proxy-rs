@@ -9,6 +9,14 @@ use crate::{
 use futures::future::BoxFuture;
 use std::{collections::BTreeMap, fmt, num::NonZeroU32, time::Duration};
 
+/// 账号内独立计数的调度容量池；Provider 决定请求归属，Store 只隔离租约
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProviderConcurrencyPool {
+    #[default]
+    Shared,
+    Reserved,
+}
+
 /// 一个 Provider 的完整可重建调度状态
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSchedulingState {
@@ -46,6 +54,7 @@ pub struct ProviderSchedulingLeaseRequest {
     account_id: ProviderAccountId,
     credential_revision: CredentialRevision,
     max_concurrent: AccountConcurrency,
+    concurrency_pool: ProviderConcurrencyPool,
     request_interval: Duration,
     deadline: crate::lifecycle::Deadline,
     cancellation: crate::lifecycle::CancellationToken,
@@ -66,6 +75,7 @@ impl ProviderSchedulingLeaseRequest {
             account_id,
             credential_revision,
             max_concurrent: max_concurrent.into(),
+            concurrency_pool: ProviderConcurrencyPool::Shared,
             request_interval,
             deadline: deadline.into(),
             cancellation: crate::lifecycle::CancellationToken::new(),
@@ -76,6 +86,17 @@ impl ProviderSchedulingLeaseRequest {
     pub fn with_cancellation(mut self, cancellation: crate::lifecycle::CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
+    }
+
+    #[must_use]
+    pub const fn with_concurrency_pool(mut self, pool: ProviderConcurrencyPool) -> Self {
+        self.concurrency_pool = pool;
+        self
+    }
+
+    #[must_use]
+    pub const fn concurrency_pool(&self) -> ProviderConcurrencyPool {
+        self.concurrency_pool
     }
 
     #[must_use]
@@ -145,11 +166,13 @@ pub enum ProviderLeaseRequest {
 }
 
 pub trait ProviderLeasePort: Send + Sync {
+    /// 按目标容量池读取在途数，账号最小请求间隔仍跨池共享
     fn load_state<'a>(
         &'a self,
         client_api_key_id: &'a ClientApiKeyId,
         provider_kind: &'a ProviderKind,
         accounts: &'a [ProviderAccountId],
+        pool: ProviderConcurrencyPool,
     ) -> BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>>;
 
     fn try_acquire(
@@ -157,7 +180,7 @@ pub trait ProviderLeasePort: Send + Sync {
         request: ProviderLeaseRequest,
     ) -> BoxFuture<'_, Result<ProviderLeaseAcquisition, ProviderStoreError>>;
 
-    /// 读取指定账号当前的在途请求数；只用于容量熔断的峰值证据，
+    /// 读取指定账号普通池的在途请求数；只用于容量熔断的峰值证据，
     /// 支持租约信号的存储实现覆盖，否则视为不可观测（空映射）
     fn account_in_flight<'a>(
         &'a self,

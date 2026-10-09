@@ -50,6 +50,36 @@ async fn list_route_should_keep_camel_case_group_and_page_wire() {
 }
 
 #[tokio::test]
+async fn options_route_should_return_only_lightweight_group_fields() {
+    let fixture = authenticated_fixture().await;
+    let response = request(
+        router(&fixture),
+        Method::GET,
+        "/api/admin/account-groups/options?page=1&pageSize=1&search=alpha&enabled=true",
+        None,
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(
+        value["data"]["items"][0],
+        json!({
+            "id": PRIMARY_GROUP_ID,
+            "name": "Alpha routing",
+            "color": "#2563EBFF",
+            "enabled": true
+        })
+    );
+    assert_eq!(value["data"]["page"]["page"], 1);
+    assert_eq!(value["data"]["page"]["pageSize"], 1);
+    assert_eq!(value["data"]["page"]["total"], 1);
+    assert_eq!(value["data"]["page"]["totalPages"], 1);
+    assert_eq!(value["data"]["configRevision"], 7);
+}
+
+#[tokio::test]
 async fn create_route_should_create_an_empty_group() {
     let fixture = authenticated_fixture().await;
     let response = request(
@@ -163,6 +193,11 @@ async fn list_route_should_reject_unknown_and_invalid_pagination_fields() {
         "/api/admin/account-groups?page=0",
         "/api/admin/account-groups?pageSize=0",
         "/api/admin/account-groups?pageSize=201",
+        "/api/admin/account-groups/options?other=true",
+        "/api/admin/account-groups/options?page=0",
+        "/api/admin/account-groups/options?pageSize=0",
+        "/api/admin/account-groups/options?pageSize=201",
+        "/api/admin/account-groups/options?search=%00",
     ] {
         let response = request(router(&fixture), Method::GET, uri, None, true).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
@@ -219,6 +254,14 @@ async fn account_group_routes_should_require_admin_authentication() {
         false,
     )
     .await;
+    let options_response = request(
+        router(&fixture),
+        Method::GET,
+        "/api/admin/account-groups/options",
+        None,
+        false,
+    )
+    .await;
     let post_response = request(
         router(&fixture),
         Method::POST,
@@ -229,7 +272,27 @@ async fn account_group_routes_should_require_admin_authentication() {
     .await;
 
     assert_eq!(get_response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(options_response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(post_response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn options_route_should_reject_client_key_identity() {
+    let fixture = crate::support::key_fixture().await;
+    let response = router(&fixture)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/admin/account-groups/options")
+                .header("x-api-key", crate::support::RAW_KEY)
+                .header("x-request-id", "req_account_group_options_client_key")
+                .body(Body::empty())
+                .expect("client key options request"),
+        )
+        .await
+        .expect("client key options response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 async fn authenticated_fixture() -> AdminTestFixture {

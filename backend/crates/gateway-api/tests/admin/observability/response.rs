@@ -233,6 +233,22 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     let now = Utc::now();
+    let mut record = usage_record_with_account(
+        "req_detail",
+        "acct_snap_a",
+        "Snapshot Alpha",
+        "alpha@example.invalid",
+        "oauth",
+        now,
+    );
+    record.first_token_ms = Some(20);
+    record.upstream_response_ms = Some(1_000);
+    record.upstream_api_overhead_ms = Some(120.25);
+    record.upstream_engine_ms = Some(6400.0);
+    record.upstream_engine_iapi_ttft_ms = Some(650.5);
+    record.upstream_engine_service_ttft_ms = Some(720.25);
+    record.upstream_engine_iapi_tbt_ms = Some(18.45);
+    record.upstream_engine_service_tbt_ms = Some(20.12);
     fixture
         .usage_detail
         .lock()
@@ -240,14 +256,7 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
         .replace(UsageDetail {
             trace: None,
             related_requests: Vec::new(),
-            request: usage_record_with_account(
-                "req_detail",
-                "acct_snap_a",
-                "Snapshot Alpha",
-                "alpha@example.invalid",
-                "oauth",
-                now,
-            ),
+            request: record,
             attempts: vec![UsageAttempt {
                 source: "ops_event".to_owned(),
                 id: "ops_detail".to_owned(),
@@ -300,6 +309,39 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
         .await
         .expect("usage detail body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage detail JSON");
+    assert_eq!(value["data"]["firstTokenLatencyMs"], 20);
+    assert_eq!(value["data"]["latencyDetails"]["upstreamResponseMs"], 1_000);
+    assert_eq!(
+        value["data"]["latencyDetails"]["upstreamApiOverheadMs"],
+        json!(120.25)
+    );
+    assert_eq!(
+        value["data"]["latencyDetails"]["upstreamEngineMs"],
+        json!(6400.0)
+    );
+    assert_eq!(
+        value["data"]["latencyDetails"]["upstreamEngineIapiTtftMs"],
+        json!(650.5)
+    );
+    assert_eq!(
+        value["data"]["latencyDetails"]["upstreamEngineServiceTtftMs"],
+        json!(720.25)
+    );
+    assert_eq!(
+        value["data"]["latencyDetails"]["upstreamEngineIapiTbtMs"],
+        json!(18.45)
+    );
+    assert_eq!(
+        value["data"]["latencyDetails"]["upstreamEngineServiceTbtMs"],
+        json!(20.12)
+    );
+    assert!(value["data"].get("firstTokenMs").is_none());
+    assert!(value["data"].get("firstTokenLatencyMsDisplay").is_none());
+    assert!(
+        value["data"]["latencyDetails"]
+            .get("firstTokenMs")
+            .is_none()
+    );
     assert_eq!(
         serde_json::json!({
             "accountId": value["data"]["accountId"],
@@ -714,6 +756,13 @@ fn usage_record_with_account(
         first_text_ms: None,
         first_token_ms: None,
         provider_processing_ms: None,
+        upstream_response_ms: None,
+        upstream_api_overhead_ms: None,
+        upstream_engine_ms: None,
+        upstream_engine_iapi_ttft_ms: None,
+        upstream_engine_service_ttft_ms: None,
+        upstream_engine_iapi_tbt_ms: None,
+        upstream_engine_service_tbt_ms: None,
         latency_ms: None,
         admission_decision_ms: None,
         account_selection_wait_ms: None,
@@ -846,6 +895,13 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             first_text_ms: Some(19),
             first_token_ms: Some(20),
             provider_processing_ms: Some(21),
+            upstream_response_ms: Some(2_000),
+            upstream_api_overhead_ms: None,
+            upstream_engine_ms: None,
+            upstream_engine_iapi_ttft_ms: None,
+            upstream_engine_service_ttft_ms: None,
+            upstream_engine_iapi_tbt_ms: None,
+            upstream_engine_service_tbt_ms: None,
             latency_ms: Some(31),
             admission_decision_ms: Some(1),
             account_selection_wait_ms: Some(2),
@@ -982,8 +1038,8 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
                 "firstEventMs": 17,
                 "firstReasoningMs": 18,
                 "firstTextMs": 19,
-                "firstTokenMs": 20,
                 "openaiProcessingMs": 21,
+                "upstreamResponseMs": 2000,
             },
             "firstTokenLatencyMs": 20,
             "latencyMs": 31,

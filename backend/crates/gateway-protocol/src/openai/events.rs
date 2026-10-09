@@ -275,27 +275,21 @@ fn retry_after_seconds_field(value: &Value) -> Option<u64> {
 }
 
 fn retry_after_seconds_header(value: &Value) -> Option<u64> {
-    value
-        .get("headers")
-        .and_then(Value::as_object)
-        .and_then(|headers| {
-            headers.iter().find_map(|(name, value)| {
-                if name.eq_ignore_ascii_case("retry-after") {
-                    json_value_as_retry_after_seconds(value)
-                } else {
-                    None
-                }
-            })
+    let headers = value.get("headers")?.as_object()?;
+    // 官方先按 HTTP 头值校验，再覆盖大小写不同的同名头；最后才解释重试时间
+    // 合法但无法解析为时间的末项也会覆盖前值，非法头值和数组不参与覆盖
+    let header = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .filter_map(|(_, value)| match value {
+            Value::String(value) => http::HeaderValue::from_str(value).ok(),
+            Value::Number(_) | Value::Bool(_) => {
+                http::HeaderValue::from_str(&value.to_string()).ok()
+            }
+            Value::Null | Value::Array(_) | Value::Object(_) => None,
         })
-}
-
-fn json_value_as_retry_after_seconds(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(value) => value.as_u64(),
-        Value::String(value) => super::headers::parse_retry_after_seconds(value),
-        Value::Array(values) => values.first().and_then(json_value_as_retry_after_seconds),
-        Value::Null | Value::Bool(_) | Value::Object(_) => None,
-    }
+        .next_back()?;
+    super::headers::parse_retry_after_seconds(header.to_str().ok()?)
 }
 
 /// 标准化的单个限流窗口

@@ -34,95 +34,223 @@ fn only_account_scheduling_leases_allow_unlimited_concurrency() {
 }
 
 #[tokio::test]
-async fn maintained_scheduling_lease_survives_initial_ttl_and_releases_on_drop() {
+async fn reserved_and_normal_leases_enforce_independent_atomic_limits_and_release() {
     let Some((repository, _, _)) = repository().await else {
         return;
     };
-    let mut request = scheduling_request("acct_long_request", "worker-long", 1, Duration::ZERO);
-    request.ttl = Duration::from_secs(1);
-    let lease = acquired(
+    let normal = scheduling_request("acct_independent", "normal", 2, Duration::ZERO);
+    let reserved = CredentialBoundedLeaseRequest {
+        scope: CredentialLeaseScope::ProviderAccountReserved,
+        max_concurrent: 3,
+        ..normal.clone()
+    };
+    let attempts = futures::future::join_all((0..20).map(|index| {
+        let request = if index % 2 == 0 {
+            normal.clone()
+        } else {
+            reserved.clone()
+        };
+        let repository = &repository;
+        async move {
+            (
+                request.scope,
+                repository
+                    .try_acquire_bounded_lease(&request)
+                    .await
+                    .unwrap(),
+            )
+        }
+    }))
+    .await;
+    let mut normal_leases = Vec::new();
+    let mut reserved_leases = Vec::new();
+    for (scope, acquisition) in attempts {
+        if let CredentialBoundedLeaseAcquisition::Acquired(lease) = acquisition {
+            if scope == CredentialLeaseScope::ProviderAccount {
+                normal_leases.push(lease);
+            } else {
+                reserved_leases.push(lease);
+            }
+        }
+    }
+    assert_eq!((normal_leases.len(), reserved_leases.len()), (2, 3));
+    assert_eq!(
         repository
-            .try_acquire_bounded_lease(&request)
+            .credential_runtime_signals(std::slice::from_ref(&normal.resource_id))
+            .await
+            .unwrap()[0]
+            .in_flight,
+        2
+    );
+
+    reserved_leases.pop().unwrap().release().await.unwrap();
+    assert!(matches!(
+        repository.try_acquire_bounded_lease(&normal).await.unwrap(),
+        CredentialBoundedLeaseAcquisition::Busy { .. }
+    ));
+    reserved_leases.push(acquired(
+        repository
+            .try_acquire_bounded_lease(&reserved)
             .await
             .unwrap(),
-    );
-    let cancellation = gateway_core::lifecycle::CancellationToken::new();
-    let lease = lease
-        .maintain(Default::default(), cancellation.clone())
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    assert!(!cancellation.is_cancelled());
+    ));
+    normal_leases.pop().unwrap().release().await.unwrap();
     assert!(matches!(
         repository
-            .try_acquire_bounded_lease(&request)
+            .try_acquire_bounded_lease(&reserved)
             .await
             .unwrap(),
         CredentialBoundedLeaseAcquisition::Busy { .. }
     ));
-    drop(lease);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if let CredentialBoundedLeaseAcquisition::Acquired(replacement) = repository
+    normal_leases.push(acquired(
+        repository.try_acquire_bounded_lease(&normal).await.unwrap(),
+    ));
+    for lease in normal_leases.into_iter().chain(reserved_leases) {
+        lease.release().await.unwrap();
+    }
+    assert_eq!(
+        repository
+            .credential_runtime_signals(std::slice::from_ref(&normal.resource_id))
+            .await
+            .unwrap()[0]
+            .in_flight,
+        0
+    );
+}
+
+#[tokio::test]
+async fn independent_capacity_pools_preserve_the_shared_account_request_interval() {
+    let Some((repository, _, _)) = repository().await else {
+        return;
+    };
+    for first_reserved in [false, true] {
+        let normal = scheduling_request(
+            &format!("acct_interval_{first_reserved}"),
+            "worker",
+            2,
+            Duration::from_secs(30),
+        );
+        let reserved = CredentialBoundedLeaseRequest {
+            scope: CredentialLeaseScope::ProviderAccountReserved,
+            ..normal.clone()
+        };
+        let (first, second) = if first_reserved {
+            (&reserved, &normal)
+        } else {
+            (&normal, &reserved)
+        };
+        acquired(repository.try_acquire_bounded_lease(first).await.unwrap())
+            .release()
+            .await
+            .unwrap();
+        assert!(
+            matches!(repository.try_acquire_bounded_lease(second).await.unwrap(), CredentialBoundedLeaseAcquisition::Busy { retry_after: Some(value) } if value > Duration::ZERO)
+        );
+    }
+}
+
+#[tokio::test]
+async fn maintained_scheduling_lease_survives_initial_ttl_and_releases_on_drop() {
+    for scope in [
+        CredentialLeaseScope::ProviderAccount,
+        CredentialLeaseScope::ProviderAccountReserved,
+    ] {
+        let Some((repository, _, _)) = repository().await else {
+            return;
+        };
+        let mut request = scheduling_request("acct_long_request", "worker-long", 1, Duration::ZERO);
+        request.scope = scope;
+        request.ttl = Duration::from_secs(1);
+        let lease = acquired(
+            repository
                 .try_acquire_bounded_lease(&request)
                 .await
-                .unwrap()
-            {
-                replacement.release().await.unwrap();
-                break;
+                .unwrap(),
+        );
+        let cancellation = gateway_core::lifecycle::CancellationToken::new();
+        let lease = lease
+            .maintain(Default::default(), cancellation.clone())
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(!cancellation.is_cancelled());
+        assert!(matches!(
+            repository
+                .try_acquire_bounded_lease(&request)
+                .await
+                .unwrap(),
+            CredentialBoundedLeaseAcquisition::Busy { .. }
+        ));
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let CredentialBoundedLeaseAcquisition::Acquired(replacement) = repository
+                    .try_acquire_bounded_lease(&request)
+                    .await
+                    .unwrap()
+                {
+                    replacement.release().await.unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("dropped request releases its slot");
+        })
+        .await
+        .expect("dropped request releases its slot");
+    }
 }
 
 #[tokio::test]
 async fn maintained_scheduling_lease_does_not_resurrect_a_lost_slot() {
-    let Some((repository, _, _)) = repository().await else {
-        return;
-    };
-    let request = scheduling_request("acct_lost_request", "worker-lost", 1, Duration::ZERO);
-    let lease = acquired(
+    for scope in [
+        CredentialLeaseScope::ProviderAccount,
+        CredentialLeaseScope::ProviderAccountReserved,
+    ] {
+        let Some((repository, _, _)) = repository().await else {
+            return;
+        };
+        let mut request = scheduling_request("acct_lost_request", "worker-lost", 1, Duration::ZERO);
+        request.scope = scope;
+        let lease = acquired(
+            repository
+                .try_acquire_bounded_lease(&request)
+                .await
+                .unwrap(),
+        );
+        let grant = lease.grant().unwrap().clone();
+        let raw = CredentialLeaseRequest {
+            scope: request.scope,
+            resource_id: request.resource_id.clone(),
+            owner_id: request.owner_id.clone(),
+            ttl: request.ttl,
+        };
         repository
-            .try_acquire_bounded_lease(&request)
+            .release_credential_lease(&raw, &grant)
             .await
-            .unwrap(),
-    );
-    let grant = lease.grant().unwrap().clone();
-    let raw = CredentialLeaseRequest {
-        scope: request.scope,
-        resource_id: request.resource_id.clone(),
-        owner_id: request.owner_id.clone(),
-        ttl: request.ttl,
-    };
-    repository
-        .release_credential_lease(&raw, &grant)
-        .await
-        .unwrap();
-    let cancellation = gateway_core::lifecycle::CancellationToken::new();
-    let lease = lease
-        .maintain(Default::default(), cancellation.clone())
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), cancellation.cancelled())
-        .await
-        .expect("lost lease cancels the request");
-    let replacement = acquired(
-        repository
-            .try_acquire_bounded_lease(&request)
+            .unwrap();
+        let cancellation = gateway_core::lifecycle::CancellationToken::new();
+        let lease = lease
+            .maintain(Default::default(), cancellation.clone())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cancellation.cancelled())
             .await
-            .unwrap(),
-    );
-    drop(lease);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(matches!(
-        repository
-            .try_acquire_bounded_lease(&request)
-            .await
-            .unwrap(),
-        CredentialBoundedLeaseAcquisition::Busy { .. }
-    ));
-    replacement.release().await.unwrap();
+            .expect("lost lease cancels the request");
+        let replacement = acquired(
+            repository
+                .try_acquire_bounded_lease(&request)
+                .await
+                .unwrap(),
+        );
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            repository
+                .try_acquire_bounded_lease(&request)
+                .await
+                .unwrap(),
+            CredentialBoundedLeaseAcquisition::Busy { .. }
+        ));
+        replacement.release().await.unwrap();
+    }
 }
 
 #[tokio::test]

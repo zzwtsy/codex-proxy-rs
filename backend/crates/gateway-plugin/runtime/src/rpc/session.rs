@@ -205,16 +205,6 @@ impl RpcSession {
             error
         })
     }
-
-    pub(crate) fn capability_version(
-        &self,
-        capability: gateway_plugin_sdk::Capability,
-    ) -> Option<u32> {
-        self.handshake
-            .contributes
-            .get(&capability)
-            .map(|declaration| declaration.version)
-    }
 }
 
 pub(crate) struct Shared {

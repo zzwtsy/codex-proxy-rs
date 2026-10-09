@@ -4,10 +4,7 @@ use std::collections::BTreeSet;
 
 use gateway_admin::model::{
     AdminError,
-    plugins::{
-        instances::{PluginFailurePolicy, PluginInstance},
-        state::PluginStateConfiguration,
-    },
+    plugins::{instances::PluginInstance, state::PluginStateConfiguration},
 };
 use gateway_plugin_sdk::{Capability, Manifest, Stage};
 use secrecy::ExposeSecret as _;
@@ -47,24 +44,8 @@ pub(super) fn validate(
         if capability != Capability::Observer && binding.event.is_some() {
             return Err(AdminError::invalid("事件订阅只能用于观察绑定"));
         }
-        let frontend_authentication = capability == Capability::FrontendAuthentication;
-        if frontend_authentication
-            && (stage != Stage::Authentication
-                || !matches!(
-                    binding.failure_policy,
-                    PluginFailurePolicy::Reject | PluginFailurePolicy::Delegate
-                )
-                || binding.identity_bindings.is_empty()
-                || !binding.client_key_ids.is_empty()
-                || !binding.account_group_ids.is_empty()
-                || !binding.provider_ids.is_empty()
-                || !binding.models.is_empty())
+        if capability != Capability::FrontendAuthentication && !binding.identity_bindings.is_empty()
         {
-            return Err(AdminError::invalid(
-                "客户端认证绑定必须配置认证阶段、回退策略和身份映射",
-            ));
-        }
-        if !frontend_authentication && !binding.identity_bindings.is_empty() {
             return Err(AdminError::invalid("身份映射只能用于客户端认证绑定"));
         }
     }

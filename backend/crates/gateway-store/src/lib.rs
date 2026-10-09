@@ -51,10 +51,12 @@ mod value;
 mod workers;
 
 pub mod backup;
+pub(crate) mod execution;
 mod plugin_state_rules;
 pub mod postgres;
 mod pricing_validation;
 pub mod redis;
+mod request_observation;
 pub(crate) mod runtime_change;
 pub(crate) mod runtime_settings;
 pub use runtime_settings::{RuntimeSettingsRepository, RuntimeSettingsUpdate};

@@ -1,6 +1,6 @@
 //! 验证健康接口按基础设施与关键 Worker 状态判定可用性
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
@@ -13,11 +13,16 @@ use gateway_core::{
         StartProviderExecution, StartedExecution,
     },
     error::GatewayError,
-    health::{WorkerHealthKey, WorkerHealthSnapshot, WorkerHealthSource, WorkerRuntimeState},
+    health::{
+        HealthProbe, HealthState, WorkerHealthKey, WorkerHealthSnapshot, WorkerHealthSource,
+        WorkerRuntimeState,
+    },
     routing::PublicModelId,
     task::{WorkerId, WorkerKind},
 };
 use tower::ServiceExt;
+
+use crate::support::RecordingDiagnostics;
 
 #[tokio::test]
 async fn healthz_should_return_no_content_when_all_inputs_are_healthy() {
@@ -79,6 +84,214 @@ async fn healthz_should_reject_critical_worker_failure() {
     .expect("health response");
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn healthz_records_probe_changes_once_and_records_recurrence_after_recovery() {
+    let probe = Arc::new(MutableProbe(Mutex::new(HealthState::Unhealthy(
+        "file logging rejected records".to_owned(),
+    ))));
+    let diagnostics = Arc::new(RecordingDiagnostics::default());
+    let router = health_router(vec![probe.clone()], Vec::new(), diagnostics.clone()).await;
+
+    let responses =
+        futures::future::join_all((0..8).map(|_| health_response(router.clone()))).await;
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    {
+        let events = diagnostics.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].component, "health");
+        assert_eq!(
+            events[0].correlation_id.as_deref(),
+            Some("probe:file_logging")
+        );
+        assert_eq!(events[0].message, "Health check failed");
+        assert!(
+            events[0]
+                .details
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("file logging rejected records")
+        );
+    }
+
+    *probe.0.lock().unwrap() = HealthState::Degraded("file logging maintenance failed".to_owned());
+    assert_eq!(
+        health_response(router.clone()).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(diagnostics.0.lock().unwrap().len(), 2);
+    *probe.0.lock().unwrap() = HealthState::Healthy;
+    assert_eq!(
+        health_response(router.clone()).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    *probe.0.lock().unwrap() = HealthState::Degraded("file logging maintenance failed".to_owned());
+    assert_eq!(
+        health_response(router).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(diagnostics.0.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthz_retains_worker_and_completed_probe_failures_when_another_probe_times_out() {
+    let diagnostics = Arc::new(RecordingDiagnostics::default());
+    let router = health_router(
+        vec![
+            Arc::new(MutableProbe(Mutex::new(HealthState::Unhealthy(
+                "file output failed".to_owned(),
+            )))),
+            Arc::new(PendingProbe),
+        ],
+        vec![
+            worker_snapshot(
+                WorkerKind::RuntimeSnapshotReconciliation,
+                WorkerRuntimeState::BackingOff,
+            ),
+            worker_snapshot(
+                WorkerKind::QuotaCatalogHealth,
+                WorkerRuntimeState::BackingOff,
+            ),
+        ],
+        diagnostics.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        health_response(router).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let events = diagnostics.0.lock().unwrap();
+    assert_eq!(events.len(), 3);
+    for (component, reason) in [
+        (
+            "worker:runtime_snapshot_reconciliation:health-test",
+            "test worker failure",
+        ),
+        ("probe:file_logging", "file output failed"),
+        ("probe:pending", "timed_out"),
+    ] {
+        let event = events
+            .iter()
+            .find(|event| event.correlation_id.as_deref() == Some(component))
+            .expect(component);
+        assert!(event.details.as_ref().unwrap().as_str().contains(reason));
+    }
+}
+
+#[tokio::test]
+async fn healthz_retries_failed_diagnostic_admission_without_changing_health_result() {
+    let diagnostics = Arc::new(FailingOnceDiagnostics::default());
+    let router = health_router(
+        vec![Arc::new(MutableProbe(Mutex::new(HealthState::Unhealthy(
+            "file output failed".to_owned(),
+        ))))],
+        Vec::new(),
+        diagnostics.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        health_response(router.clone()).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(diagnostics.recorded.0.lock().unwrap().is_empty());
+    assert_eq!(
+        health_response(router).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(diagnostics.recorded.0.lock().unwrap().len(), 1);
+}
+
+#[derive(Default)]
+struct FailingOnceDiagnostics {
+    failed: std::sync::atomic::AtomicBool,
+    recorded: RecordingDiagnostics,
+}
+
+#[async_trait::async_trait]
+impl gateway_core::diagnostics::OperationalDiagnostics for FailingOnceDiagnostics {
+    async fn record_failure(
+        &self,
+        failure: gateway_core::diagnostics::OperationalFailure,
+    ) -> Result<(), gateway_core::error::StoreError> {
+        if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(gateway_core::error::StoreError::new(
+                gateway_core::error::StoreErrorKind::Unavailable,
+            ));
+        }
+        self.recorded.record_failure(failure).await
+    }
+}
+
+async fn health_router(
+    probes: Vec<Arc<dyn HealthProbe>>,
+    workers: Vec<WorkerHealthSnapshot>,
+    diagnostics: Arc<dyn gateway_core::diagnostics::OperationalDiagnostics>,
+) -> axum::Router {
+    let admin = crate::admin::AdminTestFixture::new().await;
+    gateway_api::initialize(
+        gateway_api::ApiConfig {
+            asset_directory: std::env::temp_dir(),
+            cors_allowed_origins: Vec::new(),
+            request_timeout_seconds: None,
+            request_id_header: "x-request-id".to_owned(),
+        },
+        Arc::new(UnusedExecution),
+        admin.services,
+        probes,
+        Arc::new(StaticWorkerHealth(workers)),
+        Arc::new(crate::openai::TestLifecycle::default()),
+        diagnostics,
+    )
+    .unwrap()
+    .router()
+}
+
+async fn health_response(router: axum::Router) -> axum::response::Response {
+    router
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+struct MutableProbe(Mutex<HealthState>);
+
+impl HealthProbe for MutableProbe {
+    fn name(&self) -> &'static str {
+        "file_logging"
+    }
+
+    fn check(&self) -> BoxFuture<'_, HealthState> {
+        Box::pin(std::future::ready(self.0.lock().unwrap().clone()))
+    }
+}
+
+struct PendingProbe;
+
+impl HealthProbe for PendingProbe {
+    fn name(&self) -> &'static str {
+        "pending"
+    }
+
+    fn check(&self) -> BoxFuture<'_, HealthState> {
+        Box::pin(std::future::pending())
+    }
 }
 
 #[derive(Clone)]

@@ -27,6 +27,97 @@ impl SqliteCredentialLeaseRepository {
         Self { pool }
     }
 
+    pub(crate) async fn runtime_signals(
+        &self,
+        resource_ids: &[String],
+        scope: CredentialLeaseScope,
+    ) -> StoreResult<Vec<CredentialRuntimeSignal>> {
+        for resource_id in resource_ids {
+            crate::require_nonempty("credential runtime signal", "resource_id", resource_id)?;
+        }
+        if resource_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fingerprints = resource_ids
+            .iter()
+            .map(|resource_id| resource_fingerprint("credential lease", resource_id))
+            .collect::<StoreResult<Vec<_>>>()?;
+        let now = datetime_to_micros(Utc::now());
+        let mut cleanup =
+            QueryBuilder::<Sqlite>::new("DELETE FROM credential_leases WHERE scope = ");
+        cleanup.push_bind(scope.as_str());
+        cleanup.push(" AND expires_at_us <= ");
+        cleanup.push_bind(now);
+        cleanup.push(" AND resource_fingerprint IN (");
+        {
+            let mut separated = cleanup.separated(", ");
+            for fingerprint in &fingerprints {
+                separated.push_bind(fingerprint);
+            }
+        }
+        cleanup.push(")");
+        cleanup
+            .build()
+            .execute(&self.pool)
+            .await
+            .map_err(sqlite_unavailable)?;
+
+        // 请求间隔来自共享账号记录，容量计数只读取当前调度池
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT c.resource_fingerprint, count(l.lease_id) AS in_flight,
+                    c.last_started_at_us FROM credential_lease_counters c
+             LEFT JOIN credential_leases l ON l.scope = ",
+        );
+        query.push_bind(scope.as_str());
+        query.push(" AND l.resource_fingerprint = c.resource_fingerprint AND l.expires_at_us > ");
+        query.push_bind(now);
+        query.push(" WHERE c.scope = 'account'");
+        query.push(" AND c.resource_fingerprint IN (");
+        {
+            let mut separated = query.separated(", ");
+            for fingerprint in &fingerprints {
+                separated.push_bind(fingerprint);
+            }
+        }
+        query.push(") GROUP BY c.resource_fingerprint, c.last_started_at_us");
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sqlite_unavailable)?;
+        let mut signals = BTreeMap::new();
+        for row in rows {
+            let fingerprint: String = row
+                .try_get("resource_fingerprint")
+                .map_err(sqlite_unavailable)?;
+            let in_flight: i64 = row.try_get("in_flight").map_err(sqlite_unavailable)?;
+            let last_started: Option<i64> = row
+                .try_get("last_started_at_us")
+                .map_err(sqlite_unavailable)?;
+            signals.insert(
+                fingerprint,
+                (
+                    u32::try_from(in_flight)
+                        .map_err(|_| invalid_lease("in-flight count exceeds u32"))?,
+                    last_started.map(datetime_from_micros).transpose()?,
+                ),
+            );
+        }
+        resource_ids
+            .iter()
+            .zip(fingerprints)
+            .map(|(resource_id, fingerprint)| {
+                let (in_flight, last_started_at) =
+                    signals.get(&fingerprint).cloned().unwrap_or((0, None));
+                Ok(CredentialRuntimeSignal {
+                    resource_id: resource_id.clone(),
+                    in_flight,
+                    last_started_at,
+                })
+            })
+            .collect()
+    }
+
     async fn acquire_with_limits(
         &self,
         request: &CredentialLeaseRequest,
@@ -34,10 +125,21 @@ impl SqliteCredentialLeaseRepository {
         request_interval: Duration,
     ) -> StoreResult<LeaseAttempt> {
         request.validate()?;
-        if max_concurrent == 0 && request.scope != CredentialLeaseScope::ProviderAccount {
+        if max_concurrent == 0
+            && !matches!(
+                request.scope,
+                CredentialLeaseScope::ProviderAccount
+                    | CredentialLeaseScope::ProviderAccountReserved
+            )
+        {
             return Err(invalid_lease("max_concurrent must be positive"));
         }
         let scope = request.scope.as_str();
+        let interval_scope = if request.scope == CredentialLeaseScope::ProviderAccountReserved {
+            CredentialLeaseScope::ProviderAccount.as_str()
+        } else {
+            scope
+        };
         let resource = resource_fingerprint("credential lease", &request.resource_id)?;
         let owner = resource_fingerprint("credential lease owner", &request.owner_id)?;
         let ttl = duration_micros(request.ttl)?;
@@ -58,6 +160,10 @@ impl SqliteCredentialLeaseRepository {
         .execute(&mut *transaction)
         .await
         .map_err(sqlite_unavailable)?;
+        if interval_scope != scope {
+            sqlx::query("INSERT INTO credential_lease_counters (scope, resource_fingerprint) VALUES (?, ?) ON CONFLICT (scope, resource_fingerprint) DO NOTHING")
+                .bind(interval_scope).bind(&resource).execute(&mut *transaction).await.map_err(sqlite_unavailable)?;
+        }
         sqlx::query(
             "DELETE FROM credential_leases              WHERE scope = ? AND resource_fingerprint = ? AND expires_at_us <= ?",
         )
@@ -79,7 +185,7 @@ impl SqliteCredentialLeaseRepository {
         let last_started: Option<i64> = sqlx::query_scalar(
             "SELECT last_started_at_us FROM credential_lease_counters              WHERE scope = ? AND resource_fingerprint = ?",
         )
-        .bind(scope)
+        .bind(interval_scope)
         .bind(&resource)
         .fetch_one(&mut *transaction)
         .await
@@ -112,6 +218,10 @@ impl SqliteCredentialLeaseRepository {
         .await
         .map_err(sqlite_unavailable)?
         .ok_or_else(|| invalid_lease("fencing token reached the SQLite integer limit"))?;
+        if interval_scope != scope {
+            sqlx::query("UPDATE credential_lease_counters SET last_started_at_us = ? WHERE scope = ? AND resource_fingerprint = ?")
+                .bind(now).bind(interval_scope).bind(&resource).execute(&mut *transaction).await.map_err(sqlite_unavailable)?;
+        }
         sqlx::query(
             "INSERT INTO credential_leases              (scope, resource_fingerprint, lease_id, owner_fingerprint, fencing_token, expires_at_us)              VALUES (?, ?, ?, ?, ?, ?)",
         )
@@ -222,83 +332,8 @@ impl CredentialLeaseRepository for SqliteCredentialLeaseRepository {
         &self,
         resource_ids: &[String],
     ) -> StoreResult<Vec<CredentialRuntimeSignal>> {
-        for resource_id in resource_ids {
-            crate::require_nonempty("credential runtime signal", "resource_id", resource_id)?;
-        }
-        if resource_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let fingerprints = resource_ids
-            .iter()
-            .map(|resource_id| resource_fingerprint("credential lease", resource_id))
-            .collect::<StoreResult<Vec<_>>>()?;
-        let now = datetime_to_micros(Utc::now());
-        let mut cleanup = QueryBuilder::<Sqlite>::new(
-            "DELETE FROM credential_leases WHERE scope = 'account' AND expires_at_us <= ",
-        );
-        cleanup.push_bind(now);
-        cleanup.push(" AND resource_fingerprint IN (");
-        {
-            let mut separated = cleanup.separated(", ");
-            for fingerprint in &fingerprints {
-                separated.push_bind(fingerprint);
-            }
-        }
-        cleanup.push(")");
-        cleanup
-            .build()
-            .execute(&self.pool)
+        self.runtime_signals(resource_ids, CredentialLeaseScope::ProviderAccount)
             .await
-            .map_err(sqlite_unavailable)?;
-
-        let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT c.resource_fingerprint, count(l.lease_id) AS in_flight,              c.last_started_at_us FROM credential_lease_counters c              LEFT JOIN credential_leases l ON l.scope = c.scope                AND l.resource_fingerprint = c.resource_fingerprint AND l.expires_at_us > ",
-        );
-        query.push_bind(now);
-        query.push(" WHERE c.scope = 'account' AND c.resource_fingerprint IN (");
-        {
-            let mut separated = query.separated(", ");
-            for fingerprint in &fingerprints {
-                separated.push_bind(fingerprint);
-            }
-        }
-        query.push(") GROUP BY c.resource_fingerprint, c.last_started_at_us");
-        let rows = query
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .map_err(sqlite_unavailable)?;
-        let mut signals = BTreeMap::new();
-        for row in rows {
-            let fingerprint: String = row
-                .try_get("resource_fingerprint")
-                .map_err(sqlite_unavailable)?;
-            let in_flight: i64 = row.try_get("in_flight").map_err(sqlite_unavailable)?;
-            let last_started: Option<i64> = row
-                .try_get("last_started_at_us")
-                .map_err(sqlite_unavailable)?;
-            signals.insert(
-                fingerprint,
-                (
-                    u32::try_from(in_flight)
-                        .map_err(|_| invalid_lease("in-flight count exceeds u32"))?,
-                    last_started.map(datetime_from_micros).transpose()?,
-                ),
-            );
-        }
-        resource_ids
-            .iter()
-            .zip(fingerprints)
-            .map(|(resource_id, fingerprint)| {
-                let (in_flight, last_started_at) =
-                    signals.get(&fingerprint).cloned().unwrap_or((0, None));
-                Ok(CredentialRuntimeSignal {
-                    resource_id: resource_id.clone(),
-                    in_flight,
-                    last_started_at,
-                })
-            })
-            .collect()
     }
 
     async fn try_acquire_bounded_lease(

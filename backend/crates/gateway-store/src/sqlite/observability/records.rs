@@ -60,7 +60,7 @@ async fn count_usage_records(
     filter: &UsageRecordFilter,
 ) -> StoreResult<u64> {
     let mut statement =
-        QueryBuilder::<Sqlite>::new("select count(*) from model_requests mr where ");
+        QueryBuilder::<Sqlite>::new("select count(*) from model_request_observations mr where ");
     push_range(&mut statement, "mr", range);
     statement.push(" and ");
     statement.push(completed_usage_fact_predicate("mr"));
@@ -81,7 +81,7 @@ pub(crate) async fn usage_record_detail(
     if request_id.len() > 256 || request_id.chars().any(char::is_control) {
         return Err(invalid("request ID is invalid"));
     }
-    let row = sqlx::query("select * from model_requests where id = ?")
+    let row = sqlx::query("select * from model_request_observations where id = ?")
         .bind(request_id)
         .fetch_optional(pool)
         .await
@@ -125,7 +125,7 @@ pub(crate) async fn usage_record_detail(
     let related_rows = sqlx::query(
         "select related.id, related.outcome, related.completed_at_us,
                 case when related.id = current.recovery_request_id then 'recovered_by' else 'recovers' end as relation
-           from model_requests current join model_requests related
+           from model_request_observations current join model_request_observations related
              on related.id = current.recovery_request_id or related.recovery_request_id = current.id
           where current.id = ? order by related.started_at_us limit 20",
     )
@@ -322,6 +322,13 @@ fn usage_list_record_from_row(row: &SqliteRow) -> StoreResult<UsageListRecord> {
         first_text_ms: optional_unsigned(row, "first_text_ms")?,
         first_token_ms: optional_unsigned(row, "first_token_ms")?,
         provider_processing_ms: optional_unsigned(row, "provider_processing_ms")?,
+        upstream_response_ms: optional_unsigned(row, "upstream_response_ms")?,
+        upstream_api_overhead_ms: get(row, "upstream_api_overhead_ms")?,
+        upstream_engine_ms: get(row, "upstream_engine_ms")?,
+        upstream_engine_iapi_ttft_ms: get(row, "upstream_engine_iapi_ttft_ms")?,
+        upstream_engine_service_ttft_ms: get(row, "upstream_engine_service_ttft_ms")?,
+        upstream_engine_iapi_tbt_ms: get(row, "upstream_engine_iapi_tbt_ms")?,
+        upstream_engine_service_tbt_ms: get(row, "upstream_engine_service_tbt_ms")?,
         latency_ms: optional_unsigned(row, "latency_ms")?,
         admission_decision_ms: optional_unsigned(row, "admission_decision_ms")?,
         account_selection_wait_ms: optional_unsigned(row, "account_selection_wait_ms")?,
@@ -420,6 +427,13 @@ fn usage_record_from_row(row: &SqliteRow) -> StoreResult<UsageRecord> {
         first_text_ms: optional_unsigned(row, "first_text_ms")?,
         first_token_ms: optional_unsigned(row, "first_token_ms")?,
         provider_processing_ms: optional_unsigned(row, "provider_processing_ms")?,
+        upstream_response_ms: optional_unsigned(row, "upstream_response_ms")?,
+        upstream_api_overhead_ms: get(row, "upstream_api_overhead_ms")?,
+        upstream_engine_ms: get(row, "upstream_engine_ms")?,
+        upstream_engine_iapi_ttft_ms: get(row, "upstream_engine_iapi_ttft_ms")?,
+        upstream_engine_service_ttft_ms: get(row, "upstream_engine_service_ttft_ms")?,
+        upstream_engine_iapi_tbt_ms: get(row, "upstream_engine_iapi_tbt_ms")?,
+        upstream_engine_service_tbt_ms: get(row, "upstream_engine_service_tbt_ms")?,
         latency_ms: optional_unsigned(row, "latency_ms")?,
         admission_decision_ms: optional_unsigned(row, "admission_decision_ms")?,
         account_selection_wait_ms: optional_unsigned(row, "account_selection_wait_ms")?,
@@ -543,7 +557,7 @@ const USAGE_LIST_SELECT: &str = "select mr.*,
        account.plan_type as provider_account_plan_type,
        mr.provider_account_name_snapshot as provider_account_name,
        mr.provider_account_email_snapshot as provider_account_email
-  from model_requests mr
+  from model_request_observations mr
   left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
   left join provider_accounts account on account.id = mr.provider_account_ref";
 
@@ -570,7 +584,7 @@ const OPS_ERROR_SELECT: &str = "select * from (
         mr.recovery_attempt_count, mr.recovery_retry_delay_ms, mr.recovery_total_latency_ms,
         mr.completed_at_us as occurred_at_us,
         'model_request:' || mr.id as stable_sort_id
-   from model_requests mr
+   from model_request_observations mr
    left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
    left join provider_accounts account on account.id = mr.provider_account_ref
   where mr.error_kind is not null and mr.error_kind <> 'cancelled'
@@ -599,7 +613,7 @@ const OPS_ERROR_SELECT: &str = "select * from (
         oe.created_at_us as occurred_at_us,
         'ops_event:' || oe.id as stable_sort_id
    from ops_events oe
-   left join model_requests mr on mr.id = oe.model_request_id
+   left join model_request_observations mr on mr.id = oe.model_request_id
    left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
    left join provider_accounts account on account.id = oe.provider_account_ref
   where oe.created_at_us >= ? and oe.created_at_us < ?

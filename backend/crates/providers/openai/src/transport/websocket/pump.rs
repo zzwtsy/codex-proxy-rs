@@ -13,6 +13,8 @@
 //! - 接收：`next` 从 message channel 取出 pump 转发的入站帧（`Ping`/`Pong` 已被 pump 吞掉）
 //! - 入站缓冲满时暂停读取 socket 和主动探活，仅继续处理发送/关闭命令；消费恢复后按原顺序继续转发
 
+use gateway_core::engine::response_control::{ResponseControl, ResponseControlTransport};
+
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -21,14 +23,17 @@ use std::time::Duration;
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use super::CodexWebSocketCloseError;
+use super::{
+    CodexWebSocketCloseError,
+    control::{PumpCommand, PumpControl, SharedMessages, send_message},
+};
 
 /// 底层 tungstenite WebSocket 流
 pub(crate) trait WebSocketIo:
@@ -87,13 +92,6 @@ impl PumpKeepalive {
             liveness_timeout: None,
         }
     }
-}
-
-enum PumpCommand {
-    Send {
-        message: Message,
-        ack: oneshot::Sender<Result<(), tungstenite::Error>>,
-    },
 }
 
 const PUMP_MESSAGE_BUFFER: usize = 64;
@@ -284,7 +282,8 @@ impl PumpLifecycleState {
 pub(crate) struct PumpedWebSocket {
     connection_id: Uuid,
     tx_command: mpsc::Sender<PumpCommand>,
-    rx_message: mpsc::Receiver<Result<Message, tungstenite::Error>>,
+    rx_message: SharedMessages,
+    control: Option<Arc<dyn ResponseControlTransport>>,
     closed: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<PumpLifecycleState>>,
     pump: Option<JoinHandle<()>>,
@@ -335,7 +334,8 @@ impl PumpedWebSocket {
         Self {
             connection_id,
             tx_command,
-            rx_message,
+            rx_message: Arc::new(tokio::sync::Mutex::new(rx_message)),
+            control: None,
             closed,
             lifecycle,
             pump: Some(pump),
@@ -344,25 +344,26 @@ impl PumpedWebSocket {
 
     /// 通过 pump 发送一帧，返回底层 `send` 的结果
     pub(crate) async fn send(&self, message: Message) -> Result<(), tungstenite::Error> {
-        let (ack, rx_ack) = oneshot::channel();
-        if self
-            .tx_command
-            .send(PumpCommand::Send { message, ack })
-            .await
-            .is_err()
-        {
-            return Err(tungstenite::Error::ConnectionClosed);
-        }
-        rx_ack
-            .await
-            .unwrap_or(Err(tungstenite::Error::ConnectionClosed))
+        send_message(&self.tx_command, message).await
+    }
+
+    /// 每轮发送后替换控制 owner，旧执行的弱引用不能控制下一轮连接
+    pub(crate) fn bind_control(&mut self, control: Option<&ResponseControl>) {
+        self.control = control.map(|control| {
+            let transport: Arc<dyn ResponseControlTransport> = Arc::new(PumpControl {
+                tx_command: self.tx_command.clone(),
+                rx_message: Arc::clone(&self.rx_message),
+            });
+            control.bind(&transport);
+            transport
+        });
     }
 
     /// 取出下一帧入站消息（`Ping`/`Pong` 已被 pump 处理，不会到达这里）
     ///
     /// 返回 `None` 表示连接已结束（pump 已退出且缓冲已排空）
     pub(crate) async fn next(&mut self) -> Option<Result<Message, tungstenite::Error>> {
-        self.rx_message.recv().await
+        self.rx_message.lock().await.recv().await
     }
 
     /// 连接是否已被后台 pump 判定关闭/失活

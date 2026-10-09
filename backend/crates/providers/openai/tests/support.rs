@@ -673,6 +673,7 @@ pub(crate) struct TestLeaseCoordinator {
     pub(crate) busy: Mutex<bool>,
     pub(crate) busy_accounts: Mutex<BTreeSet<ProviderAccountId>>,
     pub(crate) signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
+    pub(crate) reserved_signals: Mutex<BTreeMap<ProviderAccountId, AccountRuntimeSignals>>,
     round_robin_cursor: Mutex<u64>,
 }
 
@@ -682,9 +683,17 @@ impl ProviderLeasePort for TestLeaseCoordinator {
         _client_api_key_id: &'a ClientApiKeyId,
         _provider_kind: &'a ProviderKind,
         accounts: &'a [ProviderAccountId],
+        pool: gateway_core::provider_ports::ProviderConcurrencyPool,
     ) -> BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async move {
-            let overrides = self.signals.lock().expect("scheduling signals lock");
+            let overrides = match pool {
+                gateway_core::provider_ports::ProviderConcurrencyPool::Shared => &self.signals,
+                gateway_core::provider_ports::ProviderConcurrencyPool::Reserved => {
+                    &self.reserved_signals
+                }
+            }
+            .lock()
+            .expect("scheduling signals lock");
             let signals = accounts
                 .iter()
                 .map(|account| {

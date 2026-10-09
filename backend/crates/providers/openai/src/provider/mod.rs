@@ -125,10 +125,6 @@ const WEBSOCKET_TRANSPORT: &str = "websocket";
 // 在已观测到的 Codex OAuth 上游 16 MiB 附近消息边界前留出传输 metadata 余量
 const WEBSOCKET_HTTP_FALLBACK_THRESHOLD_BYTES: usize = 15 * 1024 * 1024;
 const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
-/// 提交边界前预取 128 KiB 原始上游 chunk；容纳携带配置回显的前导事件，
-/// 超过阈值后结束无感换号窗口（最后一个 chunk 可越过阈值），
-/// 但不会把上游数据改写成协议失败
-const MAX_STREAM_PREFETCH_BYTES: usize = 128 * 1024;
 /// 短暂保留 response.created 等结构事件，让随后到达的明确拒绝可以无感换号；
 /// 到期即放行，避免模型长时间思考时让客户端一直收不到首事件
 const STREAM_REPLAY_GRACE: Duration = Duration::from_millis(2_500);
@@ -174,6 +170,54 @@ struct PreparedGenerateRequest {
     continuation_requested: bool,
     session_affinity: Option<CodexSessionAffinity>,
     cyber_policy_session_key: Option<ProviderSessionAffinityKey>,
+}
+
+impl PreparedGenerateRequest {
+    fn checked_native_continuation_scope(
+        &self,
+        context: &AttemptContext,
+    ) -> Result<PreviousResponseScope, ProviderError> {
+        let pin = context.continuation().and_then(ContinuationBinding::pinned);
+        let scope = match self
+            .previous_session
+            .as_ref()
+            .map(|state| state.continuation_scope)
+        {
+            Some(OpenAiContinuationScope::Persisted) => PreviousResponseScope::Persisted,
+            Some(OpenAiContinuationScope::ConnectionLocal) => {
+                PreviousResponseScope::ConnectionLocal
+            }
+            Some(OpenAiContinuationScope::ReplayRequired) => PreviousResponseScope::ExternalUnknown,
+            None => match pin.map(|pin| pin.scope()) {
+                Some(NativeContinuationScope::Persisted) => PreviousResponseScope::Persisted,
+                Some(NativeContinuationScope::ConnectionLocal) => {
+                    PreviousResponseScope::ConnectionLocal
+                }
+                None => PreviousResponseScope::ExternalUnknown,
+            },
+        };
+        // 已知不能脱离原连接的重放必须在选号前拒绝，避免失败请求先改写共享绑定
+        // Native 仍交给连接池核对原连接；此处不推测连接是否存活或上游状态是否可用
+        if pin.is_some()
+            && matches!(
+                context.continuation_attempt(),
+                ContinuationAttempt::ReplayOwner | ContinuationAttempt::ReplayAny
+            )
+            && scope == PreviousResponseScope::ConnectionLocal
+        {
+            tracing::warn!(
+                request_id = context.request_id().as_str(),
+                attempt_index = context.attempt_index().get(),
+                continuation_scope = "connection_local",
+                continuation_attempt = context.continuation_attempt().as_str(),
+                continuation_recovery_disposition = "client_replay_required",
+                continuation_recovery_action = "stop_proxy_recovery",
+                "OpenAI connection-local continuation replay was rejected before send"
+            );
+            return Err(continuation_replay_required_error("scope_unavailable"));
+        }
+        Ok(scope)
+    }
 }
 
 struct SelectedGenerate {
@@ -332,6 +376,16 @@ impl fmt::Debug for CodexProvider {
 
 #[async_trait]
 impl Provider for CodexProvider {
+    fn compile_privacy_policy(
+        &self,
+        policy: &gateway_core::settings::privacy::CodexPrivacyPolicy,
+    ) -> Result<
+        Arc<dyn gateway_core::settings::privacy::CompiledPrivacyPolicy>,
+        gateway_core::settings::privacy::PrivacyError,
+    > {
+        crate::transport::privacy::compile(policy)
+    }
+
     fn resolve_request_profile(
         &self,
         configuration: &gateway_core::account::OpaqueProviderData,
@@ -578,6 +632,9 @@ impl Provider for CodexProvider {
         let preselection = upstream
             .filter(|_| adapter.is_none())
             .map(|upstream| self.prepare_generate_request(generate, upstream, &context));
+        if let Some(prepared) = preselection.as_ref() {
+            prepared.checked_native_continuation_scope(&context)?;
+        }
         let (selection_session_affinity, selection_cyber_policy_key, requires_websocket) =
             preselection.map_or((None, None, false), |prepared| {
                 let requires_websocket =
@@ -701,7 +758,6 @@ impl CodexProvider {
                 UpstreamSendState::NotSent,
             ));
         }
-        validate_openai_reasoning(generate.protocol_payload().body())?;
         let mut upstream = encode_generate_request(&generate, upstream_model.as_str(), None)
             .map_err(map_request_error)?;
         upstream.client_account_follow_only = crate::request_identity::follows_session_with_headers(
@@ -715,6 +771,7 @@ impl CodexProvider {
             &middleware_headers,
         );
         let processed = self.prepare_generate_request(&generate, upstream, &context);
+        let native_scope = processed.checked_native_continuation_scope(&context)?;
         let mut upstream_request = processed.upstream;
         let session_transport_key =
             derive_codex_transport_key(&upstream_request, context.client_api_key_ref());
@@ -788,42 +845,6 @@ impl CodexProvider {
         {
             match continuation {
                 ContinuationBinding::Pinned(continuation) => {
-                    let native_scope = match previous_session
-                        .as_ref()
-                        .map(|state| state.continuation_scope)
-                    {
-                        Some(OpenAiContinuationScope::Persisted) => {
-                            PreviousResponseScope::Persisted
-                        }
-                        Some(OpenAiContinuationScope::ConnectionLocal) => {
-                            PreviousResponseScope::ConnectionLocal
-                        }
-                        Some(OpenAiContinuationScope::ReplayRequired) => {
-                            PreviousResponseScope::ExternalUnknown
-                        }
-                        None => match continuation.scope() {
-                            NativeContinuationScope::Persisted => PreviousResponseScope::Persisted,
-                            NativeContinuationScope::ConnectionLocal => {
-                                PreviousResponseScope::ConnectionLocal
-                            }
-                        },
-                    };
-                    if matches!(
-                        context.continuation_attempt(),
-                        ContinuationAttempt::ReplayOwner | ContinuationAttempt::ReplayAny
-                    ) && native_scope == PreviousResponseScope::ConnectionLocal
-                    {
-                        tracing::warn!(
-                            request_id = context.request_id().as_str(),
-                            attempt_index = context.attempt_index().get(),
-                            continuation_scope = "connection_local",
-                            continuation_attempt = context.continuation_attempt().as_str(),
-                            continuation_recovery_disposition = "client_replay_required",
-                            continuation_recovery_action = "stop_proxy_recovery",
-                            "OpenAI connection-local continuation replay was rejected before send"
-                        );
-                        return Err(continuation_replay_required_error("scope_unavailable"));
-                    }
                     let previous_response_scope = match context.continuation_attempt() {
                         ContinuationAttempt::Native => native_scope,
                         ContinuationAttempt::ReplayOwner | ContinuationAttempt::ReplayAny => {
@@ -1005,7 +1026,8 @@ impl CodexProvider {
                 .with_responses_api_base_url(lease.authentication().responses_api_base_url())
                 .with_connection_budget(context.connection_budget().clone())
                 .with_response_control(context.response_control().cloned())
-                .with_middleware_headers(middleware_headers),
+                .with_middleware_headers(middleware_headers)
+                .with_privacy(context.privacy(), context.cancellation().clone()),
             response_origin: self.responses_url.clone(),
             request: upstream_request,
             upstream_model,
@@ -1040,27 +1062,4 @@ fn native_request_requirements(request: &GenerateRequest) -> CapabilityRequireme
         request.protocol_payload().clone(),
     ))
     .capability_requirements()
-}
-
-fn validate_openai_reasoning(body: &Map<String, Value>) -> Result<(), ProviderError> {
-    let Some(effort) = body
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("effort"))
-    else {
-        return Ok(());
-    };
-    let Some(effort) = effort.as_str() else {
-        return Err(provider_error(
-            ProviderErrorKind::InvalidRequest,
-            UpstreamSendState::NotSent,
-        ));
-    };
-    if effort.is_empty() || effort.len() > 64 || effort.chars().any(char::is_control) {
-        return Err(provider_error(
-            ProviderErrorKind::InvalidRequest,
-            UpstreamSendState::NotSent,
-        ));
-    }
-    Ok(())
 }

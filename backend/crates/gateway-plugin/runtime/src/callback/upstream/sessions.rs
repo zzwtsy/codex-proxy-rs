@@ -16,7 +16,7 @@ pub(crate) struct ConnectionOwner {
     pub credential_revision: u64,
 }
 
-/// 每个适配器代次独立持有连接；取出即独占，失败或取消不会归还半完成会话
+/// 每个适配器进程身份独立持有连接；取出即独占，失败或取消不会归还半完成会话
 #[derive(Default)]
 pub(crate) struct ConnectionPool {
     idle: Mutex<BTreeMap<String, IdleConnection>>,

@@ -61,6 +61,95 @@ fn response_model_observation_uses_explicit_body_and_never_request_fallback() {
 const METADATA_PREFIX_FIXTURE: &str = include_str!("fixtures/metadata_only_prefix.sse");
 
 #[test]
+fn official_response_duration_uses_only_the_completed_response_on_both_transports() {
+    for websocket in [false, true] {
+        for (created_at, completed_at, expected) in [
+            (json!(1_791_441_115), json!(1_791_441_122), Some(7_000)),
+            (json!(100.25), json!(101.5), Some(1_250)),
+            (json!(100), json!(100), None),
+            (json!(101), json!(100), None),
+            (json!(-1), json!(100), None),
+            (json!(null), json!(100), None),
+            (json!(100), json!(null), None),
+            (json!("100"), json!(101), None),
+            (json!(0), json!(1e30), None),
+        ] {
+            let mut decoder = CodexCanonicalDecoder::new("gpt-5.4").with_raw_sse_passthrough();
+            // 前导响应的时间不能用于补齐完成响应缺失的时间
+            decoder.push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_time\",\"created_at\":1}}\n\n").expect("created response");
+            assert_eq!(decoder.upstream_response_ms(), None);
+            let completed = json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_time", "status": "completed", "output": [],
+                    "created_at": created_at, "completed_at": completed_at,
+                    "usage": { "input_tokens": 1, "output_tokens": 112, "total_tokens": 113 },
+                },
+            });
+            let raw = completed.to_string();
+            let frame = if websocket {
+                websocket_event_to_sse_frame(&raw).expect("WS completion")
+            } else {
+                format!("data: {raw}\n\n")
+            };
+            let split = frame.len() / 2;
+            decoder
+                .push(&frame.as_bytes()[..split])
+                .expect("first chunk");
+            let events = decoder
+                .push(&frame.as_bytes()[split..])
+                .expect("completion");
+            assert_eq!(decoder.upstream_response_ms(), expected);
+            assert!(events.iter().any(|event| {
+                event
+                    .wire_event()
+                    .is_some_and(|wire| wire.data() == &completed)
+            }));
+            assert!(canonical_facts(&events).iter().any(|event| matches!(event, GatewayEvent::Usage(usage) if usage.output_tokens == Some(112))));
+        }
+    }
+}
+
+#[test]
+fn official_response_duration_does_not_cross_response_identity_or_incomplete_boundary() {
+    for (event_type, response_id, created) in [
+        ("response.completed", "resp_other", true),
+        ("response.completed", "resp_time", false),
+        ("response.incomplete", "resp_time", true),
+    ] {
+        let mut decoder = CodexCanonicalDecoder::new("gpt-5.4");
+        if created {
+            decoder.push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_time\"}}\n\n").expect("created response");
+        }
+        let completed = json!({
+            "type": event_type,
+            "response": {
+                "id": response_id, "created_at": 100, "completed_at": 107,
+                "usage": { "input_tokens": 1, "output_tokens": 112, "total_tokens": 113 },
+            },
+        });
+        let events = decoder
+            .push(format!("data: {completed}\n\n").as_bytes())
+            .expect("terminal response");
+        assert_eq!(decoder.upstream_response_ms(), None);
+        assert!(events.iter().any(|event| {
+            event
+                .wire_event()
+                .is_some_and(|wire| wire.data() == &completed)
+        }));
+    }
+}
+
+#[test]
+fn official_timing_frames_do_not_start_first_output_wait() {
+    let mut decoder = CodexCanonicalDecoder::new("gpt-5.4");
+    let events = decoder.push(b"data: {\"type\":\"responsesapi.websocket_timing\",\"timing_metrics\":{\"total_turn_time_s\":20}}\n\n").expect("timing frame");
+    assert!(!events.is_empty());
+    assert!(!decoder.take_timing_signals().output_start);
+    assert_eq!(decoder.upstream_response_ms(), None);
+}
+
+#[test]
 fn decoder_should_not_forward_codex_rate_limit_metadata_fixture_as_openai_wire() {
     let events = CodexCanonicalDecoder::new("fallback")
         .with_raw_sse_passthrough()
@@ -551,7 +640,7 @@ fn decoder_should_restore_done_only_reasoning_and_text_as_canonical_facts() {
 }
 
 #[test]
-fn decoder_timing_signals_should_count_tool_arguments_as_first_token() {
+fn decoder_timing_signals_distinguish_tool_item_start_from_argument_output() {
     let body = concat!(
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_timing\",\"model\":\"gpt-test\"}}\n\n",

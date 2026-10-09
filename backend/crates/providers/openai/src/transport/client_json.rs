@@ -16,11 +16,12 @@ use super::{
 };
 
 impl CodexBackendClient {
-    /// 向固定 Provider 端点发送一次原始 JSON；请求与成功响应正文均不经过 serde
+    /// 向固定 Provider 端点发送 JSON，仅启用隐私规则时解码请求正文
     pub(crate) async fn post_raw_json(
         &self,
         endpoint_path: &'static str,
         body: Bytes,
+        passthrough_headers: &reqwest::header::HeaderMap,
         image_turn_id: Option<&str>,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<CodexBackendJsonResponse> {
@@ -35,6 +36,11 @@ impl CodexBackendClient {
         };
         let profile = self.profile.snapshot();
         let mut headers = self.model_request_headers(&profile, context)?;
+        super::headers::append_passthrough_headers(&mut headers, passthrough_headers);
+        // 独立端点没有 Responses 原连接归属，续接状态不能跨账号继承
+        // turn metadata 随后仅使用当前 lease 已处理的值
+        headers.remove("x-codex-turn-state");
+        headers.remove("x-codex-turn-metadata");
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         insert_optional_protocol_header(&mut headers, "x-codex-image-turn-id", image_turn_id);
         insert_optional_protocol_header(
@@ -43,6 +49,21 @@ impl CodexBackendClient {
             context.turn_metadata,
         );
         self.append_middleware_headers(&mut headers)?;
+        let body = if self.privacy.is_some() {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&body).map_err(CodexClientError::RequestBodyEncode)?;
+            let original = value.clone();
+            self.apply_privacy(&mut value, &mut headers)?;
+            if value == original {
+                body
+            } else {
+                bytes::Bytes::from(
+                    serde_json::to_vec(&value).map_err(CodexClientError::RequestBodyEncode)?,
+                )
+            }
+        } else {
+            body
+        };
 
         let trace = context
             .trace

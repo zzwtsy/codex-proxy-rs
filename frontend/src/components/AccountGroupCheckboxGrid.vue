@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import type { AccountGroup } from '@/api'
+import type { AccountGroupRef } from '@/api'
 
 import { BaseCheckbox } from '@codex-proxy/ui'
 
 withDefaults(
   defineProps<{
-    groups: AccountGroup[]
+    groups: AccountGroupRef[]
     loading?: boolean
     disabled?: boolean
   }>(),

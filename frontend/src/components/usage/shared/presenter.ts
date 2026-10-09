@@ -1,12 +1,41 @@
-import type { UsageListRecord, UsageRecordDetail } from '@/api'
-import { formatCompactNumber, formatDuration } from '@/utils/format'
+import type { UsageListRecord, UsageRecordDetail, UsageTokenDetails } from '@/api'
+import { formatCompactNumber, formatDuration, formatInteger } from '@/utils/format'
 
 // 列表与详情使用独立读模型，展示函数只依赖两者的公共字段。
 type UsageCommonRecord = UsageListRecord | UsageRecordDetail
 type UsageLatencyRecord = Pick<UsageCommonRecord, 'latencyDetails' | 'firstTokenLatencyMs' | 'latencyMs'>
 
-export type UsagePerformanceRecord = UsageLatencyRecord & {
+export type UsagePerformanceRecord = Pick<UsageCommonRecord, 'latencyDetails' | 'firstTokenLatencyMs'> & {
   tokenDetails: Pick<UsageListRecord['tokenDetails'], 'outputTokens'> | null
+}
+
+interface UsageTimingItem {
+  label: string
+  value: string
+  emphasized?: boolean
+}
+
+interface UsageTimingSection {
+  title: string
+  source: 'official' | 'local'
+  items: UsageTimingItem[]
+}
+
+export function usageFreshInputTokens(input: number, cached: number, written: number) {
+  // 输入总量包含缓存读写，普通输入与缓存明细分开展示
+  return Math.max(0, input - cached - written)
+}
+
+export function usageTokenDetails(details: UsageTokenDetails): UsageTokenDetails {
+  const inputTokens = details.inputTokens === null
+    ? null
+    : usageFreshInputTokens(details.inputTokens, details.cachedTokens ?? 0, details.cacheWriteTokens ?? 0)
+
+  return {
+    ...details,
+    inputTokens,
+    inputTokensDisplay: inputTokens === null ? details.inputTokensDisplay : formatInteger(inputTokens),
+  }
 }
 
 export function usageTransportType(transport?: string | null) {
@@ -84,52 +113,53 @@ export function usageModelDisplay(record: UsageCommonRecord) {
 }
 
 export function usagePerformanceDetails(record: UsagePerformanceRecord) {
-  const firstTokenMs = usageFirstTokenMs(record)
-  const totalMs = durationValue(record.latencyMs)
+  const upstreamMs = upstreamResponseMs(record.latencyDetails)
   const outputTokens = record.tokenDetails?.outputTokens
-  // 输出包含推理 Token，使用完整请求耗时，避免扣除推理等待后高估速率
+  // 输出已包含推理 Token，分母只取同一完成响应的官方时间跨度
   const throughput = typeof outputTokens === 'number' && Number.isFinite(outputTokens) && outputTokens > 0
-    && totalMs !== null && totalMs > 0
-    ? outputTokens * 1000 / totalMs
+    && upstreamMs !== null
+    ? outputTokens * 1000 / upstreamMs
     : null
 
   return {
     throughputDisplay: throughput === null ? '—' : `${formatCompactNumber(throughput)} tok/s`,
-    firstTokenDisplay: formatDuration(firstTokenMs),
+    firstTokenDisplay: formatDuration(durationValue(record.firstTokenLatencyMs)),
   }
 }
 
 export function usageLatencyDetails(record: UsageLatencyRecord) {
   const latencyDetails = record.latencyDetails
-  const firstTokenMs = usageFirstTokenMs(record)
-  const firstEventMs = durationValue(latencyDetails?.firstEventMs)
+  const firstTokenMs = durationValue(record.firstTokenLatencyMs)
+  const upstreamMs = upstreamResponseMs(latencyDetails)
   const totalMs = durationValue(record.latencyMs)
   const firstReasoningMs = durationValue(latencyDetails?.firstReasoningMs)
   const firstTextMs = durationValue(latencyDetails?.firstTextMs)
-  const breakdownItems = []
+  const requestItems: UsageTimingItem[] = []
 
   if (firstTokenMs !== null && totalMs !== null && firstTokenMs <= totalMs) {
-    breakdownItems.push({ label: '首字等待', value: formatDuration(firstTokenMs) })
+    requestItems.push({ label: '首个输出等待', value: formatDuration(firstTokenMs) })
 
     if (firstTextMs !== null && firstTextMs >= firstTokenMs && firstTextMs <= totalMs) {
       const beforeTextMs = firstTextMs - firstTokenMs
       if (beforeTextMs > 0) {
-        breakdownItems.push({
+        requestItems.push({
           label: firstReasoningMs === firstTokenMs ? '推理到正文' : '首个输出到正文',
           value: formatDuration(beforeTextMs),
         })
       }
-      breakdownItems.push({ label: '正文生成', value: formatDuration(totalMs - firstTextMs) })
+      requestItems.push({ label: '正文到完成', value: formatDuration(totalMs - firstTextMs) })
     }
     else {
-      breakdownItems.push({
+      requestItems.push({
         label: '首个输出后完成',
         value: formatDuration(totalMs - firstTokenMs),
       })
     }
   }
 
-  const transportItems = [
+  requestItems.push({ label: '总耗时', value: formatDuration(totalMs), emphasized: true })
+
+  const transportItems: UsageTimingItem[] = [
     { label: '准入判定', value: durationValue(latencyDetails?.admissionDecisionMs) },
     { label: '账号选择等待', value: durationValue(latencyDetails?.accountSelectionWaitMs) },
     {
@@ -138,8 +168,7 @@ export function usageLatencyDetails(record: UsageLatencyRecord) {
     },
     { label: 'WebSocket 连接', value: durationValue(latencyDetails?.wsConnectMs) },
     { label: '上游响应头', value: durationValue(latencyDetails?.upstreamHeadersMs) },
-    { label: '首个上游事件', value: firstEventMs },
-    { label: '上游处理', value: durationValue(latencyDetails?.openaiProcessingMs) },
+    { label: '首个上游事件', value: durationValue(latencyDetails?.firstEventMs) },
   ]
     .filter(item => item.value !== null)
     .map(item => ({ ...item, value: formatDuration(item.value) }))
@@ -154,13 +183,49 @@ export function usageLatencyDetails(record: UsageLatencyRecord) {
     })
   }
 
+  const upstreamDisplay = formatDuration(upstreamMs)
+  const upstreamItems: UsageTimingItem[] = []
+  if (upstreamMs !== null)
+    upstreamItems.push({ label: '响应耗时', value: upstreamDisplay })
+  const processingMs = durationValue(latencyDetails?.openaiProcessingMs)
+  if (processingMs !== null)
+    upstreamItems.push({ label: '处理耗时', value: formatDuration(processingMs) })
+
+  const performanceItems = [
+    { label: 'API 开销', value: durationValue(latencyDetails?.upstreamApiOverheadMs) },
+    { label: '引擎耗时', value: durationValue(latencyDetails?.upstreamEngineMs) },
+    { label: 'TTFT · IAPI', value: durationValue(latencyDetails?.upstreamEngineIapiTtftMs) },
+    { label: 'TTFT · Service', value: durationValue(latencyDetails?.upstreamEngineServiceTtftMs) },
+    { label: 'Token 间隔 · IAPI', value: durationValue(latencyDetails?.upstreamEngineIapiTbtMs) },
+    { label: 'Token 间隔 · Service', value: durationValue(latencyDetails?.upstreamEngineServiceTbtMs) },
+  ]
+  for (const item of performanceItems) {
+    if (item.value !== null)
+      upstreamItems.push({ label: item.label, value: formatUpstreamDuration(item.value) })
+  }
+
+  const sections: UsageTimingSection[] = []
+  if (upstreamItems.length) {
+    sections.push({
+      title: '上游性能',
+      source: 'official',
+      items: upstreamItems,
+    })
+  }
+  sections.push({ title: '请求观测', source: 'local', items: requestItems })
+  if (transportItems.length) {
+    sections.push({
+      title: '传输观测',
+      source: 'local',
+      items: transportItems,
+    })
+  }
+
   return {
-    // SSE 可能先收到生命周期事件而没有文本或推理增量；这不是首字，须保留原始语义。
-    firstOutputLabel: firstTokenMs === null && firstEventMs !== null ? '首事件' : '首字',
-    firstOutputDisplay: formatDuration(firstTokenMs ?? firstEventMs),
+    upstreamDisplay,
+    firstOutputDisplay: formatDuration(firstTokenMs),
     totalDisplay: formatDuration(totalMs),
-    breakdownItems,
-    transportItems,
+    sections,
   }
 }
 
@@ -172,6 +237,15 @@ function durationValue(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
 }
 
-function usageFirstTokenMs(record: UsageLatencyRecord) {
-  return durationValue(record.firstTokenLatencyMs ?? record.latencyDetails?.firstTokenMs)
+function formatUpstreamDuration(value: number) {
+  if (value >= 1000)
+    return formatDuration(value)
+  if (value > 0 && value < 0.001)
+    return '<0.001 ms'
+  return `${Number(value.toFixed(3))} ms`
+}
+
+function upstreamResponseMs(details: UsageCommonRecord['latencyDetails']) {
+  const value = durationValue(details?.upstreamResponseMs)
+  return value !== null && value > 0 ? value : null
 }

@@ -489,12 +489,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     call.request.head.settings,
                     configuration["expected_settings"]
                 );
-                if let Some(expected) = configuration.get("expected_legacy_source") {
+                if let Some(expected) = configuration.get("expected_fast_source") {
                     let sources = &call.request.head.settings_sources["execution"];
-                    assert!(sources.get("fast_mode").is_none());
-                    assert!(sources["input"].get("fast_mode").is_none());
-                    assert_eq!(sources["input"]["disable_fast"], false);
-                    assert_eq!(&sources["disable_fast"], expected);
+                    assert!(sources.get("disable_fast").is_none());
+                    assert!(sources["input"].get("disable_fast").is_none());
+                    assert_eq!(sources["input"]["fast_mode"], "default");
+                    assert_eq!(&sources["fast_mode"], expected);
                 }
                 if let Some(settings) = configuration.get("settings") {
                     call.request.head.settings = settings.clone();

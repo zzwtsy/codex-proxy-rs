@@ -1,45 +1,68 @@
-//! 验证响应中断的当前 owner 校验及独立执行间的控制隔离
+//! 验证原连接控制端口的透明传递、owner 生命周期与执行隔离
 
-use futures::FutureExt;
-use gateway_core::engine::response_control::{ResponseControl, ResponseInterruptError};
+use std::sync::{Arc, Mutex};
 
-#[test]
-fn interrupt_requires_the_current_response_owner_and_does_not_extend_its_lifetime() {
-    let control = ResponseControl::default();
-    assert_eq!(
-        control.interrupt("resp_a"),
-        Err(ResponseInterruptError::Unavailable)
-    );
-    assert!(control.activate(String::new()).is_none());
-    let active = control.activate("resp_a".to_owned()).unwrap();
-    let requested = active.requested();
-    assert!(control.activate("resp_b".to_owned()).is_none());
-    assert_eq!(
-        control.interrupt("resp_b"),
-        Err(ResponseInterruptError::ResponseMismatch)
-    );
-    assert!(active.requested().now_or_never().is_none());
-    control.interrupt("resp_a").unwrap();
-    control.interrupt("resp_a").unwrap();
-    assert_eq!(requested.now_or_never(), Some(()));
-    let retained_waiter = active.requested();
-    drop(active);
-    assert_eq!(
-        control.interrupt("resp_a"),
-        Err(ResponseInterruptError::Unavailable)
-    );
-    let next = control.activate("resp_b".to_owned()).unwrap();
-    assert!(next.requested().now_or_never().is_none());
-    drop(retained_waiter);
+use async_trait::async_trait;
+use futures::{FutureExt, executor::block_on};
+use gateway_core::engine::response_control::{
+    ResponseControl, ResponseControlTransport, ResponseControlUnavailable,
+};
+
+#[derive(Default)]
+struct Transport(Mutex<Vec<String>>);
+
+#[async_trait]
+impl ResponseControlTransport for Transport {
+    async fn send(&self, payload: &str) -> Result<(), ResponseControlUnavailable> {
+        self.0.lock().unwrap().push(payload.to_owned());
+        Ok(())
+    }
+    async fn receive(&self) -> Result<String, ResponseControlUnavailable> {
+        Ok("upstream reply".to_owned())
+    }
 }
 
 #[test]
-fn matching_response_ids_do_not_share_control_between_root_executions() {
-    let first = ResponseControl::default();
-    let second = ResponseControl::default();
-    let active_first = first.activate("resp_same".to_owned()).unwrap();
-    let active_second = second.activate("resp_same".to_owned()).unwrap();
-    first.interrupt("resp_same").unwrap();
-    assert_eq!(active_first.requested().now_or_never(), Some(()));
-    assert!(active_second.requested().now_or_never().is_none());
+fn control_requires_a_live_connection_owner_and_preserves_unknown_payloads() {
+    block_on(async {
+        let control = ResponseControl::default();
+        assert_eq!(
+            control.send("unknown").await,
+            Err(ResponseControlUnavailable)
+        );
+        assert!(control.receive().now_or_never().is_none());
+        let transport = Arc::new(Transport::default());
+        let owner: Arc<dyn ResponseControlTransport> = transport.clone();
+        control.bind(&owner);
+        let payload = "{ \"type\": \"future.control\", \"extension\": [1, 2] }";
+        control.send(payload).await.unwrap();
+        control.send(payload).await.unwrap();
+        assert_eq!(*transport.0.lock().unwrap(), [payload, payload]);
+        assert_eq!(control.receive().await.unwrap(), "upstream reply");
+        drop(owner);
+        drop(transport);
+        assert_eq!(control.send(payload).await, Err(ResponseControlUnavailable));
+    });
+}
+
+#[test]
+fn replacing_or_clearing_a_binding_does_not_share_control_between_executions() {
+    block_on(async {
+        let first = ResponseControl::default();
+        let second = ResponseControl::default();
+        let old: Arc<dyn ResponseControlTransport> = Arc::new(Transport::default());
+        let current = Arc::new(Transport::default());
+        let owner: Arc<dyn ResponseControlTransport> = current.clone();
+        first.bind(&old);
+        second.bind(&owner);
+        drop(old);
+        assert_eq!(first.send("old").await, Err(ResponseControlUnavailable));
+        second.send("current").await.unwrap();
+        assert_eq!(*current.0.lock().unwrap(), ["current"]);
+        second.clear();
+        assert_eq!(
+            second.send("cleared").await,
+            Err(ResponseControlUnavailable)
+        );
+    });
 }

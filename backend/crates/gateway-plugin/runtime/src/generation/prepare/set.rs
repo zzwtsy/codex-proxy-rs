@@ -30,7 +30,7 @@ pub(super) struct PreparedSet {
     pub(super) _execution: Option<Arc<ExecutionExtensionPlans>>,
     pub(super) _authentication:
         Option<Arc<dyn gateway_core::engine::authentication::FrontendAuthenticationPlan>>,
-    pub(super) sessions: Vec<PreparedInstance>,
+    pub(super) sessions: Vec<Arc<PreparedInstance>>,
     pub(super) failures: BTreeMap<String, PluginInstanceRuntimeFailure>,
     pub(super) shutting_down: Arc<AtomicBool>,
     pub(super) commands: Vec<Arc<crate::adapter::command_line::PluginCommand>>,
@@ -38,12 +38,12 @@ pub(super) struct PreparedSet {
     pub(super) model_aliases: Vec<gateway_core::routing::ContributedModelAlias>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct PreparedContributions {
-    pub(super) sessions: Vec<PreparedInstance>,
     pub(super) observer_entries: Vec<crate::adapter::observer::ObserverEntry>,
     pub(super) commands: Vec<Arc<crate::adapter::command_line::PluginCommand>>,
     pub(super) management: Vec<crate::adapter::management::ManagementEntry>,
+    pub(super) middleware_entries: Vec<crate::adapter::middleware::MiddlewareEntry>,
     pub(super) policy_entries: Vec<crate::adapter::policy::PolicyEntry>,
     pub(super) upstream_entries: Vec<crate::adapter::upstream_adapter::AdapterEntry>,
     pub(super) authentication_entries:
@@ -53,12 +53,12 @@ pub(super) struct PreparedContributions {
 
 impl PreparedContributions {
     pub(super) fn append(&mut self, other: Self) {
-        self.sessions.extend(other.sessions);
         self.observer_entries.extend(other.observer_entries);
         self.commands.extend(other.commands);
         self.management.extend(other.management);
         self.model_aliases.extend(other.model_aliases);
         self.policy_entries.extend(other.policy_entries);
+        self.middleware_entries.extend(other.middleware_entries);
         self.upstream_entries.extend(other.upstream_entries);
         self.authentication_entries
             .extend(other.authentication_entries);
@@ -72,6 +72,7 @@ pub(super) struct PreparedInstance {
     pub(super) session: Arc<RpcSession>,
     pub(super) private_state: Arc<PluginPrivateState>,
     pub(super) maintenance: bool,
+    pub(super) contributions: PreparedContributions,
 }
 
 impl PreparedSet {
@@ -97,16 +98,16 @@ impl ExtensionSetLease for PreparedSet {
     }
 }
 
-impl Drop for PreparedSet {
+impl Drop for PreparedInstance {
     fn drop(&mut self) {
-        for instance in self.sessions.drain(..) {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let session = instance.session;
-                    session.quiesce();
-                    session.shutdown(Duration::from_secs(1)).await;
-                });
-            }
+        // 发布集合只共享同一配置的实例，最后一个实例持有者释放后才关闭进程
+        // 先同步停止新调用，随后有界等待在途 I/O 并回收进程
+        self.session.quiesce();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let session = Arc::clone(&self.session);
+            handle.spawn(async move {
+                session.shutdown(Duration::from_secs(1)).await;
+            });
         }
     }
 }

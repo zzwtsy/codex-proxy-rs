@@ -196,11 +196,6 @@ async function handleRestart() {
   try {
     if (!updateInfo.value)
       throw new Error('请等待系统更新信息加载完成')
-    // 文件已更新但旧进程仍在运行时，旧 API 继续使用安装前的兼容预检。
-    if (!updateInfo.value.restartConfirmationSupported) {
-      await restartNow()
-      return
-    }
     restartPlan.value = await checkSystemRestart()
     if (restartPlan.value.incompatiblePlugins.length) {
       restartConfirmOpen.value = true

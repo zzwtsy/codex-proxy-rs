@@ -3,7 +3,7 @@
 use super::{
     PluginRuntime,
     diagnostics::{PreparationDiagnostic, runtime_failure_from_admin},
-    set::{PreparedContributions, PreparedSet, fingerprint},
+    set::{PreparedContributions, PreparedSet, fingerprint, instance_fingerprint},
 };
 use crate::ValidatedPackage;
 use async_trait::async_trait;
@@ -88,7 +88,12 @@ impl PluginRuntime {
             }
             return Ok(ExtensionSetReference::new(set.id.clone(), set));
         }
+        self.prepared_instances
+            .lock()
+            .await
+            .retain(|_, instance| instance.strong_count() > 0);
         let mut contributions = PreparedContributions::default();
+        let mut sessions = Vec::new();
         let mut failures = BTreeMap::new();
         let mut identities = BTreeSet::new();
         for instance in snapshot
@@ -99,15 +104,34 @@ impl PluginRuntime {
             if !identities.insert(instance.id.clone()) {
                 return Err(AdminError::invalid("插件实例 ID 重复"));
             }
-            let result = tokio::time::timeout(
-                // 沿用准备阶段原有的 30 秒预算；打包校验与能力恢复也在预算内
-                Duration::from_secs(30),
-                self.prepare_instance(instance.clone(), snapshot.config_revision),
-            )
-            .await
-            .unwrap_or_else(|_| Err(AdminError::unavailable("插件启动超时")));
+            let identity = instance_fingerprint(instance)?;
+            let reusable = {
+                let instances = self.prepared_instances.lock().await;
+                instances
+                    .get(&identity)
+                    .and_then(Weak::upgrade)
+                    .filter(|instance| instance.session.is_ready())
+            };
+            let result = if let Some(instance) = reusable {
+                Ok(instance)
+            } else {
+                tokio::time::timeout(
+                    // 沿用准备阶段原有的 30 秒预算；打包校验与能力恢复也在预算内
+                    Duration::from_secs(30),
+                    self.prepare_instance(instance.clone(), snapshot.config_revision),
+                )
+                .await
+                .unwrap_or_else(|_| Err(AdminError::unavailable("插件启动超时")))
+            };
             match result {
-                Ok(candidate) => contributions.append(candidate),
+                Ok(candidate) => {
+                    self.prepared_instances
+                        .lock()
+                        .await
+                        .insert(identity, Arc::downgrade(&candidate));
+                    contributions.append(candidate.contributions.clone());
+                    sessions.push(candidate);
+                }
                 Err(error) if required_revision == Some(instance.revision) => return Err(error),
                 Err(error) => {
                     // 目录没有拒绝请求用的 binding，不能在恢复失败时悄悄撤销仍启用的别名
@@ -132,6 +156,9 @@ impl PluginRuntime {
                     contributions
                         .policy_entries
                         .extend(crate::adapter::policy::unavailable_entries(instance)?);
+                    contributions
+                        .middleware_entries
+                        .extend(crate::adapter::middleware::unavailable_entries(instance)?);
                     contributions.upstream_entries.extend(
                         crate::adapter::upstream_adapter::unavailable_entries(instance)?,
                     );
@@ -145,11 +172,11 @@ impl PluginRuntime {
             }
         }
         let PreparedContributions {
-            sessions,
             observer_entries,
             commands,
             management,
             policy_entries,
+            middleware_entries,
             upstream_entries,
             authentication_entries,
             model_aliases,
@@ -177,23 +204,21 @@ impl PluginRuntime {
                 .map_err(|_| AdminError::invalid("插件观察计划注册冲突"))
         })
         .transpose()?;
-        let policy_plan = crate::adapter::policy::PluginRequestPolicyPlan::compile(
+        let policies = crate::adapter::policy::PluginRequestPolicyPlan::compile(
             policy_entries,
             self.config.rpc_limits.maximum_call_timeout,
-        )?;
-        let policies = policy_plan
-            .as_ref()
-            .filter(|plan| plan.has_request_policy())
-            .cloned()
-            .map(|plan| {
-                self.policies
-                    .register(id.clone(), plan)
-                    .map_err(|_| AdminError::invalid("插件请求策略计划注册冲突"))
-            })
-            .transpose()?;
-        let middleware = policy_plan
-            .filter(|plan| plan.has_middleware())
-            .map(|plan| plan as Arc<dyn gateway_core::engine::middleware::MiddlewarePlan>);
+        )?
+        .map(|plan| {
+            self.policies
+                .register(id.clone(), plan)
+                .map_err(|_| AdminError::invalid("插件请求策略计划注册冲突"))
+        })
+        .transpose()?;
+        let middleware = crate::adapter::middleware::PluginMiddlewarePlan::compile(
+            middleware_entries,
+            self.config.rpc_limits.maximum_call_timeout,
+        )
+        .map(|plan| plan as Arc<dyn gateway_core::engine::middleware::MiddlewarePlan>);
         let upstream_adapters =
             crate::adapter::upstream_adapter::PluginUpstreamAdapterPlan::compile(upstream_entries)?;
         let execution = if middleware.is_some() || upstream_adapters.is_some() {
@@ -297,6 +322,7 @@ impl PluginPreparation for PluginRuntime {
             let (_, state) = super::super::configuration::validate(&instance, package.manifest())?;
             crate::adapter::observer::validate_bindings(package.manifest(), &instance.bindings)?;
             crate::adapter::policy::validate_bindings(package.manifest(), &instance.bindings)?;
+            crate::adapter::middleware::validate_bindings(package.manifest(), &instance.bindings)?;
             crate::adapter::catalog::validate_bindings(package.manifest(), &instance.bindings)?;
             crate::adapter::upstream_adapter::validate_bindings(
                 package.manifest(),

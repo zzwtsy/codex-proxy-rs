@@ -296,71 +296,71 @@ async fn restart_circuit_counts_a_started_process_that_exits_during_handshake() 
 }
 
 #[tokio::test]
-async fn restart_circuit_does_not_let_an_older_generation_clear_newer_failures() {
+async fn reused_session_failure_counts_once_across_multiple_generations() {
     let restart_circuit = gateway_plugin_runtime::PluginRestartCircuitConfig {
         maximum_failures: NonZeroUsize::new(3).unwrap(),
         stability_window: Duration::from_millis(50),
     };
     let (cache, store, runtime) = super::super::setup_with_restart_circuit(restart_circuit).await;
     let controls = tempfile::tempdir().unwrap();
-    let marker = controls.path().join("overlapping-generations.jsonl");
-    let old_exit = controls.path().join("old-generation-exit");
+    let marker = controls.path().join("shared-generations.jsonl");
+    let exit = controls.path().join("shared-exit");
     let mut snapshot = store.snapshot.lock().unwrap().clone();
     snapshot.instances[0].configuration = serde_json::json!({
-        "startup_marker":marker,
-        "startup_failures":[false,true,true,true],
-        "exit_after_ready_signals":[old_exit],
+        "startup_marker": marker,
+        "startup_failures": [false, true, true, true],
+        "exit_after_ready_signals": [exit],
     });
     let mut other = snapshot.instances[0].clone();
     other.id = "other-instance".into();
-    other.name = "Other".into();
     other.configuration = serde_json::json!({});
     snapshot.instances.push(other);
     let published = PluginPreparation::prepare(&runtime, snapshot.clone())
         .await
-        .expect("published generation");
-    assert!(published.is_ready());
-    // 旧代次明确越过稳定窗口；新代次在握手前失败，运行时间固定为零
-    // 不依赖 15 ms 退出与注册完成的竞速，也不让调度延迟重置新失败预算
-    tokio::time::sleep(restart_circuit.stability_window).await;
-
-    let mut failed_candidate = None;
+        .unwrap();
+    let mut retained = Vec::new();
     for revision in 2..=4 {
         snapshot.config_revision = Revision::new(revision).unwrap();
-        snapshot.instances[1].revision = Revision::new(revision).unwrap();
-        snapshot.instances[1].configuration = serde_json::json!({"revision":revision});
+        snapshot.instances[1].revision = snapshot.config_revision;
+        retained.push(
+            PluginPreparation::prepare(&runtime, snapshot.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        startup_count(&marker),
+        1,
+        "unrelated edits share the healthy process"
+    );
+    tokio::time::sleep(restart_circuit.stability_window).await;
+    std::fs::write(&exit, b"exit").unwrap();
+    wait_until_unready(&published).await;
+    assert!(retained.iter().all(|set| !set.is_ready()));
+    // 同一进程故障只扣一次预算；两个新的握手失败后才熔断
+    for revision in 5..=6 {
+        snapshot.config_revision = Revision::new(revision).unwrap();
+        snapshot.instances[1].revision = snapshot.config_revision;
         let candidate = PluginPreparation::prepare(&runtime, snapshot.clone())
             .await
-            .expect("the unrelated instance starts while the newer incarnation fails");
-        assert_eq!(startup_count(&marker), revision as usize);
-        drop(failed_candidate.replace(candidate));
-        assert!(published.is_ready(), "the older generation remains healthy");
+            .unwrap();
+        assert_eq!(startup_count(&marker), (revision - 3) as usize);
+        drop(candidate);
     }
-    drop(failed_candidate.take());
-    std::fs::write(&old_exit, b"exit").unwrap();
-    wait_until_unready(&published).await;
-    snapshot.config_revision = Revision::new(5).unwrap();
-    snapshot.instances[1].revision = Revision::new(5).unwrap();
-    snapshot.instances[1].configuration = serde_json::json!({"revision":5});
-    let circuit = gateway_admin::ports::plugins::PluginRuntimeDiagnostics::runtime_diagnostics(
-        &runtime, &snapshot, None, None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        circuit["instance-one"]
-            .failure
-            .as_ref()
-            .map(|failure| failure.code.as_str()),
-        Some("restart_circuit_open"),
-    );
+    snapshot.config_revision = Revision::new(7).unwrap();
+    snapshot.instances[1].revision = snapshot.config_revision;
     let recovered = PluginPreparation::prepare(&runtime, snapshot.clone())
         .await
-        .expect("an older failed instance is isolated during unrelated recovery");
+        .unwrap();
+    assert_eq!(
+        startup_count(&marker),
+        3,
+        "the open circuit prevents another start"
+    );
     let diagnostics = gateway_admin::ports::plugins::PluginRuntimeDiagnostics::runtime_diagnostics(
         &runtime,
         &snapshot,
-        Some(5),
+        Some(7),
         Some(&recovered),
     )
     .await
@@ -370,18 +370,16 @@ async fn restart_circuit_does_not_let_an_older_generation_clear_newer_failures()
             .failure
             .as_ref()
             .map(|failure| failure.code.as_str()),
-        Some("unavailable"),
-        "the older healthy session must not erase newer failures for the same identity"
+        Some("unavailable")
     );
-    assert_eq!(startup_count(&marker), 4);
-
+    drop(retained);
     drop(recovered);
     drop(published);
     super::super::wait_until_empty(cache.path()).await;
 }
 
 #[tokio::test]
-async fn restart_circuit_restores_an_older_failure_after_candidate_shutdown() {
+async fn abandoned_candidate_keeps_shared_process_failure_in_restart_budget() {
     let restart_circuit = gateway_plugin_runtime::PluginRestartCircuitConfig {
         maximum_failures: NonZeroUsize::MIN,
         stability_window: Duration::from_secs(1),
@@ -411,10 +409,11 @@ async fn restart_circuit_restores_an_older_failure_after_candidate_shutdown() {
     let candidate = PluginPreparation::prepare(&runtime, snapshot.clone())
         .await
         .expect("healthy replacement candidate");
+    assert_eq!(startup_count(&marker), 1);
+    drop(candidate);
+    assert!(published.is_ready());
     std::fs::write(&old_exit, b"exit").unwrap();
     wait_until_unready(&published).await;
-    assert!(candidate.is_ready());
-    drop(candidate);
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -461,7 +460,7 @@ async fn restart_circuit_restores_an_older_failure_after_candidate_shutdown() {
             .map(|failure| failure.code.as_str()),
         Some("unavailable"),
     );
-    assert_eq!(startup_count(&marker), 2);
+    assert_eq!(startup_count(&marker), 1);
 
     drop(recovered);
     drop(published);

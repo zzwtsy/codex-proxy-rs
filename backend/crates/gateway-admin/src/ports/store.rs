@@ -12,8 +12,9 @@ use super::backup::BackupStorePorts;
 use crate::model::{
     MutationContext, Revision,
     account_groups::{
-        AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-        DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled, UpdateAccountGroup,
+        AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+        AccountGroupOptionsPage, AccountGroupPage, DeleteAccountGroup, NewAccountGroup,
+        SetAccountGroupEnabled, UpdateAccountGroup,
     },
     accounts::{
         AccountListQuery, AccountPage, AccountPageItem, AccountRuntimeSnapshot,
@@ -384,6 +385,11 @@ pub trait AccountGroupStore: Send + Sync {
         &self,
         query: AccountGroupListQuery,
     ) -> AdminStoreResult<AccountGroupPage>;
+
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage>;
 
     async fn load_account_group_members(
         &self,

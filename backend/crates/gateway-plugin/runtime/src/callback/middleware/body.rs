@@ -212,10 +212,11 @@ impl BodyResource {
         };
         let transformed = frame.transformed();
         let (bytes, framing, terminal, envelope) = frame.into_parts();
-        // canonical-only 事件没有客户端正文，仍须保留并允许读取其完整事实
-        let facts_only =
-            framing == MiddlewareFraming::RawBytes && bytes.is_empty() && envelope.is_some();
-        if (!facts_only && framing != self.expected_framing) || bytes.len() > maximum {
+        // 宿主原始字节可能没有 JSON 解析视图，包含未知 WS 文本和 canonical-only 事实
+        // 预期 framing 约束插件改写后的输出，不能阻止插件读取并原样归还来源
+        if (framing != MiddlewareFraming::RawBytes && framing != self.expected_framing)
+            || bytes.len() > maximum
+        {
             return Err(invalid());
         }
         let source_id = state.next_source_id.checked_add(1).ok_or_else(invalid)?;

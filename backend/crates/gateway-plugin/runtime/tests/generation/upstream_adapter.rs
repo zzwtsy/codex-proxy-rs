@@ -102,18 +102,12 @@ async fn setup(
     Arc<super::Store>,
     gateway_plugin_runtime::PluginRuntime,
 ) {
-    let mut contributes = Contributions::from([crate::support::contribution(
+    let contributes = Contributions::from([crate::support::contribution(
         Capability::UpstreamAdapter,
         vec![Stage::Upstream],
         vec!["openai".into()],
         vec!["openai".into()],
     )]);
-    if let Some(version) = config["upstream_version"].as_u64() {
-        contributes
-            .get_mut(&Capability::UpstreamAdapter)
-            .unwrap()
-            .version = version.try_into().unwrap();
-    }
     let (cache, store, runtime) =
         super::setup_with_contributions_and_restart_circuit(contributes, Default::default()).await;
     {
@@ -226,7 +220,7 @@ fn execute_with_context(
 }
 
 #[tokio::test]
-async fn legacy_adapter_decodes_exact_v1_metadata_for_all_fast_modes() {
+async fn adapter_preserves_three_state_fast_in_request_metadata() {
     use gateway_core::account::FastMode;
     for mode in [FastMode::Default, FastMode::Enabled, FastMode::Disabled] {
         let server = MockServer::start().await;
@@ -237,8 +231,7 @@ async fn legacy_adapter_decodes_exact_v1_metadata_for_all_fast_modes() {
             .mount(&server)
             .await;
         let mut config = configuration(&server.uri(), false);
-        config["upstream_version"] = json!(1);
-        config["expected_disable_fast"] = json!(mode == FastMode::Disabled);
+        config["expected_fast_mode"] = json!(mode.as_str());
         let (cache, _, runtime) = setup(config).await;
         let generation =
             ExtensionPreparationPort::prepare(&runtime, ConfigRevision::new(1).unwrap())

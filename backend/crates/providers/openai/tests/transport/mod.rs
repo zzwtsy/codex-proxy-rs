@@ -58,6 +58,7 @@ mod endpoints;
 mod headers;
 mod http_client;
 mod latency;
+pub(crate) mod privacy;
 mod profile;
 mod profile_avatar;
 mod profile_contract;
@@ -268,7 +269,16 @@ async fn collect_backend_response(
                 .unwrap_or(i64::MAX)
                 .max(1)
         });
-        body_bytes.extend_from_slice(&chunk);
+        if transport == CodexBackendTransport::WebSocket {
+            let raw = std::str::from_utf8(&chunk).unwrap();
+            body_bytes.extend_from_slice(
+                provider_openai::transport::protocol::websocket::websocket_event_to_sse_frame(raw)
+                    .unwrap()
+                    .as_bytes(),
+            );
+        } else {
+            body_bytes.extend_from_slice(&chunk);
+        }
     }
     if let Some(updates) = rate_limit_updates {
         for update in updates.lock().await.iter() {

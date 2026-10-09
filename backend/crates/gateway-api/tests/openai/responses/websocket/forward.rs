@@ -106,10 +106,18 @@ async fn next_error(socket: &mut TestSocket) -> Value {
 }
 
 async fn assert_no_duplicate_failure(socket: &mut TestSocket) {
-    // 后续入站帧只会在本轮收敛后处理，比固定等待窗口更可靠地检查没有重复失败终态
-    socket.send(Message::Text("{".into())).await.unwrap();
+    // 无效创建帧仍走串行队列，以本地业务校验作为本轮收敛后的屏障
+    socket
+        .send(Message::Text(
+            json!({"type":"response.create","model":"model-a","stream":false})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
     let error = next_event(socket).await;
-    assert_eq!(error["error"]["code"], "invalid_json");
+    assert_eq!(error["error"]["code"], "invalid_value");
+    assert_eq!(error["error"]["param"], "stream");
     assert_eq!(error["status"], 400);
     assert_eq!(error["headers"]["x-request-id"], error["request_id"]);
     assert_eq!(

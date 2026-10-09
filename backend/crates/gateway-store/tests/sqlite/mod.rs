@@ -8,11 +8,13 @@ mod client_keys;
 mod execution;
 #[cfg(unix)]
 mod file_permissions;
+mod migrations;
 mod name_keys;
 mod plugin_artifacts;
 mod plugin_distribution;
 mod plugin_resources;
 mod plugin_state;
+mod provider_leases;
 mod proxies;
 mod retention;
 mod session_cleanup;
@@ -312,6 +314,7 @@ async fn sqlite_runtime_settings_update_atomically_and_fence_provider_profiles_b
             .clone(),
     );
     let make_update = |refresh_margin_seconds, request_profile_updates| RuntimeSettingsUpdate {
+        codex_privacy_policy: Default::default(),
         request_profile_updates,
         request_location_enabled: false,
         request_location: Default::default(),
@@ -426,11 +429,11 @@ async fn sqlite_admission_recovery_reads_recent_and_running_requests_across_pool
         async move {
             sqlx::query(
                 "insert into model_requests (
-                   id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-                   client_transport, started_at_us, deadline_at_us, completed_at_us, outcome,
-                   routing_scope, routing_group_refs_json, routing_group_names_snapshot_json
-                 ) values (?1, 'key_recovery', 1, 'openai', 'responses', '/v1/responses',
-                   'http', ?2, ?3, ?4, ?5, 'all', '[]', '[]')",
+               id, client_api_key_ref, operation, client_transport, started_at_us, deadline_at_us, completed_at_us, outcome, request_observation_json
+             ) values (
+               ?1, 'key_recovery', 'responses', 'http', ?2, ?3, ?4, ?5,
+               json_object('request', json_object('configRevision', 1, 'protocol', 'openai', 'endpoint', '/v1/responses', 'compact', json('false')), 'routing', json_object('scope', 'all', 'groupRefs', json('[]'), 'groupNamesSnapshot', json('[]')))
+             )",
             )
             .bind(id)
             .bind(started_at.timestamp_micros())
@@ -1363,20 +1366,35 @@ async fn sqlite_provider_lease_coordinator_loads_cross_process_signals_and_scope
     let account = ProviderAccountId::new("acct_cursor").unwrap();
 
     let first = coordinator
-        .load_state(&client, &provider, std::slice::from_ref(&account))
+        .load_state(
+            &client,
+            &provider,
+            std::slice::from_ref(&account),
+            gateway_core::provider_ports::ProviderConcurrencyPool::Shared,
+        )
         .await
         .unwrap();
     assert_eq!(first.round_robin_cursor(), 0);
     assert_eq!(first.signals().get(&account).unwrap().in_flight, 0);
     let second = coordinator
-        .load_state(&client, &provider, std::slice::from_ref(&account))
+        .load_state(
+            &client,
+            &provider,
+            std::slice::from_ref(&account),
+            gateway_core::provider_ports::ProviderConcurrencyPool::Shared,
+        )
         .await
         .unwrap();
     assert_eq!(second.round_robin_cursor(), 1);
 
     let other_client = ClientApiKeyId::new("key_cursor_other").unwrap();
     let isolated = coordinator
-        .load_state(&other_client, &provider, std::slice::from_ref(&account))
+        .load_state(
+            &other_client,
+            &provider,
+            std::slice::from_ref(&account),
+            gateway_core::provider_ports::ProviderConcurrencyPool::Shared,
+        )
         .await
         .unwrap();
     assert_eq!(isolated.round_robin_cursor(), 0);

@@ -345,7 +345,7 @@ async fn sqlite_account_diagnostics_include_non_oauth_and_unrouted_requests() {
         sqlx::query(
             "update model_requests
              set client_api_key_ref = ?1, provider_kind = 'openai', provider_account_ref = ?2,
-                 provider_account_authentication_kind_snapshot = ?3
+                 request_observation_json = json_set(request_observation_json, '$.account.authenticationKind', ?3)
              where id = ?4",
         )
         .bind(client_key)
@@ -509,17 +509,11 @@ async fn insert_request(pool: &sqlx::SqlitePool, fixture: RequestFixture<'_>) {
     let usage = outcome == "succeeded";
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, outcome, client_status_code,
-           error_kind, input_tokens, output_tokens, total_tokens,
-           downstream_committed_at_us, cost_source, cost_amount, cost_currency,
-           latency_ms, first_token_ms, started_at_us, deadline_at_us, completed_at_us,
-           routing_scope
-         ) values (
-           ?1, 'key-observability', 1, 'openai', 'responses.create', '/v1/responses',
-           'http', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-           ?13, ?14, ?15, ?16, ?17, 'legacy_provider'
-         )",
+               id, client_api_key_ref, operation, client_transport, requested_model_id, outcome, client_status_code, error_kind, input_tokens, output_tokens, total_tokens, downstream_committed_at_us, cost_source, cost_amount, cost_currency, started_at_us, deadline_at_us, completed_at_us, request_observation_json
+             ) values (
+               ?1, 'key-observability', 'responses.create', 'http', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?15, ?16, ?17,
+               json_object('request', json_object('configRevision', 1, 'protocol', 'openai', 'endpoint', '/v1/responses', 'compact', json('false')), 'timings', json_object('local', json_object('latencyMs', ?13, 'firstTokenMs', ?14)), 'routing', json_object('scope', 'legacy_provider', 'groupRefs', json('[]'), 'groupNamesSnapshot', json('[]')))
+             )",
     )
     .bind(id)
     .bind(model)

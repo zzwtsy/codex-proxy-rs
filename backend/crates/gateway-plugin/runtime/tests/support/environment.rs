@@ -747,7 +747,7 @@ impl Environment {
 
     pub async fn bound_model_requests(&self, client_key_id: &str) -> Vec<(String, String)> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "select request_kind, subagent_kind from {}.model_requests
+            "select request_kind, subagent_kind from {}.model_request_observations
              where client_api_key_ref = $1 order by started_at, id",
             self.schema
         )))

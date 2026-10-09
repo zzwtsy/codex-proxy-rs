@@ -1,10 +1,12 @@
 //! `/healthz` 对 Core、Store 与 Host 关键 worker 健康事实的聚合
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode};
 use futures::future::join_all;
+use gateway_core::diagnostics::{OperationalDiagnostics, OperationalFailure};
+use gateway_core::error::{ErrorDetails, ErrorSource};
 use gateway_core::health::{
     HealthProbe, HealthState, WorkerHealthKey, WorkerHealthSnapshot, WorkerHealthSource,
     WorkerRuntimeState,
@@ -19,6 +21,16 @@ const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) struct HealthStatus {
     probes: Arc<[Arc<dyn HealthProbe>]>,
     workers: Arc<dyn WorkerHealthSource>,
+    diagnostics: Arc<dyn OperationalDiagnostics>,
+    failures: Arc<Mutex<Vec<HealthFailure>>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
+#[error("{component} is {state}: {reason}")]
+struct HealthFailure {
+    component: String,
+    state: &'static str,
+    reason: String,
 }
 
 impl HealthStatus {
@@ -26,31 +38,93 @@ impl HealthStatus {
     pub(crate) fn new(
         probes: Vec<Arc<dyn HealthProbe>>,
         workers: Arc<dyn WorkerHealthSource>,
+        diagnostics: Arc<dyn OperationalDiagnostics>,
     ) -> Self {
         Self {
             probes: probes.into(),
             workers,
+            diagnostics,
+            failures: Arc::default(),
         }
     }
 
     pub(crate) async fn healthy(&self) -> bool {
-        if !self
+        let mut failures: Vec<_> = self
             .workers
             .snapshot()
-            .iter()
-            .filter(|worker| worker_affects_healthz(worker))
-            .all(worker_is_healthy)
-        {
-            return false;
-        }
-        let checks = self.probes.iter().map(|probe| probe.check());
-        tokio::time::timeout(HEALTH_CHECK_TIMEOUT, join_all(checks))
-            .await
-            .is_ok_and(|states| {
-                states
-                    .into_iter()
-                    .all(|state| matches!(state, HealthState::Healthy))
+            .into_iter()
+            .filter(|worker| worker_affects_healthz(worker) && !worker_is_healthy(worker))
+            .map(|worker| HealthFailure {
+                component: match worker.key {
+                    WorkerHealthKey::Task(id) => format!("worker:{id}"),
+                    WorkerHealthKey::Disabled(kind) => format!("worker:{kind:?}"),
+                },
+                state: "unhealthy",
+                reason: format!(
+                    "state={:?}; last_error={}",
+                    worker.state,
+                    worker.last_error.as_deref().unwrap_or("none")
+                ),
             })
+            .collect();
+        // 逐个探针共享截止时间，保留已完成结果并指出具体超时组件
+        let deadline = tokio::time::Instant::now() + HEALTH_CHECK_TIMEOUT;
+        let checks = self.probes.iter().map(|probe| async move {
+            let (state, reason) = match tokio::time::timeout_at(deadline, probe.check()).await {
+                Ok(HealthState::Healthy) => return None,
+                Ok(HealthState::Degraded(reason)) => ("degraded", reason),
+                Ok(HealthState::Unhealthy(reason)) => ("unhealthy", reason),
+                Err(_) => ("timed_out", "health probe exceeded 2s deadline".to_owned()),
+            };
+            Some(HealthFailure {
+                component: format!("probe:{}", probe.name()),
+                state,
+                reason,
+            })
+        });
+        failures.extend(join_all(checks).await.into_iter().flatten());
+        let healthy = failures.is_empty();
+        let changed = {
+            let mut previous = self
+                .failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = failures
+                .iter()
+                .filter(|failure| !previous.contains(failure))
+                .cloned()
+                .collect::<Vec<_>>();
+            for recovered in previous
+                .iter()
+                .filter(|old| !failures.iter().any(|new| new.component == old.component))
+            {
+                tracing::info!(component = %recovered.component, "health component recovered");
+            }
+            *previous = failures;
+            changed
+        };
+        // 只记录故障变化；使用既有有界观测队列，文件日志失效时仍有独立的运维证据
+        for failure in changed {
+            tracing::warn!(component = %failure.component, state = failure.state, "health check failed");
+            let mut event = OperationalFailure::new(
+                "health",
+                "check",
+                "health_check_failed",
+                "Health check failed",
+            );
+            event.correlation_id = Some(failure.component.clone());
+            event.details =
+                ErrorDetails::capture(Some(&ErrorSource::new(failure.clone())), None, false);
+            if self.diagnostics.record_failure(event).await.is_err() {
+                tracing::warn!("health diagnostic could not be recorded");
+                // 入队失败不能抑制下次探测的记录机会，也不改变本次健康判定
+                self.failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|previous| previous != &failure);
+            }
+        }
+        healthy
     }
 }
 

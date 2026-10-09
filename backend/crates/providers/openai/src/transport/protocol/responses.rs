@@ -1,6 +1,6 @@
 //! Codex Responses 请求、传输要求、事件信号与流式错误的协议解析
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use gateway_core::account::FastMode;
 use gateway_protocol::openai::{
@@ -212,7 +212,7 @@ pub fn transport_requirement(request: &CodexResponsesRequest) -> TransportRequir
 
 /// 单个 Responses 事件对计时系统提供的稳定语义信号
 ///
-/// `output_start` 用于首字观测，包含非前导结构事件；`semantic_output` 仍要求
+/// `output_start` 只表示官方输出项开始事件；`semantic_output` 仍要求
 /// 实际内容，供重试与交付边界使用，不能与首字观测互换
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResponseEventSignals {
@@ -223,24 +223,117 @@ pub struct ResponseEventSignals {
     pub text_output: bool,
 }
 
+/// 仅使用同一条完成响应的官方时间戳计算响应耗时
+///
+/// 整数秒时间戳可能得到零跨度，缺失、倒序或无法落盘的时间均保留未知
+pub(crate) fn response_duration_ms(value: &Value) -> Option<u64> {
+    let response = value.get("response")?;
+    let created_at = response.get("created_at")?.as_f64()?;
+    let completed_at = response.get("completed_at")?.as_f64()?;
+    if created_at < 0.0 || completed_at <= created_at {
+        return None;
+    }
+    let duration = Duration::try_from_secs_f64(completed_at - created_at).ok()?;
+    let millis = i64::try_from(duration.as_millis()).ok()?;
+    (millis > 0).then_some(millis as u64)
+}
+
+/// 官方专项计时快照，毫秒小数按原始值保存，各层级不可混算
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct ResponseTimingMetrics {
+    pub upstream_api_overhead_ms: Option<f64>,
+    pub upstream_engine_ms: Option<f64>,
+    pub upstream_engine_iapi_ttft_ms: Option<f64>,
+    pub upstream_engine_service_ttft_ms: Option<f64>,
+    pub upstream_engine_iapi_tbt_ms: Option<f64>,
+    pub upstream_engine_service_tbt_ms: Option<f64>,
+}
+
+impl ResponseTimingMetrics {
+    pub(crate) fn from_event(value: &Value) -> Self {
+        let Some(metrics) = value.get("timing_metrics") else {
+            return Self::default();
+        };
+        let valid_milliseconds =
+            |value: &f64| value.is_finite() && *value >= 0.0 && *value < i64::MAX as f64;
+        let milliseconds =
+            |source: &Value, key: &str| source.get(key)?.as_f64().filter(valid_milliseconds);
+        if let Some(path) = metrics.get("critical_path") {
+            // 外层 logical_turn 可累计多次响应与工具等待，只取完整的当前响应阶段
+            if path.get("scope").and_then(Value::as_str) != Some("response")
+                || path.get("coverage").and_then(Value::as_str) != Some("complete")
+                || path.get("boundary_type").and_then(Value::as_str)
+                    != Some("actionable_output_item_done")
+            {
+                return Self::default();
+            }
+            // API 开销由推理前与其他处理构成，缺少任一分项时不能按零补齐
+            let overhead = milliseconds(path, "responses_pre_inference_ms")
+                .zip(milliseconds(path, "responses_other_ms"))
+                .map(|(before, other)| before + other)
+                .filter(valid_milliseconds);
+            return Self {
+                upstream_api_overhead_ms: overhead,
+                upstream_engine_ms: milliseconds(path, "engine_wall_ms"),
+                ..Self::default()
+            };
+        }
+        // 直接返回的专项指标保留原口径，明确标为整轮累计的值不能归入单次请求
+        if metrics
+            .get("timing_scope")
+            .is_some_and(|scope| scope.as_str() != Some("response"))
+        {
+            return Self::default();
+        }
+        Self {
+            upstream_api_overhead_ms: milliseconds(
+                metrics,
+                "responses_duration_excl_engine_and_client_tool_time_ms",
+            ),
+            upstream_engine_ms: milliseconds(metrics, "engine_service_total_ms"),
+            upstream_engine_iapi_ttft_ms: milliseconds(metrics, "engine_iapi_ttft_total_ms"),
+            upstream_engine_service_ttft_ms: milliseconds(metrics, "engine_service_ttft_total_ms"),
+            upstream_engine_iapi_tbt_ms: milliseconds(
+                metrics,
+                "engine_iapi_tbt_across_engine_calls_ms",
+            ),
+            upstream_engine_service_tbt_ms: milliseconds(
+                metrics,
+                "engine_service_tbt_across_engine_calls_ms",
+            ),
+        }
+    }
+
+    pub(crate) fn merge(&mut self, incoming: Self) {
+        if incoming.upstream_api_overhead_ms.is_some() {
+            self.upstream_api_overhead_ms = incoming.upstream_api_overhead_ms;
+        }
+        if incoming.upstream_engine_ms.is_some() {
+            self.upstream_engine_ms = incoming.upstream_engine_ms;
+        }
+        if incoming.upstream_engine_iapi_ttft_ms.is_some() {
+            self.upstream_engine_iapi_ttft_ms = incoming.upstream_engine_iapi_ttft_ms;
+        }
+        if incoming.upstream_engine_service_ttft_ms.is_some() {
+            self.upstream_engine_service_ttft_ms = incoming.upstream_engine_service_ttft_ms;
+        }
+        if incoming.upstream_engine_iapi_tbt_ms.is_some() {
+            self.upstream_engine_iapi_tbt_ms = incoming.upstream_engine_iapi_tbt_ms;
+        }
+        if incoming.upstream_engine_service_tbt_ms.is_some() {
+            self.upstream_engine_service_tbt_ms = incoming.upstream_engine_service_tbt_ms;
+        }
+    }
+}
+
 /// 从已解析的 Responses 事件提取计时语义
 ///
-/// 首字采用首个非前导、非心跳、非失败事件，包含结构事件
+/// 首字采用官方 Codex 的首个 output_item.added 边界
 /// 语义输出仍要求文本、推理、工具参数、图片结果或工具执行
 pub fn response_event_signals(event_type: Option<&str>, value: &Value) -> ResponseEventSignals {
     let mut signals = ResponseEventSignals {
         protocol_progress: !matches!(event_type, Some("response.failed" | "error")),
-        output_start: event_type.is_some_and(|event_type| {
-            !matches!(
-                event_type,
-                "response.created"
-                    | "response.in_progress"
-                    | "keepalive"
-                    | "codex.rate_limits"
-                    | "response.failed"
-                    | "error"
-            )
-        }),
+        output_start: event_type == Some("response.output_item.added"),
         ..ResponseEventSignals::default()
     };
     match event_type {

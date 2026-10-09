@@ -6,17 +6,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use gateway_core::{
     engine::{
-        AttemptRecord, EntryRejection, ExecutionOutcome, ExecutionStore, IntermediateFailure,
+        AttemptRecord, EntryRejection, ExecutionStore, IntermediateFailure,
         ModelRequestFinalization, ModelRequestId, NewModelRequest, ProbeFailure, RecoveryReport,
     },
-    error::{
-        ProviderErrorKind, StoreError as CoreStoreError, StoreErrorKind as CoreStoreErrorKind,
-    },
-    metering::CostSource,
-    routing::AccountRoutingSnapshot,
+    error::{StoreError as CoreStoreError, StoreErrorKind as CoreStoreErrorKind},
     upstream::UpstreamSendState,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use crate::sqlite::value::encode_amount;
@@ -34,60 +30,39 @@ impl SqliteExecutionStore {
 
     async fn insert_request(
         &self,
-        request: &NewModelRequest,
+        request: NewModelRequest,
         attempt: Option<&AttemptRecord>,
     ) -> Result<(), CoreStoreError> {
-        validate_new_request(request)?;
-        let (routing_scope, group_refs, group_names) = routing_snapshot(&request.routing);
-        let group_refs = serde_json::to_string(&group_refs).map_err(|_| core_invalid())?;
-        let group_names = serde_json::to_string(&group_names).map_err(|_| core_invalid())?;
+        let request = crate::execution::new_model_request_row(request);
+        request.validate().map_err(crate::core_store_error)?;
+        let observation = crate::request_observation::RequestObservation::initial(&request)
+            .map_err(crate::core_store_error)?;
         let mut transaction = self.pool.begin().await.map_err(|_| core_unavailable())?;
         sqlx::query(
             "insert into model_requests (
-               id, client_api_key_id, client_api_key_ref, config_revision, protocol,
-               routing_scope, routing_group_refs_json, routing_group_names_snapshot_json,
-               operation, endpoint, client_transport, requested_model_id,
-               client_ip, user_agent, reasoning_effort, reasoning_preset, request_kind,
-               subagent_kind, compact, image_generation_requested, admission_decision_ms,
-               started_at_us, deadline_at_us, continuation_affinity_hash,
-               continuation_previous_response_id_hash, continuation_requested
-             ) values (
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-               ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
-             )",
+               id, client_api_key_id, client_api_key_ref, operation, client_transport,
+               requested_model_id, image_generation_requested, started_at_us, deadline_at_us,
+               continuation_affinity_hash, continuation_requested, request_kind, request_observation_json
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
-        .bind(request.id.as_str())
-        .bind(request.client_api_key_id.as_ref().map(|id| id.as_str()))
-        .bind(request.client_api_key_ref.as_str())
-        .bind(to_i64(request.config_revision.get())?)
-        .bind(&request.protocol)
-        .bind(routing_scope)
-        .bind(group_refs)
-        .bind(group_names)
-        .bind(request.operation.as_str())
-        .bind(&request.endpoint)
-        .bind(&request.client_transport)
-        .bind(request.requested_model.as_ref().map(|model| model.as_str()))
-        .bind(request.client_ip.map(|address| address.to_string()))
-        .bind(&request.user_agent)
-        .bind(&request.reasoning_effort)
-        .bind(&request.reasoning_preset)
-        .bind(&request.request_kind)
-        .bind(&request.subagent_kind)
-        .bind(bool_i64(request.compact))
+        .bind(&request.id)
+        .bind(request.client_api_key_id)
+        .bind(request.client_api_key_ref)
+        .bind(request.operation)
+        .bind(request.client_transport)
+        .bind(request.requested_model_id)
         .bind(bool_i64(request.image_generation_requested))
-        .bind(optional_i64(request.admission_decision_ms)?)
-        .bind(DateTime::<Utc>::from(request.started_at).timestamp_micros())
-        .bind(DateTime::<Utc>::from(request.deadline_at.lease_deadline()).timestamp_micros())
-        .bind(&request.continuation.affinity_hash)
-        .bind(&request.continuation.previous_response_id_hash)
+        .bind(request.started_at.timestamp_micros())
+        .bind(request.deadline_at.timestamp_micros())
+        .bind(request.continuation.affinity_hash)
         .bind(bool_i64(request.continuation.requested))
+        .bind(request.request_kind)
+        .bind(observation)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| core_unavailable())?;
-
+        .map_err(|source| crate::core_store_error(super::sqlite_unavailable("insert SQLite model request").with_source(source)))?;
         if let Some(attempt) = attempt {
-            if attempt.attempt_count.get() != 1 || attempt.request_id != request.id {
+            if attempt.attempt_count.get() != 1 || attempt.request_id.as_str() != request.id {
                 return Err(core_invalid_state());
             }
             update_attempt(&mut transaction, attempt).await?;
@@ -242,7 +217,7 @@ impl ExecutionStore for SqliteExecutionStore {
     }
 
     async fn create_model_request(&self, request: NewModelRequest) -> Result<(), CoreStoreError> {
-        self.insert_request(&request, None).await
+        self.insert_request(request, None).await
     }
 
     async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), CoreStoreError> {
@@ -258,7 +233,7 @@ impl ExecutionStore for SqliteExecutionStore {
         attempt: AttemptRecord,
     ) -> Result<(), CoreStoreError> {
         validate_attempt(&attempt)?;
-        self.insert_request(&request, Some(&attempt)).await
+        self.insert_request(request, Some(&attempt)).await
     }
 
     async fn mark_send_state(
@@ -422,120 +397,58 @@ impl ExecutionStore for SqliteExecutionStore {
         &self,
         finalization: ModelRequestFinalization,
     ) -> Result<(), CoreStoreError> {
-        let outcome = outcome_str(finalization.outcome)?;
-        validate_status_code(finalization.client_status_code)?;
-        validate_status_code(finalization.upstream_status_code)?;
-        validate_finalization_json(&finalization)?;
-        validate_connection_observation(&finalization)?;
-        if let Some(tier) = finalization.service_tier.as_deref()
-            && (tier.is_empty() || tier.len() > 64 || tier.chars().any(char::is_control))
-        {
-            return Err(core_invalid());
-        }
-
-        let continuation_reason = finalization
-            .failure_observation
-            .continuation_unavailable_reason
-            .clone();
-        validate_stable_reason(continuation_reason.as_deref())?;
-        let (cost_source, cost_amount, cost_currency) = match finalization.cost.total() {
-            Some(total) => (
-                cost_source_str(finalization.cost.source()),
-                Some(encode_amount(total.amount())),
-                Some(total.currency().as_str().to_owned()),
-            ),
-            None => ("unavailable", None, None),
-        };
-        let error_kind = if continuation_reason.is_some() {
-            Some(
-                ProviderErrorKind::ContinuationRecoveryRequired
+        let finalization = crate::execution::finalization_row(finalization)?;
+        finalization.validate().map_err(crate::core_store_error)?;
+        let observation = crate::request_observation::RequestObservation::finalized(&finalization)
+            .map_err(crate::core_store_error)?;
+        let cost_amount = finalization
+            .cost_amount
+            .as_ref()
+            .map(|value| {
+                value
                     .as_str()
-                    .to_owned(),
-            )
-        } else {
-            finalization
-                .error
-                .as_ref()
-                .map(|error| error.kind().as_str().to_owned())
-        };
-        let error_message = finalization.error.as_ref().map(|error| {
-            error.diagnostic().map_or_else(
-                || error.safe_message().to_owned(),
-                |diagnostic| diagnostic.as_str().to_owned(),
-            )
-        });
-        let connection = finalization
-            .failure_observation
-            .upstream_connection
-            .as_ref();
-        let completed_at_us = DateTime::<Utc>::from(finalization.completed_at).timestamp_micros();
-        let provider_metadata = finalization
-            .provider_metadata_json
-            .as_deref()
-            .map(parse_json_object)
+                    .parse::<gateway_core::metering::Decimal>()
+                    .map(encode_amount)
+                    .map_err(|_| core_invalid())
+            })
             .transpose()?;
-        let diagnostic_trace = finalization
-            .diagnostic_trace_json
-            .as_deref()
-            .map(parse_json_object)
-            .transpose()?;
-        let billing_snapshot = finalization
-            .cost
-            .breakdown()
-            .map(crate::billing::encode_billing_snapshot)
-            .map(|value| value.to_string());
-
         let mut transaction = self.pool.begin().await.map_err(|_| core_unavailable())?;
         let current = sqlx::query(
             "update model_requests
              set outcome = ?2, upstream_send_state = ?3, attempt_count = ?4,
                  downstream_committed_at_us = ?5,
-                 client_status_code = coalesce(client_status_code, ?6),
-                 upstream_status_code = ?7,
+                 client_status_code = coalesce(client_status_code, ?6), upstream_status_code = ?7,
                  client_response_id = ?8, upstream_request_id = ?9, upstream_response_id = ?10,
-                 error_kind = ?11, provider_error_code = ?12, error_message = ?13,
-                 retry_after_ms = ?14, input_tokens = ?15, output_tokens = ?16,
-                 cached_tokens = ?17, cache_write_tokens = ?18, reasoning_tokens = ?19,
-                 image_input_tokens = ?20, image_output_tokens = ?21, total_tokens = ?22,
-                 image_generation_succeeded = ?23, cost_source = ?24,
-                 cost_amount = ?25, cost_currency = ?26,
-                 transport_decision_wait_ms = ?27, connect_ms = ?28,
-                 headers_ms = ?29, first_event_ms = ?30, first_reasoning_ms = ?31,
-                 first_text_ms = ?32, first_token_ms = ?33, provider_processing_ms = ?34,
-                 latency_ms = ?35, completed_at_us = max(started_at_us, ?36),
-                 upstream_transport = coalesce(?37, upstream_transport),
-                 http_version = coalesce(?38, http_version), websocket_pool = ?39,
-                 service_tier = ?40, provider_observation_json = ?41,
-                 error_details = ?42,
-                 continuation_unavailable_reason = ?43,
-                 upstream_connection_id = ?44,
-                 upstream_connection_exit_reason = ?45,
-                 upstream_connection_age_ms = ?46,
-                 upstream_connection_idle_ms = ?47, diagnostic_trace_json = ?48,
-                 upstream_response_model = ?49, billing_snapshot_json = ?50
+                 error_kind = ?11, input_tokens = ?12, output_tokens = ?13,
+                 cached_tokens = ?14, cache_write_tokens = ?15, reasoning_tokens = ?16,
+                 image_input_tokens = ?17, image_output_tokens = ?18, total_tokens = ?19,
+                 image_generation_succeeded = ?20, cost_source = ?21,
+                 cost_amount = ?22, cost_currency = ?23,
+                 completed_at_us = max(started_at_us, ?24),
+                 upstream_transport = coalesce(?25, upstream_transport), service_tier = ?26,
+                 provider_observation_json = ?27, error_details = ?28, diagnostic_trace_json = ?29,
+                 billing_snapshot_json = ?30,
+                 request_observation_json = json_patch(request_observation_json, ?31)
              where id = ?1 and outcome = 'running'
              returning id, client_api_key_ref, continuation_affinity_hash,
                        continuation_requested, provider_kind, upstream_transport,
                        outcome, started_at_us, completed_at_us",
         )
-        .bind(finalization.request_id.as_str())
-        .bind(outcome)
-        .bind(send_state_str(finalization.send_state))
+        .bind(&finalization.model_request_id)
+        .bind(finalization.outcome.as_str())
+        .bind(finalization.upstream_send_state.as_str())
         .bind(i64::from(finalization.attempt_count))
         .bind(
             finalization
                 .downstream_committed_at
-                .map(|value| DateTime::<Utc>::from(value).timestamp_micros()),
+                .map(|value| value.timestamp_micros()),
         )
         .bind(finalization.client_status_code.map(i64::from))
         .bind(finalization.upstream_status_code.map(i64::from))
         .bind(finalization.client_response_id.map(String::into_bytes))
-        .bind(&finalization.upstream_request_id)
+        .bind(finalization.upstream_request_id)
         .bind(finalization.upstream_response_id.map(String::into_bytes))
-        .bind(error_kind)
-        .bind(&finalization.provider_error_code)
-        .bind(error_message)
-        .bind(optional_i64(finalization.retry_after_ms)?)
+        .bind(finalization.error_kind)
         .bind(optional_i64(finalization.usage.input_tokens)?)
         .bind(optional_i64(finalization.usage.output_tokens)?)
         .bind(optional_i64(finalization.usage.cached_tokens)?)
@@ -545,48 +458,24 @@ impl ExecutionStore for SqliteExecutionStore {
         .bind(optional_i64(finalization.usage.image_output_tokens)?)
         .bind(optional_i64(finalization.usage.total_tokens)?)
         .bind(finalization.image_generation_succeeded.map(bool_i64))
-        .bind(cost_source)
+        .bind(finalization.cost_source.as_str())
         .bind(cost_amount)
-        .bind(cost_currency)
-        .bind(optional_i64(
-            finalization.timings.transport_decision_wait_ms,
-        )?)
-        .bind(optional_i64(finalization.timings.connect_ms)?)
-        .bind(optional_i64(finalization.timings.headers_ms)?)
-        .bind(optional_i64(finalization.timings.first_event_ms)?)
-        .bind(optional_i64(finalization.timings.first_reasoning_ms)?)
-        .bind(optional_i64(finalization.timings.first_text_ms)?)
-        .bind(optional_i64(finalization.timings.first_token_ms)?)
-        .bind(optional_i64(finalization.timings.provider_processing_ms)?)
-        .bind(optional_i64(finalization.timings.latency_ms)?)
-        .bind(completed_at_us)
-        .bind(&finalization.upstream_transport)
-        .bind(&finalization.http_version)
-        .bind(&finalization.websocket_pool)
-        .bind(&finalization.service_tier)
-        .bind(provider_metadata.map(|value| value.to_string()))
-        .bind(&finalization.error_details)
-        .bind(&continuation_reason)
-        .bind(connection.map(|observation| observation.connection_id()))
-        .bind(connection.map(|observation| observation.exit_reason()))
-        .bind(
-            connection
-                .map(|observation| optional_i64(Some(observation.age_ms())))
-                .transpose()?
-                .flatten(),
-        )
-        .bind(
-            connection
-                .map(|observation| optional_i64(Some(observation.idle_ms())))
-                .transpose()?
-                .flatten(),
-        )
-        .bind(diagnostic_trace.map(|value| value.to_string()))
-        .bind(&finalization.upstream_response_model)
-        .bind(billing_snapshot)
+        .bind(finalization.cost_currency)
+        .bind(finalization.completed_at.timestamp_micros())
+        .bind(finalization.upstream_transport)
+        .bind(finalization.service_tier)
+        .bind(finalization.provider_metadata_json.map(sqlx::types::Json))
+        .bind(finalization.error_details)
+        .bind(finalization.diagnostic_trace_json.map(sqlx::types::Json))
+        .bind(finalization.billing_snapshot_json.map(sqlx::types::Json))
+        .bind(observation)
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(|_| core_unavailable())?;
+        .map_err(|source| {
+            crate::core_store_error(
+                super::sqlite_unavailable("finalize SQLite model request").with_source(source),
+            )
+        })?;
         let Some(current) = current else {
             transaction
                 .rollback()
@@ -604,7 +493,7 @@ impl ExecutionStore for SqliteExecutionStore {
         let result = sqlx::query(
             "update model_requests
              set outcome = 'incomplete', error_kind = 'process_interrupted',
-                 error_message = 'request did not reach a terminal state',
+                 request_observation_json = json_set(request_observation_json, '$.error.message', 'request did not reach a terminal state'),
                  image_generation_succeeded = case
                    when image_generation_requested = 1 then 0 else null
                  end,
@@ -629,18 +518,18 @@ async fn update_attempt(
     let result = sqlx::query(
         "update model_requests
          set provider_kind = ?2, provider_account_id = ?3, provider_account_ref = ?4,
-             provider_account_name_snapshot = (select name from provider_accounts where id = ?3),
-             provider_account_email_snapshot = (select email from provider_accounts where id = ?3),
-             provider_account_authentication_kind_snapshot =
-               (select authentication_kind from provider_accounts where id = ?3),
-             upstream_model_id = ?5, upstream_transport = ?6, http_version = ?7,
-             attempt_count = ?8,
-             account_selection_wait_ms = case
-               when ?9 is null then account_selection_wait_ms
-               else coalesce(account_selection_wait_ms, 0) + ?9
-             end,
-             capacity_used_slots = coalesce(?10, capacity_used_slots),
-             capacity_total_slots = coalesce(?11, capacity_total_slots)
+             upstream_model_id = ?5, upstream_transport = ?6, attempt_count = ?8,
+             request_observation_json = json_set(request_observation_json,
+               '$.account', json_object(
+                 'name', (select name from provider_accounts where id = ?3),
+                 'email', (select email from provider_accounts where id = ?3),
+                 'authenticationKind', (select authentication_kind from provider_accounts where id = ?3)),
+               '$.transport', json_object('httpVersion', ?7),
+               '$.scheduling.accountSelectionWaitMs', case when ?9 is null
+                 then json_extract(request_observation_json, '$.scheduling.accountSelectionWaitMs')
+                 else coalesce(json_extract(request_observation_json, '$.scheduling.accountSelectionWaitMs'), 0) + ?9 end,
+               '$.scheduling.capacityUsedSlots', coalesce(?10, json_extract(request_observation_json, '$.scheduling.capacityUsedSlots')),
+               '$.scheduling.capacityTotalSlots', coalesce(?11, json_extract(request_observation_json, '$.scheduling.capacityTotalSlots')))
          where id = ?1 and outcome = 'running' and downstream_committed_at_us is null
            and ?8 = attempt_count + 1",
     )
@@ -709,10 +598,10 @@ async fn update_continuation_recovery(
            recovery_attempt_count = recovery_attempt_count + 1,
            recovery_request_id = case when ?2 = 1 then ?3 else recovery_request_id end,
            recovered_at_us = case when ?2 = 1 then ?4 else recovered_at_us end,
-           recovery_retry_delay_ms = case when ?2 = 1 then max(0, (?5 - ?6) / 1000)
-                                          else recovery_retry_delay_ms end,
-           recovery_total_latency_ms = case when ?2 = 1 then max(0, (?4 - ?6) / 1000)
-                                            else recovery_total_latency_ms end
+           request_observation_json = case when ?2 = 1 then json_set(request_observation_json,
+               '$.recovery', json_object('retryDelayMs', max(0, (?5 - ?6) / 1000),
+                                        'totalLatencyMs', max(0, (?4 - ?6) / 1000)))
+               else request_observation_json end
          where id = ?1 and recovered_at_us is null",
     )
     .bind(target_id)
@@ -771,8 +660,9 @@ async fn update_session_transport_recovery(
         "update model_requests set
            recovery_attempt_count = recovery_attempt_count + 1,
            recovery_request_id = ?2, recovered_at_us = ?3,
-           recovery_retry_delay_ms = max(0, (?4 - ?5) / 1000),
-           recovery_total_latency_ms = max(0, (?3 - ?5) / 1000)
+           request_observation_json = json_set(request_observation_json, '$.recovery',
+               json_object('retryDelayMs', max(0, (?4 - ?5) / 1000),
+                           'totalLatencyMs', max(0, (?3 - ?5) / 1000)))
          where id = ?1 and recovered_at_us is null",
     )
     .bind(target_id)
@@ -808,36 +698,6 @@ struct OpsEvent {
     message: String,
 }
 
-fn validate_new_request(request: &NewModelRequest) -> Result<(), CoreStoreError> {
-    if request.id.as_str().is_empty()
-        || request.client_api_key_ref.as_str().is_empty()
-        || request.protocol.is_empty()
-        || request.endpoint.is_empty()
-        || request.client_transport.is_empty()
-        || request
-            .deadline_at
-            .at()
-            .is_some_and(|deadline| request.started_at > deadline)
-        || request
-            .client_api_key_id
-            .as_ref()
-            .is_some_and(|id| id != &request.client_api_key_ref)
-    {
-        return Err(core_invalid());
-    }
-    let hashes = [
-        request.continuation.affinity_hash.as_deref(),
-        request.continuation.previous_response_id_hash.as_deref(),
-    ];
-    if hashes.into_iter().flatten().any(|hash| !is_hash(hash))
-        || (!request.continuation.requested
-            && request.continuation.previous_response_id_hash.is_some())
-    {
-        return Err(core_invalid());
-    }
-    Ok(())
-}
-
 fn validate_attempt(attempt: &AttemptRecord) -> Result<(), CoreStoreError> {
     if attempt.upstream_transport.is_empty()
         || attempt
@@ -859,86 +719,6 @@ fn validate_attempt(attempt: &AttemptRecord) -> Result<(), CoreStoreError> {
     Ok(())
 }
 
-fn routing_snapshot(snapshot: &AccountRoutingSnapshot) -> (String, Vec<String>, Vec<String>) {
-    let groups = snapshot.groups_snapshot();
-    (
-        snapshot.kind().as_str().to_owned(),
-        groups
-            .iter()
-            .map(|group| group.id().as_str().to_owned())
-            .collect(),
-        groups.iter().map(|group| group.name().to_owned()).collect(),
-    )
-}
-
-fn validate_finalization_json(
-    finalization: &ModelRequestFinalization,
-) -> Result<(), CoreStoreError> {
-    for value in [
-        finalization.provider_metadata_json.as_deref(),
-        finalization.diagnostic_trace_json.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        parse_json_object(value)?;
-    }
-    if finalization
-        .diagnostic_trace_json
-        .as_ref()
-        .is_some_and(|value| value.len() > 64 * 1024)
-    {
-        return Err(core_invalid());
-    }
-    Ok(())
-}
-
-fn parse_json_object(value: &str) -> Result<Value, CoreStoreError> {
-    let value: Value = serde_json::from_str(value).map_err(|_| core_invalid())?;
-    if !value.is_object() {
-        return Err(core_invalid());
-    }
-    Ok(value)
-}
-
-fn validate_connection_observation(
-    finalization: &ModelRequestFinalization,
-) -> Result<(), CoreStoreError> {
-    let Some(connection) = finalization
-        .failure_observation
-        .upstream_connection
-        .as_ref()
-    else {
-        return Ok(());
-    };
-    let id = connection.connection_id();
-    let exit = connection.exit_reason();
-    if id.is_empty()
-        || id.len() > 128
-        || id.chars().any(char::is_control)
-        || !valid_stable_reason(exit)
-        || connection.idle_ms() > connection.age_ms()
-    {
-        return Err(core_invalid());
-    }
-    Ok(())
-}
-
-fn validate_stable_reason(value: Option<&str>) -> Result<(), CoreStoreError> {
-    if value.is_some_and(|value| !valid_stable_reason(value)) {
-        return Err(core_invalid());
-    }
-    Ok(())
-}
-
-fn valid_stable_reason(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_lowercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'_'))
-        })
-}
-
 fn validate_status_code(value: Option<u16>) -> Result<(), CoreStoreError> {
     if value.is_some_and(|status| !(100..=599).contains(&status)) {
         return Err(core_invalid());
@@ -954,29 +734,11 @@ fn require_update(updated: bool) -> Result<(), CoreStoreError> {
     }
 }
 
-fn outcome_str(value: ExecutionOutcome) -> Result<&'static str, CoreStoreError> {
-    match value {
-        ExecutionOutcome::Running => Err(core_invalid_state()),
-        ExecutionOutcome::Succeeded => Ok("succeeded"),
-        ExecutionOutcome::Failed => Ok("failed"),
-        ExecutionOutcome::Cancelled => Ok("cancelled"),
-        ExecutionOutcome::Incomplete => Ok("incomplete"),
-    }
-}
-
 const fn send_state_str(value: UpstreamSendState) -> &'static str {
     match value {
         UpstreamSendState::NotSent => "not_sent",
         UpstreamSendState::Sent => "sent",
         UpstreamSendState::Ambiguous => "ambiguous",
-    }
-}
-
-const fn cost_source_str(value: CostSource) -> &'static str {
-    match value {
-        CostSource::ProviderReported => "provider_reported",
-        CostSource::Calculated => "calculated",
-        CostSource::Unavailable => "unavailable",
     }
 }
 
@@ -996,13 +758,6 @@ fn to_i64(value: u64) -> Result<i64, CoreStoreError> {
 
 const fn bool_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
-}
-
-fn is_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn row_string(

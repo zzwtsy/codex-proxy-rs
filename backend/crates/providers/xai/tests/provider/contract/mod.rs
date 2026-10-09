@@ -1,6 +1,7 @@
 //! 验证 xAI 原生执行的协议转换、账号选择与交付状态隔离
 
 mod replay_tool_names;
+mod timing;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
@@ -1839,6 +1840,7 @@ impl ProviderLeasePort for DiagnosticLeasePort {
         _: &'a ClientApiKeyId,
         _: &'a ProviderKind,
         account_ids: &'a [gateway_core::account::ProviderAccountId],
+        _pool: gateway_core::provider_ports::ProviderConcurrencyPool,
     ) -> futures::future::BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async move {
             Ok(ProviderSchedulingState::new(

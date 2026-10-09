@@ -81,8 +81,6 @@ pub struct HostConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub system_update: SystemUpdateConfig,
-    #[serde(default = "default_drain_timeout_seconds")]
-    pub drain_timeout_seconds: u64,
     #[serde(default = "default_worker_shutdown_timeout_seconds")]
     pub worker_shutdown_timeout_seconds: u64,
 }
@@ -110,9 +108,6 @@ impl HostConfig {
         if self.listen.port == 0 {
             return Err(ConfigError::InvalidField("host.listen.port"));
         }
-        if self.drain_timeout_seconds == 0 {
-            return Err(ConfigError::InvalidField("host.drain_timeout_seconds"));
-        }
         if self.worker_shutdown_timeout_seconds == 0 {
             return Err(ConfigError::InvalidField(
                 "host.worker_shutdown_timeout_seconds",
@@ -134,11 +129,6 @@ impl HostConfig {
     #[must_use]
     pub fn runtime_data_dir(&self) -> &Path {
         &self.runtime_data_dir
-    }
-
-    #[must_use]
-    pub const fn drain_timeout(&self) -> Duration {
-        Duration::from_secs(self.drain_timeout_seconds)
     }
 
     #[must_use]
@@ -262,10 +252,6 @@ fn resolve_relative_path(base: &Path, path: &mut PathBuf) {
     if path.is_relative() {
         *path = base.join(&*path);
     }
-}
-
-const fn default_drain_timeout_seconds() -> u64 {
-    30
 }
 
 const fn default_worker_shutdown_timeout_seconds() -> u64 {

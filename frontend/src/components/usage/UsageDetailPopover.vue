@@ -5,7 +5,7 @@ import { Info } from '@lucide/vue'
 
 // 表格单元格的“信息点”悬浮明细：统一触发按钮与面板壳。
 defineProps<{
-  title: string
+  title?: string
   triggerLabel: string
   tone?: 'primary' | 'warning'
 }>()
@@ -30,7 +30,7 @@ defineProps<{
     </template>
 
     <div class="grid w-60 gap-2 p-3 text-cp-sm leading-none">
-      <p class="m-0 font-heavy text-cp-text">
+      <p v-if="title" class="m-0 font-heavy text-cp-text">
         {{ title }}
       </p>
       <slot />

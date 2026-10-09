@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { AccountGroup } from '@/api'
+import type { AccountGroupRef } from '@/api'
 import { BaseButton, BaseInput, BaseSelect } from '@codex-proxy/ui'
 
 import { Download, ListTodo, Pencil, Search, Trash2, Upload } from '@lucide/vue'
@@ -14,7 +14,7 @@ const props = defineProps<{
   batchDeleting: boolean
   exportingAccounts: boolean
   exportDisabledReason: string
-  groups: AccountGroup[]
+  groups: AccountGroupRef[]
   groupsLoading: boolean
 }>()
 

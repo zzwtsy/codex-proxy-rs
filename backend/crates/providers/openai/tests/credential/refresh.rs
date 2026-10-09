@@ -124,6 +124,7 @@ impl ProviderLeasePort for RefreshLeases {
         _: &'a ClientApiKeyId,
         _: &'a ProviderKind,
         _: &'a [ProviderAccountId],
+        _pool: gateway_core::provider_ports::ProviderConcurrencyPool,
     ) -> BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async { panic!("scheduled credential refresh does not load scheduling state") })
     }

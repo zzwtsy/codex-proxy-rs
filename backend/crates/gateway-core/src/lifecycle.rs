@@ -126,7 +126,7 @@ pub trait ConnectionGuard: Send + 'static {}
 pub trait ConnectionLifecycle: Send + Sync {
     /// 原子地检查 drain 状态并注册一个活跃连接
     ///
-    /// 当本方法成功时，drain 必须等待返回的 guard 被释放；
+    /// 成功注册不延长关闭流程，活跃连接可随进程退出被中断；
     /// 当 drain 已经线性化生效时，本方法必须返回 [`ConnectionDraining`]
     fn try_register(&self) -> Result<Box<dyn ConnectionGuard>, ConnectionDraining>;
 

@@ -14,6 +14,31 @@ use gateway_core::concurrency::{
 use super::{candidate_with_concurrency, context, weighted_candidate};
 
 #[test]
+fn reserved_pool_scoring_and_trace_use_its_capacity_instead_of_the_normal_limit() {
+    let mut context = context(RotationStrategy::Smart);
+    context.reserved_concurrency = 5;
+    context.policy = context.policy.with_smart_scheduling(
+        SmartSchedulingConfig::new([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], false).unwrap(),
+    );
+    let candidates = [
+        candidate_with_concurrency("acct_large_normal", 2, 100),
+        candidate_with_concurrency("acct_small_normal", 1, 1),
+    ];
+    let selection = AccountSelector.select(&candidates, &context).unwrap();
+    assert_eq!(
+        selection.candidate().account.id().as_str(),
+        "acct_small_normal"
+    );
+    let trace = gateway_core::diagnostics::TraceContext::new("req_reserved_scores");
+    trace.account_selection(&candidates, &context, Some(&selection));
+    let snapshot = trace.snapshot().unwrap();
+    let selected = &snapshot["events"][0]["data"]["candidates"][0];
+    assert_eq!(selected["concurrencyLimit"], 5);
+    assert_eq!(selected["inFlight"], 1);
+    assert_eq!(selected["smartScore"], 0.8);
+}
+
+#[test]
 fn smart_config_rejects_invalid_weights_and_incomplete_wire_values() {
     for value in [-0.1, 10.1, 0.01, f64::NAN, f64::INFINITY] {
         for dimension in 0..6 {

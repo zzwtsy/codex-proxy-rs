@@ -153,7 +153,7 @@ impl ScheduledTask for XaiQuotaCatalogTask {
                 .map_err(|source| {
                     WorkerTaskError::safe("xAI Provider accounts unavailable").with_source(source)
                 })?;
-            let mut failures = 0_u64;
+            let mut failures = QuotaCatalogFailure::default();
             let now = SystemTime::now();
             let accounts = self.reserve_periodic_refreshes(accounts, now);
             for account in accounts {
@@ -162,23 +162,50 @@ impl ScheduledTask for XaiQuotaCatalogTask {
                 }
                 match self.quota.refresh_account(account.id()).await {
                     Ok(_) | Err(GrokQuotaError::AccountUnavailable) => {}
-                    Err(_) => failures = failures.saturating_add(1),
+                    Err(error) => {
+                        failures.quota_failures = failures.quota_failures.saturating_add(1);
+                        failures.first_quota_error.get_or_insert(error);
+                    }
                 }
             }
             match self.catalog.query_models().await {
                 Ok(_) | Err(GrokCredentialCatalogError::NoEligibleCredential) => {}
-                Err(_) => failures = failures.saturating_add(1),
+                Err(error) => failures.catalog_error = Some(error),
             }
-            if failures == 0 {
+            if failures.quota_failures == 0 && failures.catalog_error.is_none() {
                 Ok(())
             } else {
-                Err(WorkerTaskError::safe(
-                    "xAI quota or catalog synchronization failed",
-                ))
+                Err(
+                    WorkerTaskError::safe("xAI quota or catalog synchronization failed")
+                        .with_source(failures),
+                )
             }
         })
     }
 }
+
+// 额度按账号批量执行，只保留首个失败及总数，目录失败独立保留，避免诊断随账号数增长
+#[derive(Debug, Default)]
+struct QuotaCatalogFailure {
+    quota_failures: u64,
+    first_quota_error: Option<GrokQuotaError>,
+    catalog_error: Option<GrokCredentialCatalogError>,
+}
+
+impl std::fmt::Display for QuotaCatalogFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "quota failures={}", self.quota_failures)?;
+        if let Some(error) = &self.first_quota_error {
+            write!(formatter, "; first quota error: {error}")?;
+        }
+        if let Some(error) = &self.catalog_error {
+            write!(formatter, "; catalog error: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for QuotaCatalogFailure {}
 
 impl XaiQuotaCatalogTask {
     fn reserve_periodic_refreshes(

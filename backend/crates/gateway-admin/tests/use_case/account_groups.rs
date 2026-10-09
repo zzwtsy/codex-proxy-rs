@@ -10,12 +10,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use gateway_admin::{
     model::{
-        MutationContext, PageSize, Revision,
+        AdminErrorKind, MutationContext, PageSize, Revision,
         account_groups::{
             AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupColor,
-            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-            AccountGroupRecord, AccountGroupUsage, DeleteAccountGroup, NewAccountGroup,
-            SetAccountGroupEnabled, UpdateAccountGroup,
+            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+            AccountGroupOptionsPage, AccountGroupPage, AccountGroupRecord, AccountGroupRef,
+            AccountGroupUsage, DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled,
+            UpdateAccountGroup,
         },
         accounts::AccountRuntimeSnapshot,
         observability::DecimalAmount,
@@ -90,6 +91,62 @@ async fn group_query_service_enriches_only_current_page_members_with_runtime_fac
     );
 }
 
+#[tokio::test]
+async fn group_options_query_should_skip_member_and_runtime_enrichment() {
+    let groups = Arc::new(FakeGroupStore::default());
+    let runtime = Arc::new(FakeRuntimeStore::default());
+    let service = AdminHarness::new()
+        .account_groups(groups.clone())
+        .account_runtime(runtime.clone())
+        .build()
+        .await;
+
+    let page = service
+        .account_groups()
+        .list_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .expect("list account group options");
+
+    assert_eq!(page.items[0].id.as_str(), GROUP_ID);
+    assert!(
+        groups
+            .requested_groups
+            .lock()
+            .expect("requested groups")
+            .is_empty()
+    );
+    assert!(
+        runtime
+            .requested_accounts
+            .lock()
+            .expect("requested accounts")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn group_options_query_should_preserve_store_failures() {
+    let service = AdminHarness::new().build().await;
+
+    let error = service
+        .account_groups()
+        .list_options(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .expect_err("unavailable options store must fail");
+
+    assert_eq!(error.kind(), AdminErrorKind::Unavailable);
+}
+
 #[derive(Default)]
 struct FakeGroupStore {
     requested_groups: Mutex<Vec<String>>,
@@ -138,6 +195,24 @@ impl AccountGroupStore for FakeGroupStore {
         Ok(AccountGroupPage {
             config_revision: Revision::new(1).expect("revision"),
             items: vec![group_record()],
+            total: 1,
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
+    }
+
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage> {
+        Ok(AccountGroupOptionsPage {
+            config_revision: Revision::new(1).expect("revision"),
+            items: vec![AccountGroupRef {
+                id: group_id(),
+                name: "Primary".to_owned(),
+                color: AccountGroupColor::parse("#2563EBFF").expect("color"),
+                enabled: true,
+            }],
             total: 1,
             page: query.page,
             page_size: query.page_size.get(),
@@ -300,7 +375,7 @@ fn unused() -> AdminStoreError {
 
 #[tokio::test]
 async fn invalid_group_fields_are_rejected_before_store_mutations() {
-    use gateway_admin::model::{AdminErrorKind, MutationActor, account_groups::CreateAccountGroup};
+    use gateway_admin::model::{MutationActor, account_groups::CreateAccountGroup};
     let service = AdminHarness::new()
         .account_groups(Arc::new(FakeGroupStore::default()))
         .build()

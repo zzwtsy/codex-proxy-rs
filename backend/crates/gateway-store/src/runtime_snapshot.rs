@@ -65,6 +65,7 @@ pub struct SnapshotRuntimeSettings {
     pub pricing: gateway_core::metering::PricingOverrides,
     pub request_profiles:
         BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
+    pub codex_privacy_policy: gateway_core::settings::privacy::CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
     pub refresh_margin_seconds: u64,
@@ -138,6 +139,7 @@ pub(crate) fn snapshot_data_into_facts(
     .with_max_account_rotations(data.settings.max_account_rotations)
     .with_openai_session_affinity_ttl_hours(data.settings.openai_session_affinity_ttl_hours)
     .with_smart_scheduling(data.settings.smart_scheduling)
+    .with_codex_privacy_policy(data.settings.codex_privacy_policy)
     .with_request_profiles(data.settings.request_profiles)
     .with_pricing(data.settings.pricing)
     .with_request_location(

@@ -12,7 +12,7 @@ use gateway_core::account::{AccountRuntimeSignals, ProviderAccountId};
 use gateway_core::lifecycle::REQUEST_LEASE_TTL;
 use gateway_core::policy::ClientApiKeyId;
 use gateway_core::provider_ports::{
-    ProviderLeaseAcquisition, ProviderLeasePort, ProviderLeaseRequest,
+    ProviderConcurrencyPool, ProviderLeaseAcquisition, ProviderLeasePort, ProviderLeaseRequest,
     ProviderRefreshCapacityRequest, ProviderSchedulingLeaseRequest, ProviderSchedulingState,
     ProviderStoreError, ProviderStoreErrorKind,
 };
@@ -128,6 +128,7 @@ return tostring(cursor - 1)
 pub enum CredentialLeaseScope {
     Provider,
     ProviderAccount,
+    ProviderAccountReserved,
     OAuthRefreshCapacity,
     OAuthRefresh,
     ProviderTask,
@@ -138,9 +139,17 @@ impl CredentialLeaseScope {
         match self {
             Self::Provider => "provider",
             Self::ProviderAccount => "account",
+            Self::ProviderAccountReserved => "account-reserved",
             Self::OAuthRefreshCapacity => "refresh-capacity",
             Self::OAuthRefresh => "refresh",
             Self::ProviderTask => "task",
+        }
+    }
+
+    const fn scheduling(pool: ProviderConcurrencyPool) -> Self {
+        match pool {
+            ProviderConcurrencyPool::Shared => Self::ProviderAccount,
+            ProviderConcurrencyPool::Reserved => Self::ProviderAccountReserved,
         }
     }
 }
@@ -334,6 +343,7 @@ pub trait CredentialLeaseRepository: Send + Sync {
         request: &CredentialLeaseRequest,
         grant: &CredentialLeaseGrant,
     ) -> StoreResult<bool>;
+    /// 管理端容量与自适应并发观测只统计普通池，不把审批占用投影为普通并发压力
     async fn credential_runtime_signals(
         &self,
         resource_ids: &[String],
@@ -395,10 +405,16 @@ impl RedisCredentialLeaseRepository {
         let fingerprint = resource_fingerprint("credential lease", &request.resource_id)?;
         let tag = format!("{{{fingerprint}}}");
         let prefix = format!("{}:lease:{}:{tag}", self.namespace, request.scope.as_str());
+        // 两个容量池独立计数，但账号最小请求间隔仍由同一时间戳原子裁决
+        let interval_prefix = if request.scope == CredentialLeaseScope::ProviderAccountReserved {
+            format!("{}:lease:account:{tag}", self.namespace)
+        } else {
+            prefix.clone()
+        };
         Ok([
             format!("{prefix}:active"),
             format!("{prefix}:fence"),
-            format!("{prefix}:last-started"),
+            format!("{interval_prefix}:last-started"),
         ])
     }
 
@@ -472,9 +488,29 @@ impl RedisCredentialLeaseRepository {
         })
     }
 
-    async fn load_signal(&self, resource_id: String) -> StoreResult<CredentialRuntimeSignal> {
+    async fn runtime_signals(
+        &self,
+        resource_ids: &[String],
+        pool: ProviderConcurrencyPool,
+    ) -> StoreResult<Vec<CredentialRuntimeSignal>> {
+        for resource_id in resource_ids {
+            require_nonempty("credential runtime signal", "resource_id", resource_id)?;
+        }
+        let mut signals = Vec::with_capacity(resource_ids.len());
+        for ids in resource_ids.chunks(super::ACCOUNT_STATE_READ_CONCURRENCY) {
+            let batch = join_all(ids.iter().cloned().map(|id| self.load_signal(id, pool))).await;
+            signals.extend(batch.into_iter().collect::<StoreResult<Vec<_>>>()?);
+        }
+        Ok(signals)
+    }
+
+    async fn load_signal(
+        &self,
+        resource_id: String,
+        pool: ProviderConcurrencyPool,
+    ) -> StoreResult<CredentialRuntimeSignal> {
         let request = CredentialLeaseRequest {
-            scope: CredentialLeaseScope::ProviderAccount,
+            scope: CredentialLeaseScope::scheduling(pool),
             resource_id: resource_id.clone(),
             owner_id: "signal-reader".to_owned(),
             ttl: Duration::from_secs(1),
@@ -539,6 +575,7 @@ impl RedisProviderLeaseCoordinator {
     async fn load_signals(
         &self,
         accounts: &[ProviderAccountId],
+        pool: ProviderConcurrencyPool,
     ) -> Result<BTreeMap<ProviderAccountId, AccountRuntimeSignals>, ProviderStoreError> {
         let ids = accounts
             .iter()
@@ -546,7 +583,7 @@ impl RedisProviderLeaseCoordinator {
             .collect::<Vec<_>>();
         let signals = self
             .repository
-            .credential_runtime_signals(&ids)
+            .runtime_signals(&ids, pool)
             .await
             .map_err(|source| crate::provider_unavailable("load scheduling signals", source))?;
         signals
@@ -588,7 +625,7 @@ impl RedisProviderLeaseCoordinator {
         let acquisition = self
             .repository
             .try_acquire_bounded_lease(&CredentialBoundedLeaseRequest {
-                scope: CredentialLeaseScope::ProviderAccount,
+                scope: CredentialLeaseScope::scheduling(request.concurrency_pool()),
                 resource_id: request.account_id().as_str().to_owned(),
                 owner_id: self.owner_id("request"),
                 max_concurrent: request.max_concurrent().get(),
@@ -646,9 +683,10 @@ impl ProviderLeasePort for RedisProviderLeaseCoordinator {
         client_api_key_id: &'a ClientApiKeyId,
         provider_kind: &'a ProviderKind,
         accounts: &'a [ProviderAccountId],
+        pool: ProviderConcurrencyPool,
     ) -> futures::future::BoxFuture<'a, Result<ProviderSchedulingState, ProviderStoreError>> {
         Box::pin(async move {
-            let signals = self.load_signals(accounts).await?;
+            let signals = self.load_signals(accounts, pool).await?;
             let round_robin_cursor = self
                 .next_scheduling_cursor(client_api_key_id, provider_kind)
                 .await?;
@@ -782,15 +820,8 @@ impl CredentialLeaseRepository for RedisCredentialLeaseRepository {
         &self,
         resource_ids: &[String],
     ) -> StoreResult<Vec<CredentialRuntimeSignal>> {
-        for resource_id in resource_ids {
-            require_nonempty("credential runtime signal", "resource_id", resource_id)?;
-        }
-        let mut signals = Vec::with_capacity(resource_ids.len());
-        for ids in resource_ids.chunks(super::ACCOUNT_STATE_READ_CONCURRENCY) {
-            let batch = join_all(ids.iter().cloned().map(|id| self.load_signal(id))).await;
-            signals.extend(batch.into_iter().collect::<StoreResult<Vec<_>>>()?);
-        }
-        Ok(signals)
+        self.runtime_signals(resource_ids, ProviderConcurrencyPool::Shared)
+            .await
     }
 
     async fn try_acquire_bounded_lease(

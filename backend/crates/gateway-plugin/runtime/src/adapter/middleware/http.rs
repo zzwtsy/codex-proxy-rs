@@ -12,7 +12,7 @@ use gateway_plugin_sdk::{
 use http_body::Frame;
 use http_body_util::{BodyExt as _, StreamBody};
 
-use super::super::MiddlewareEntry;
+use super::MiddlewareEntry;
 use crate::callback::http_middleware::{Invocation, headers};
 
 pub(super) async fn invoke(
@@ -33,12 +33,7 @@ pub(super) async fn invoke(
         .extensions()
         .get::<core::Settings>()
         .and_then(|settings| settings.runtime.as_ref())
-        .map(|settings| {
-            crate::compatibility::FastSettings::middleware(&ports.session).sources(settings)
-        })
-        .transpose()
-        .map_err(|_| MiddlewareError::InvalidState)?
-        .unwrap_or(serde_json::Value::Null);
+        .map_or(serde_json::Value::Null, |settings| settings.inspect());
     let (invocation, request) = Invocation::new(request, next, entry.instance_id.clone())?;
     let mut call = ports.session.context(Stage::Http, timeout);
     call.request_id = Some(context.request_id.clone());

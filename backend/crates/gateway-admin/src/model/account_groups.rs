@@ -126,6 +126,16 @@ pub struct AccountGroupPage {
     pub page_size: u16,
 }
 
+/// 分组选择器使用的轻量分页结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountGroupOptionsPage {
+    pub config_revision: Revision,
+    pub items: Vec<AccountGroupRef>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u16,
+}
+
 /// 创建账号分组
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateAccountGroup {

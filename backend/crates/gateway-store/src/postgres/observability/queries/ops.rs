@@ -32,7 +32,7 @@ const REQUEST_ERROR_SELECT: &str = "select 'model_request'::text as source,
        mr.recovery_retry_delay_ms, mr.recovery_total_latency_ms,
        mr.completed_at as occurred_at,
        'model_request:' || mr.id as stable_sort_id
-from model_requests mr
+from model_request_observations mr
 left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
 left join provider_accounts account on account.id = mr.provider_account_ref
 where true";
@@ -67,7 +67,7 @@ const OPS_EVENT_SELECT: &str = "select 'ops_event'::text as source,
        oe.created_at as occurred_at,
        'ops_event:' || oe.id as stable_sort_id
 from ops_events oe
-left join model_requests mr on mr.id = oe.model_request_id
+left join model_request_observations mr on mr.id = oe.model_request_id
 left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
 left join provider_accounts account on account.id = oe.provider_account_ref
 where true";
@@ -112,11 +112,11 @@ pub(crate) async fn count_ops_errors(
     filter: &OpsErrorFilter,
 ) -> StoreResult<u64> {
     let mut statement = QueryBuilder::<Postgres>::new(
-        "select coalesce(sum(source_count), 0)::bigint from (select count(*)::bigint as source_count from model_requests mr where true",
+        "select coalesce(sum(source_count), 0)::bigint from (select count(*)::bigint as source_count from model_request_observations mr where true",
     );
     push_request_error_predicates(&mut statement, range, filter);
     statement.push(
-        " union all select count(*)::bigint as source_count from ops_events oe left join model_requests mr on mr.id = oe.model_request_id where true",
+        " union all select count(*)::bigint as source_count from ops_events oe left join model_request_observations mr on mr.id = oe.model_request_id where true",
     );
     push_ops_event_predicates(&mut statement, range, filter);
     statement.push(") counts");

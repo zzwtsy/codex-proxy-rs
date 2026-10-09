@@ -10,9 +10,10 @@ use gateway_admin::{
         MutationContext,
         account_groups::{
             AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupColor,
-            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-            AccountGroupRecord, AccountGroupUsage, DeleteAccountGroup, NewAccountGroup,
-            SetAccountGroupEnabled, UpdateAccountGroup,
+            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+            AccountGroupOptionsPage, AccountGroupPage, AccountGroupRecord, AccountGroupRef,
+            AccountGroupUsage, DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled,
+            UpdateAccountGroup,
         },
         observability::DecimalAmount,
     },
@@ -160,6 +161,44 @@ impl AccountGroupStore for PgAccountGroupRepository {
             }
         }
         Ok(AccountGroupPage {
+            config_revision: self.current_revision().await?,
+            items,
+            total,
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
+    }
+
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage> {
+        validate_page_query(&query)?;
+        let total = count_groups(&self.pool, &query)
+            .await
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        let offset = u64::from(query.page.saturating_sub(1)) * u64::from(query.page_size.get());
+        let mut statement = QueryBuilder::<Postgres>::new(
+            "select g.id, g.name, g.color, g.enabled from account_groups g where true",
+        );
+        push_group_filter(&mut statement, &query);
+        statement.push(" order by g.created_at desc, g.id desc limit ");
+        statement.push_bind(i64::from(query.page_size.get()));
+        statement.push(" offset ");
+        statement.push_bind(i64::try_from(offset).map_err(|_| invalid_admin("page is too large"))?);
+        let rows = statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| {
+                admin_store_error(ENTITY, unavailable("list account group options", source))
+            })?;
+        let items = rows
+            .iter()
+            .map(group_ref)
+            .collect::<StoreResult<Vec<_>>>()
+            .map_err(|error| admin_store_error(ENTITY, error))?;
+        Ok(AccountGroupOptionsPage {
             config_revision: self.current_revision().await?,
             items,
             total,
@@ -535,6 +574,28 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
         updated_at: row
             .try_get("updated_at")
             .map_err(|source| invalid("invalid updated_at").with_source(source))?,
+    })
+}
+
+fn group_ref(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRef> {
+    Ok(AccountGroupRef {
+        id: AccountGroupId::new(
+            row.try_get::<String, _>("id")
+                .map_err(|source| invalid("invalid id").with_source(source))?,
+        )
+        .map_err(|source| invalid("invalid id").with_source(source))?,
+        name: row
+            .try_get("name")
+            .map_err(|source| invalid("invalid name").with_source(source))?,
+        color: AccountGroupColor::parse(
+            row.try_get::<String, _>("color")
+                .map_err(|source| invalid("invalid color").with_source(source))?
+                .as_str(),
+        )
+        .ok_or_else(|| invalid("invalid color"))?,
+        enabled: row
+            .try_get("enabled")
+            .map_err(|source| invalid("invalid enabled").with_source(source))?,
     })
 }
 

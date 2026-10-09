@@ -51,7 +51,6 @@ fn logging_requires_at_least_one_sink() {
             request_dump_retention_days: 1,
         },
         system_update: SystemUpdateConfig::default(),
-        drain_timeout_seconds: 30,
         worker_shutdown_timeout_seconds: 30,
     };
 
@@ -329,7 +328,6 @@ fn logging_config(directory: PathBuf, request_dump: bool) -> HostConfig {
             request_dump_retention_days: 1,
         },
         system_update: SystemUpdateConfig::default(),
-        drain_timeout_seconds: 30,
         worker_shutdown_timeout_seconds: 30,
     }
 }

@@ -230,7 +230,7 @@ export function useRequestTrendChart(options: {
         return formatLatency(point?.firstTokenP95Ms, value)
       if (name === '总耗时 P95')
         return formatLatency(point?.latencyP95Ms, value)
-      if (name === '吞吐 P50')
+      if (name === '速率 P50')
         return point?.outputThroughputP50 == null ? value : `${point.outputThroughputP50} tok/s`
     }
     if (name === '错误数')
@@ -291,9 +291,9 @@ export function useRequestTrendChart(options: {
           { area: true, smooth: 0.24, width: 2.5, z: 4 },
         ),
         ...gapLineSeries(
-          '吞吐 P50',
+          '速率 P50',
           activeSeriesValues('outputThroughputP50'),
-          trendColor('吞吐', '--cp-color-green-solid', '#12B981'),
+          trendColor('速率', '--cp-color-green-solid', '#12B981'),
           { smooth: 0.2, width: 2, yAxisIndex: 1, z: 3 },
         ),
       ]

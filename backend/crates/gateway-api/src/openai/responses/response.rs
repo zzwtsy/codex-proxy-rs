@@ -47,7 +47,7 @@ impl OpenAiResponsesEncoder {
             return Vec::new();
         };
         self.observe_wire(wire);
-        let projected = client_failure_payload(wire);
+        let projected = client_payload(wire);
         let data = projected.as_ref().unwrap_or_else(|| wire.data());
         // 当前 Codex 不消费 Responses `error` event，会在 EOF 时丢失失败原因
         // 在客户端 SSE 边界统一投影成它能识别的 `response.failed`
@@ -70,22 +70,29 @@ impl OpenAiResponsesEncoder {
         {
             return vec![raw_sse_frame.clone()];
         }
+        let data = if projected.is_none() {
+            wire.raw_websocket_message()
+                .map(str::to_owned)
+                .unwrap_or_else(|| data.to_string())
+        } else {
+            data.to_string()
+        };
         vec![Bytes::from(encode_sse_event_with_metadata(
             effective_event_type(wire).unwrap_or_default(),
-            &data.to_string(),
+            &data,
             wire.sse_id(),
             wire.sse_retry(),
         ))]
     }
 
-    /// 消费一个 Provider event，并返回 WebSocket JSON messages
+    /// 消费一个 Provider event，并返回完整 WebSocket 文本消息
     pub fn push_websocket(&mut self, event: &ProviderEvent) -> Vec<String> {
         self.observe_canonical_identity(event);
-        let Some(wire) = openai_wire(event).filter(|wire| wire.has_json_data()) else {
+        let Some(wire) = openai_wire(event) else {
             return Vec::new();
         };
         self.observe_wire(wire);
-        let projected = client_failure_payload(wire);
+        let projected = client_payload(wire);
         let data = projected.as_ref().unwrap_or_else(|| wire.data());
         // WS 客户端只对它无法消费的裸 `error` 帧做投影：codex 的 WS 端点
         // 会静默忽略缺少 status 且不含内置可重试错误码的 `error` 帧，客户
@@ -103,6 +110,14 @@ impl OpenAiResponsesEncoder {
             )
         {
             return vec![data.to_string()];
+        }
+        if projected.is_none()
+            && let Some(raw) = wire.raw_websocket_message()
+        {
+            return vec![raw.to_owned()];
+        }
+        if !wire.has_json_data() {
+            return Vec::new();
         }
         vec![data.to_string()]
     }
@@ -248,15 +263,43 @@ fn effective_event_type(wire: &ProtocolWireEvent) -> Option<&str> {
         .or_else(|| wire.data().get("type").and_then(Value::as_str))
 }
 
-fn client_failure_payload(wire: &ProtocolWireEvent) -> Option<Value> {
+fn client_payload(wire: &ProtocolWireEvent) -> Option<Value> {
     if matches!(
         effective_event_type(wire),
         Some("error" | "response.failed")
     ) {
-        capacity_error_for_client(wire.data())
-    } else {
-        None
+        return capacity_error_for_client(wire.data());
     }
+    if !matches!(
+        effective_event_type(wire),
+        Some("response.metadata" | "codex.response.metadata")
+    ) {
+        return None;
+    }
+    let headers = wire.data().get("headers")?.as_object()?;
+    let connection_options: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| match value {
+            Value::Array(values) => values.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            _ => value.as_str().into_iter().collect(),
+        })
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    if headers
+        .keys()
+        .all(|name| super::response_header_is_forwardable(name, &connection_options))
+    {
+        return None;
+    }
+    // 只剥离既有响应头隔离策略禁止的字段，metadata 业务扩展保持不透明
+    let mut projected = wire.data().clone();
+    projected
+        .get_mut("headers")?
+        .as_object_mut()?
+        .retain(|name, _| super::response_header_is_forwardable(name, &connection_options));
+    Some(projected)
 }
 
 /// 判断 WS 上游的 `error` 帧是否已经是客户端可直接消费的形状

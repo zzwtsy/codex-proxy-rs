@@ -286,7 +286,7 @@ async fn model_request_persists_group_routing_snapshot_without_live_group_foreig
 
     let stored: (String, Vec<String>, serde_json::Value) = sqlx::query_as(
         "select routing_scope, routing_group_refs, routing_group_names_snapshot
-         from model_requests where id = 'req_group_history'",
+         from model_request_observations where id = 'req_group_history'",
     )
     .fetch_one(&database.pool)
     .await
@@ -423,7 +423,7 @@ async fn core_adapter_should_persist_calculated_cost_exactly() {
     ) = sqlx::query_as(
         "select cost_source, cost_amount::text, cost_currency, upstream_transport, http_version,
                 websocket_pool, service_tier
-         from model_requests where id = 'req_calculated_cost'",
+         from model_request_observations where id = 'req_calculated_cost'",
     )
     .fetch_one(&database.pool)
     .await
@@ -600,7 +600,7 @@ async fn core_adapter_should_persist_image_result_and_new_websocket_pool() {
     let persisted: (bool, Option<i64>, Option<i64>, Option<bool>, Option<String>) = sqlx::query_as(
         "select image_generation_requested, image_input_tokens, image_output_tokens,
                     image_generation_succeeded, websocket_pool
-             from model_requests where id = 'req_image_usage'",
+             from model_request_observations where id = 'req_image_usage'",
     )
     .fetch_one(&database.pool)
     .await
@@ -958,7 +958,7 @@ async fn core_adapter_persists_continuation_connection_failure_observation() {
         "select error_kind, continuation_unavailable_reason,
                 upstream_connection_id, upstream_connection_exit_reason,
                 upstream_connection_age_ms, upstream_connection_idle_ms
-           from model_requests where id = 'req_continuation_observation'",
+           from model_request_observations where id = 'req_continuation_observation'",
     )
     .fetch_one(&database.pool)
     .await
@@ -1016,7 +1016,7 @@ async fn successful_new_chain_should_mark_recent_continuation_failure_recovered(
     let recovered: PersistedRecoveryObservation = sqlx::query_as(
         "select recovery_request_id, recovered_at, recovery_attempt_count,
                 recovery_retry_delay_ms, recovery_total_latency_ms
-           from model_requests where id = 'req_continuation_failed'",
+           from model_request_observations where id = 'req_continuation_failed'",
     )
     .fetch_one(&database.pool)
     .await
@@ -1096,7 +1096,7 @@ async fn successful_http_downgrade_should_mark_pending_websocket_failures_recove
     let recovered: Vec<PersistedRecovery> = sqlx::query_as(
         "select id, recovery_request_id, recovered_at, recovery_attempt_count,
                 recovery_retry_delay_ms, recovery_total_latency_ms
-           from model_requests
+           from model_request_observations
           where id like 'req_websocket_failed_%'
           order by id",
     )
@@ -1293,14 +1293,19 @@ async fn seed_continuation_failure(
         .expect("seed continuation failure request");
     sqlx::query(
         "update model_requests
-            set client_api_key_ref = 'key_continuation', client_transport = 'websocket',
-                continuation_affinity_hash = $2,
-                continuation_previous_response_id_hash = $3,
-                continuation_requested = true,
-                outcome = 'failed', error_kind = 'continuation_recovery_required',
-                continuation_unavailable_reason = 'reused_connection_lost',
-                started_at = $4 - interval '1 second', deadline_at = $4,
-                completed_at = $4
+            set client_api_key_ref = 'key_continuation',
+           client_transport = 'websocket',
+           continuation_affinity_hash = $2,
+           continuation_requested = true,
+           outcome = 'failed',
+           error_kind = 'continuation_recovery_required',
+           started_at = $4 - interval '1 second',
+           deadline_at = $4,
+           completed_at = $4,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'continuation', coalesce(request_observation_json #> '{continuation}', '{}'::jsonb) || jsonb_build_object(
+             'previousResponseIdHash', $3::text,
+             'unavailableReason', 'reused_connection_lost')))
           where id = $1",
     )
     .bind(id)
@@ -1348,14 +1353,19 @@ async fn seed_websocket_transport_failure(
     sqlx::query(
         "update model_requests
             set client_api_key_ref = 'key_transport_recovery',
-                client_transport = 'http_sse',
-                continuation_affinity_hash = $2,
-                attempt_count = 1, upstream_send_state = 'ambiguous',
-                upstream_transport = 'websocket', outcome = 'failed',
-                error_kind = 'upstream_unavailable',
-                provider_error_code = 'websocket_close_1000',
-                started_at = $3 - interval '1 second', deadline_at = $3,
-                completed_at = $3
+           client_transport = 'http_sse',
+           continuation_affinity_hash = $2,
+           attempt_count = 1,
+           upstream_send_state = 'ambiguous',
+           upstream_transport = 'websocket',
+           outcome = 'failed',
+           error_kind = 'upstream_unavailable',
+           started_at = $3 - interval '1 second',
+           deadline_at = $3,
+           completed_at = $3,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'error', coalesce(request_observation_json #> '{error}', '{}'::jsonb) || jsonb_build_object(
+             'providerErrorCode', 'websocket_close_1000')))
           where id = $1",
     )
     .bind(id)
@@ -1394,13 +1404,20 @@ async fn seed_transport_recovery_request(
 async fn seed_running_request(pool: &sqlx::PgPool, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, provider_kind, provider_account_ref, cost_source,
-           started_at, deadline_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
-         ) values ($1, 'key_status', 1, 'openai_responses', 'generate', '/v1/responses',
-           'http_json', 'status-model', 'openai', 'acct_status', 'unavailable', now(), now() + interval '1 minute',
-           'all', '{}'::text[], '[]'::jsonb)",
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_ref, cost_source, started_at, deadline_at, request_observation_json
+         ) values (
+           $1, 'key_status', 'generate', 'http_json', 'status-model', 'openai', 'acct_status', 'unavailable', now(), now() + interval '1 minute',
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai_responses',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
+         )",
     )
     .bind(id)
     .execute(pool)
@@ -1440,7 +1457,7 @@ async fn diagnostic_trace_is_finalized_atomically_and_available_for_failed_reque
         .await
         .unwrap();
     let persisted: (String, serde_json::Value, String) = sqlx::query_as(
-        "select outcome, diagnostic_trace_json, error_message from model_requests where id = 'req_diagnostic_failed'"
+        "select outcome, diagnostic_trace_json, error_message from model_request_observations where id = 'req_diagnostic_failed'"
     ).fetch_one(&database.pool).await.unwrap();
     assert_eq!(
         persisted,
@@ -1547,7 +1564,7 @@ pub(super) fn early_failure(request: &CoreNewModelRequest) -> CoreModelRequestFi
 }
 
 async fn stored_row(pool: &PgPool, request_id: &str) -> Value {
-    sqlx::query_scalar("select to_jsonb(mr) from model_requests mr where id = $1")
+    sqlx::query_scalar("select to_jsonb(mr) from model_request_observations mr where id = $1")
         .bind(request_id)
         .fetch_one(pool)
         .await
@@ -2123,6 +2140,13 @@ async fn shared_core_usage_and_timings_preserve_fields_and_reject_invalid_phases
         first_text_ms: Some(6),
         first_token_ms: Some(7),
         provider_processing_ms: Some(8),
+        upstream_response_ms: Some(1_000),
+        upstream_api_overhead_ms: Some(120.25),
+        upstream_engine_ms: Some(6400.0),
+        upstream_engine_iapi_ttft_ms: Some(650.5),
+        upstream_engine_service_ttft_ms: Some(720.25),
+        upstream_engine_iapi_tbt_ms: Some(18.45),
+        upstream_engine_service_tbt_ms: Some(20.12),
         latency_ms: Some(9),
     };
     ExecutionStore::finalize_model_request(&store, finalization)
@@ -2146,10 +2170,29 @@ async fn shared_core_usage_and_timings_preserve_fields_and_reject_invalid_phases
         ("first_text_ms", 6),
         ("first_token_ms", 7),
         ("provider_processing_ms", 8),
+        ("upstream_response_ms", 1_000),
         ("latency_ms", 9),
     ] {
         assert_eq!(persisted[field], json!(expected), "{field}");
     }
+    assert_eq!(persisted["upstream_api_overhead_ms"].as_f64(), Some(120.25));
+    assert_eq!(persisted["upstream_engine_ms"].as_f64(), Some(6400.0));
+    assert_eq!(
+        persisted["upstream_engine_iapi_ttft_ms"].as_f64(),
+        Some(650.5)
+    );
+    assert_eq!(
+        persisted["upstream_engine_service_ttft_ms"].as_f64(),
+        Some(720.25)
+    );
+    assert_eq!(
+        persisted["upstream_engine_iapi_tbt_ms"].as_f64(),
+        Some(18.45)
+    );
+    assert_eq!(
+        persisted["upstream_engine_service_tbt_ms"].as_f64(),
+        Some(20.12)
+    );
     let invalid_id = "req_invalid_phase";
     seed_running_request(&database.pool, invalid_id)
         .await
@@ -2163,5 +2206,100 @@ async fn shared_core_usage_and_timings_preserve_fields_and_reject_invalid_phases
         .unwrap_err();
     assert_eq!(error.kind(), StoreErrorKind::InvalidData);
     assert_eq!(stored_row(&database.pool, invalid_id).await, before);
+    for invalid_ms in [-1.0, f64::NAN, f64::INFINITY, i64::MAX as f64] {
+        let mut invalid = successful_core_finalization(invalid_id);
+        invalid.timings.upstream_engine_iapi_tbt_ms = Some(invalid_ms);
+        let error = ExecutionStore::finalize_model_request(&store, invalid)
+            .await
+            .expect_err("invalid official timing must not silently become missing");
+        assert_eq!(error.kind(), StoreErrorKind::InvalidData);
+        assert_eq!(stored_row(&database.pool, invalid_id).await, before);
+    }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn concurrent_retry_updates_keep_request_context_and_clear_previous_transport() {
+    let Some(database) = TestDatabase::create("observation_retry_cas").await else {
+        return;
+    };
+    let store = PgExecutionStore::new(database.pool.clone());
+    let request = accepted_request("req_observation_retry");
+    store.create_model_request(request.clone()).await.unwrap();
+    let before = stored_row(&database.pool, request.id.as_str()).await;
+    let mut attempt = ModelRequestAttemptStart {
+        model_request_id: request.id.as_str().to_owned(),
+        attempt_count: 1,
+        provider_kind: "openai".to_owned(),
+        provider_account_id: None,
+        provider_account_ref: Some("deleted_account".to_owned()),
+        upstream_model_id: Some("model".to_owned()),
+        upstream_transport: "http_sse".to_owned(),
+        http_version: Some("HTTP/1.1".to_owned()),
+        account_selection_wait_ms: Some(5),
+        capacity_used_slots: Some(1),
+        capacity_total_slots: Some(10),
+    };
+    store
+        .begin_model_request_attempt(attempt.clone())
+        .await
+        .unwrap();
+    sqlx::query("update model_requests set request_observation_json = request_observation_json || $1::jsonb where id = $2")
+        .bind(sqlx::types::Json(
+            json!({"transport": {"httpVersion":"HTTP/1.1", "connection": {
+                "id":"previous", "exitReason":"peer_closed", "ageMs":10, "idleMs":0
+            }}}),
+        ))
+        .bind(request.id.as_str())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    attempt.attempt_count = 2;
+    attempt.http_version = Some("HTTP/2".to_owned());
+    attempt.account_selection_wait_ms = Some(7);
+    attempt.capacity_used_slots = Some(2);
+    let (first, second) = tokio::join!(
+        store.begin_model_request_attempt(attempt.clone()),
+        store.begin_model_request_attempt(attempt),
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let retried = stored_row(&database.pool, request.id.as_str()).await;
+    let observation = &retried["request_observation_json"];
+    assert_eq!(
+        observation["request"],
+        before["request_observation_json"]["request"]
+    );
+    assert_eq!(
+        observation["routing"],
+        before["request_observation_json"]["routing"]
+    );
+    assert_eq!(observation["scheduling"]["admissionDecisionMs"], 2);
+    assert_eq!(observation["scheduling"]["accountSelectionWaitMs"], 12);
+    assert_eq!(observation["scheduling"]["capacityUsedSlots"], 2);
+    assert_eq!(observation["transport"], json!({"httpVersion":"HTTP/2"}));
+    let mut finalization = successful_core_finalization(request.id.as_str());
+    finalization.attempt_count = 2;
+    finalization.http_version = None;
+    finalization.timings.upstream_response_ms = Some(1_000);
+    ExecutionStore::finalize_model_request(&store, finalization)
+        .await
+        .unwrap();
+    let terminal = stored_row(&database.pool, request.id.as_str()).await;
+    assert_eq!(
+        terminal["request_observation_json"]["scheduling"],
+        observation["scheduling"]
+    );
+    assert_eq!(
+        terminal["request_observation_json"]["request"],
+        observation["request"]
+    );
+    assert_eq!(
+        terminal["request_observation_json"]["transport"]["httpVersion"],
+        "HTTP/2"
+    );
+    assert_eq!(
+        terminal["request_observation_json"]["timings"]["upstream"]["responseMs"],
+        1_000
+    );
     database.close().await;
 }

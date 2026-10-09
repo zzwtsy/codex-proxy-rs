@@ -14,7 +14,7 @@ pub enum EventKind {
 }
 
 /// 元数据在 RPC 参数中传递；WebSocket 原始帧独立放在二进制载荷中
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "event",
     content = "data",
@@ -83,8 +83,8 @@ pub struct RequestCost {
     pub total: Option<RequestMoney>,
 }
 
-/// 用量观察取得的毫秒级阶段耗时；缺失字段表示宿主没有该项事实
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// 用量观察取得的请求与上游响应耗时，毫秒单位不代表来源精度
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +103,20 @@ pub struct RequestTimings {
     pub first_token_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_processing_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_response_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_api_overhead_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_engine_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_engine_iapi_ttft_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_engine_service_ttft_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_engine_iapi_tbt_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_engine_service_tbt_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
 }
@@ -138,7 +152,7 @@ pub struct RequestTerminal {
 }
 
 /// 用量观察取得的最终标准化用量；缺失字段表示宿主没有该项事实
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,7 +180,7 @@ pub struct RequestUsage {
 }
 
 /// 一次完成事件包含宿主已确认的全部终态、用量、费用与耗时
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestCompleted {
     /// 不重投时仍保持稳定，供插件自行去重和关联日志

@@ -67,8 +67,8 @@ fn usage_outcome_filter_should_accept_bounded_unknown_values() {
 }
 
 #[tokio::test]
-async fn output_throughput_uses_full_duration_independently_of_first_token() {
-    let Some(database) = TestDatabase::create("output_throughput_full_duration").await else {
+async fn output_throughput_uses_official_response_duration_without_local_fallback() {
+    let Some(database) = TestDatabase::create("output_throughput_official_duration").await else {
         return;
     };
     let now = Utc::now();
@@ -79,29 +79,73 @@ async fn output_throughput_uses_full_duration_independently_of_first_token() {
     let store = admin_observability_store(&database.pool);
     let admin_range = admin_observability::TimeRange::new(range.start, range.end).unwrap();
 
-    // 输出包含首字前的推理量；首字缺失或仅剩 1 ms 都不应改变整次请求速率
-    for (first_token, latency, output, expected) in [
-        (Some(17_799_i64), Some(19_216_i64), Some(605_i64), Some(31)),
-        (None, Some(19_216), Some(605), Some(31)),
-        (Some(19_215), Some(19_216), Some(605), Some(31)),
-        (Some(19_216), Some(19_216), Some(605), Some(31)),
-        (None, Some(0), Some(605), None),
-        (None, None, Some(605), None),
-        (None, Some(19_216), Some(0), None),
-        (None, Some(19_216), None, None),
+    // 官方输出已包含推理量；本地总耗时和首字不能改变速率，也不能补齐上游耗时
+    for (first_token, latency, upstream, output, expected) in [
+        (
+            Some(14_238_i64),
+            Some(15_604_i64),
+            Some(7_000_i64),
+            Some(112_i64),
+            Some(16),
+        ),
+        (None, Some(15_604), Some(7_000), Some(112), Some(16)),
+        (Some(15_603), Some(15_604), Some(7_000), Some(112), Some(16)),
+        (None, None, Some(7_000), Some(112), Some(16)),
+        (None, Some(0), Some(7_000), Some(112), Some(16)),
+        (Some(10_196), Some(11_186), Some(3_000), Some(46), Some(15)),
+        (None, Some(15_604), None, Some(112), None),
+        (None, Some(15_604), Some(7_000), Some(0), None),
+        (None, Some(15_604), Some(7_000), None, None),
     ] {
         sqlx::query(
             "update model_requests
-             set output_tokens = $1, reasoning_tokens = 500,
-                 first_token_ms = $2, latency_ms = $3
+             set output_tokens = $1,
+           reasoning_tokens = case when $1 > 0 then 20 else null end,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'timings', coalesce(request_observation_json #> '{timings}', '{}'::jsonb) || jsonb_build_object(
+             'local', coalesce(request_observation_json #> '{timings,local}', '{}'::jsonb) || jsonb_build_object(
+               'firstTokenMs', $2::bigint,
+               'latencyMs', $3::bigint),
+             'upstream', coalesce(request_observation_json #> '{timings,upstream}', '{}'::jsonb) || jsonb_build_object(
+               'responseMs', $4::bigint, 'engineIapiTbtMs', 2.450638))))
              where id = 'req_observe_success'",
         )
         .bind(output)
         .bind(first_token)
         .bind(latency)
+        .bind(upstream)
         .execute(&database.pool)
         .await
         .unwrap();
+
+        let records = repository
+            .list_usage_records(UsageRecordQuery {
+                range,
+                filter: UsageRecordFilter::default(),
+                current_page: 1,
+                page_size: ObservabilityPageSize::new(10).unwrap(),
+            })
+            .await
+            .expect("official duration in usage list");
+        let record = records
+            .items
+            .iter()
+            .find(|record| record.id == "req_observe_success")
+            .unwrap();
+        assert_eq!(
+            record.upstream_response_ms,
+            upstream.map(|value| value as u64)
+        );
+        let detail = repository
+            .usage_record_detail("req_observe_success")
+            .await
+            .expect("official duration in usage detail");
+        assert_eq!(
+            detail.request.upstream_response_ms,
+            record.upstream_response_ms
+        );
+        assert_eq!(record.upstream_engine_iapi_tbt_ms, Some(2.450638));
+        assert_eq!(detail.request.upstream_engine_iapi_tbt_ms, Some(2.450638));
 
         let summary = repository
             .usage_summary(range, UsageRecordFilter::default())
@@ -441,9 +485,9 @@ async fn account_key_diagnostics_should_keep_keys_separate_per_oauth_account() {
     sqlx::query(
         "update model_requests
             set provider_account_id = 'acct_second', provider_account_ref = 'acct_second',
-                provider_account_name_snapshot = 'secondary',
-                provider_account_email_snapshot = 'second@example.invalid',
-                provider_account_authentication_kind_snapshot = 'oauth',
+                request_observation_json = request_observation_json || jsonb_build_object(
+                  'account', jsonb_build_object('name', 'secondary',
+                    'email', 'second@example.invalid', 'authenticationKind', 'oauth')),
                 outcome = 'succeeded', client_status_code = 200, upstream_status_code = 200,
                 error_kind = null, total_tokens = 40, downstream_committed_at = $1
           where id = 'req_observe_failed'",
@@ -553,14 +597,18 @@ async fn usage_search_should_match_account_email_and_name_prefixes() {
         assert_usage_search_ids(&database.pool, range, search, &[]).await;
     }
 
-    sqlx::query("update model_requests set provider_account_email_snapshot = null")
+    sqlx::query("update model_requests set request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'account', coalesce(request_observation_json #> '{account}', '{}'::jsonb) || jsonb_build_object(
+             'email', null)))")
         .execute(&database.pool)
         .await
         .expect("clear account email snapshots");
     assert_usage_search_ids(&database.pool, range, "primary", &["req_observe_success"]).await;
     assert_usage_search_ids(&database.pool, range, "account@", &[]).await;
 
-    sqlx::query("update model_requests set provider_account_name_snapshot = null")
+    sqlx::query("update model_requests set request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'account', coalesce(request_observation_json #> '{account}', '{}'::jsonb) || jsonb_build_object(
+             'name', null)))")
         .execute(&database.pool)
         .await
         .expect("clear account name snapshots");
@@ -617,7 +665,10 @@ async fn usage_search_should_treat_account_snapshot_wildcards_as_literals() {
         .expect("seed observability facts");
     sqlx::query(
         "update model_requests
-         set provider_account_email_snapshot = $1, provider_account_name_snapshot = $2",
+         set request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'account', coalesce(request_observation_json #> '{account}', '{}'::jsonb) || jsonb_build_object(
+             'email', $1::text,
+             'name', $2::text)))",
     )
     .bind("account_team%tag@example.invalid")
     .bind(r"primary\ops_100%")
@@ -948,11 +999,17 @@ async fn ops_should_include_incomplete_upstream_errors() {
     let raw_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Invalid `previous_response_id`."}}"#;
     sqlx::query(
         "update model_requests
-            set outcome = 'incomplete', error_kind = 'invalid_request',
-                client_transport = 'websocket', upstream_transport = 'websocket',
-                downstream_committed_at = completed_at,
-                client_status_code = null, upstream_status_code = 400,
-                provider_error_code = null, error_details = $1
+            set outcome = 'incomplete',
+           error_kind = 'invalid_request',
+           client_transport = 'websocket',
+           upstream_transport = 'websocket',
+           downstream_committed_at = completed_at,
+           client_status_code = null,
+           upstream_status_code = 400,
+           error_details = $1,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'error', coalesce(request_observation_json #> '{error}', '{}'::jsonb) || jsonb_build_object(
+             'providerErrorCode', null)))
           where id = 'req_observe_failed'",
     )
     .bind(raw_error)
@@ -1064,13 +1121,18 @@ async fn recovered_continuation_failure_should_be_visible_in_ops_but_hidden_from
     sqlx::query(
         "update model_requests
             set error_kind = 'continuation_recovery_required',
-                continuation_affinity_hash = $2,
-                continuation_previous_response_id_hash = $3,
-                continuation_requested = true,
-                continuation_unavailable_reason = 'reused_connection_lost',
-                recovery_request_id = 'req_observe_success', recovered_at = $1,
-                recovery_attempt_count = 1, recovery_retry_delay_ms = 4000,
-                recovery_total_latency_ms = 8000
+           continuation_affinity_hash = $2,
+           continuation_requested = true,
+           recovery_request_id = 'req_observe_success',
+           recovered_at = $1,
+           recovery_attempt_count = 1,
+           request_observation_json = jsonb_strip_nulls(request_observation_json || jsonb_build_object(
+           'continuation', coalesce(request_observation_json #> '{continuation}', '{}'::jsonb) || jsonb_build_object(
+             'previousResponseIdHash', $3::text,
+             'unavailableReason', 'reused_connection_lost'),
+           'recovery', coalesce(request_observation_json #> '{recovery}', '{}'::jsonb) || jsonb_build_object(
+             'retryDelayMs', 4000,
+             'totalLatencyMs', 8000)))
           where id = 'req_observe_failed'",
     )
     .bind(now)
@@ -2249,25 +2311,26 @@ async fn seed_observability_facts(
     .await?;
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id,
-           provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport,
-           provider_account_name_snapshot, provider_account_email_snapshot,
-           provider_account_authentication_kind_snapshot,
-           attempt_count, upstream_send_state, outcome, client_status_code,
-           input_tokens, output_tokens, total_tokens, cost_source, latency_ms,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_id, provider_account_ref, upstream_model_id, upstream_transport, attempt_count, upstream_send_state, outcome, client_status_code, input_tokens, output_tokens, total_tokens, cost_source, started_at, deadline_at, completed_at, request_observation_json
          ) values (
-           'req_observe_uncommitted', 'key_observe', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'public-model', 'openai', 'acct_observe',
-           'acct_observe', 'upstream-model', 'http_sse',
-           'primary', 'account@example.invalid', 'oauth',
-           1, 'sent', 'succeeded', 200,
-           900, 900, 1800, 'unavailable', 650,
-           $1 - interval '15 minutes', $1 + interval '10 minutes', $1 - interval '14 minutes',
-           'all', '{}'::text[], '[]'::jsonb
+           'req_observe_uncommitted', 'key_observe', 'responses', 'http_sse', 'public-model', 'openai', 'acct_observe', 'acct_observe', 'upstream-model', 'http_sse', 1, 'sent', 'succeeded', 200, 900, 900, 1800, 'unavailable', $1 - interval '15 minutes', $1 + interval '10 minutes', $1 - interval '14 minutes',
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'account', jsonb_build_object(
+             'name', 'primary',
+             'email', 'account@example.invalid',
+             'authenticationKind', 'oauth'),
+           'timings', jsonb_build_object(
+             'local', jsonb_build_object(
+               'latencyMs', 650)),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .bind(now)
@@ -2275,34 +2338,29 @@ async fn seed_observability_facts(
     .await?;
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id,
-           provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport, websocket_pool,
-           service_tier,
-           provider_account_name_snapshot, provider_account_email_snapshot,
-           provider_account_authentication_kind_snapshot,
-           attempt_count,
-           upstream_send_state, downstream_committed_at, outcome, client_status_code,
-           upstream_status_code, client_response_id, upstream_request_id, upstream_response_id,
-           input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens,
-           image_input_tokens, image_output_tokens, total_tokens,
-           image_generation_requested, image_generation_succeeded,
-           cost_source, cost_amount, cost_currency, first_token_ms, latency_ms,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_id, provider_account_ref, upstream_model_id, upstream_transport, service_tier, attempt_count, upstream_send_state, downstream_committed_at, outcome, client_status_code, upstream_status_code, client_response_id, upstream_request_id, upstream_response_id, input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, image_input_tokens, image_output_tokens, total_tokens, image_generation_requested, image_generation_succeeded, cost_source, cost_amount, cost_currency, started_at, deadline_at, completed_at, request_observation_json
          ) values (
-           'req_observe_success', 'key_observe', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'public-model', 'openai', 'acct_observe',
-           'acct_observe', 'upstream-model',
-           'http_sse', 'reuse', 'priority',
-           'primary', 'account@example.invalid', 'oauth',
-           1, 'sent', $1 - interval '19 minutes', 'succeeded', 200, 200,
-           'resp_observe_success', 'upstream_req_success', 'upstream_resp_success',
-           100, 20, 40, 3, 5, 31, 9, 120, true, true,
-           'provider_reported', 1.25, 'USD', 120, 900,
-           $1 - interval '20 minutes', $1 + interval '10 minutes', $1 - interval '19 minutes',
-           'groups', array['grp_history'], jsonb_build_array('Historical group')
+           'req_observe_success', 'key_observe', 'responses', 'http_sse', 'public-model', 'openai', 'acct_observe', 'acct_observe', 'upstream-model', 'http_sse', 'priority', 1, 'sent', $1 - interval '19 minutes', 'succeeded', 200, 200, 'resp_observe_success', 'upstream_req_success', 'upstream_resp_success', 100, 20, 40, 3, 5, 31, 9, 120, true, true, 'provider_reported', 1.25, 'USD', $1 - interval '20 minutes', $1 + interval '10 minutes', $1 - interval '19 minutes',
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'transport', jsonb_build_object(
+             'websocketPool', 'reuse'),
+           'account', jsonb_build_object(
+             'name', 'primary',
+             'email', 'account@example.invalid',
+             'authenticationKind', 'oauth'),
+           'timings', jsonb_build_object(
+             'local', jsonb_build_object(
+               'firstTokenMs', 120,
+               'latencyMs', 900)),
+           'routing', jsonb_build_object(
+             'scope', 'groups',
+             'groupRefs', array['grp_history'],
+             'groupNamesSnapshot', jsonb_build_array('Historical group'))))
          )",
     )
     .bind(now)
@@ -2310,32 +2368,35 @@ async fn seed_observability_facts(
     .await?;
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, service_tier,
-           provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport, attempt_count,
-           provider_account_name_snapshot, provider_account_email_snapshot,
-           provider_account_authentication_kind_snapshot,
-           upstream_send_state, outcome, client_status_code, upstream_status_code,
-           error_kind, provider_error_code, error_message, retry_after_ms,
-           input_tokens, cached_tokens, image_generation_requested,
-           image_generation_succeeded, cost_source, latency_ms,
-           client_ip, user_agent, reasoning_effort, reasoning_preset,
-           request_kind, subagent_kind, compact,
-           started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, service_tier, provider_kind, provider_account_id, provider_account_ref, upstream_model_id, upstream_transport, attempt_count, upstream_send_state, outcome, client_status_code, upstream_status_code, error_kind, input_tokens, cached_tokens, image_generation_requested, image_generation_succeeded, cost_source, request_kind, started_at, deadline_at, completed_at, request_observation_json
          ) values (
-           'req_observe_failed', 'key_observe', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'public-model', 'priority', 'openai', 'acct_observe',
-           'acct_observe', 'upstream-model',
-           'http_sse', 2,
-           'primary', 'account@example.invalid', 'oauth',
-           'sent', 'failed', 502, 429, 'rate_limited', 'rate_limit',
-           'upstream limited', 1000, 0, 0, true, false, 'unavailable', 700,
-           '203.0.113.9', 'codex-cli/0.144.0', 'medium', null,
-           'root', null, false,
-           $1 - interval '10 minutes', $1 + interval '20 minutes', $1 - interval '9 minutes',
-           'all', '{}'::text[], '[]'::jsonb
+           'req_observe_failed', 'key_observe', 'responses', 'http_sse', 'public-model', 'priority', 'openai', 'acct_observe', 'acct_observe', 'upstream-model', 'http_sse', 2, 'sent', 'failed', 502, 429, 'rate_limited', 0, 0, true, false, 'unavailable', 'root', $1 - interval '10 minutes', $1 + interval '20 minutes', $1 - interval '9 minutes',
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'clientIp', '203.0.113.9',
+             'userAgent', 'codex-cli/0.144.0',
+             'reasoningEffort', 'medium',
+             'reasoningPreset', null,
+             'subagentKind', null,
+             'compact', false),
+           'account', jsonb_build_object(
+             'name', 'primary',
+             'email', 'account@example.invalid',
+             'authenticationKind', 'oauth'),
+           'error', jsonb_build_object(
+             'providerErrorCode', 'rate_limit',
+             'message', 'upstream limited',
+             'retryAfterMs', 1000),
+           'timings', jsonb_build_object(
+             'local', jsonb_build_object(
+               'latencyMs', 700)),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .bind(now)
@@ -2370,24 +2431,23 @@ async fn seed_calculated_billing_facts(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport, attempt_count,
-           provider_account_name_snapshot, provider_account_email_snapshot,
-           provider_account_authentication_kind_snapshot,
-           upstream_send_state, downstream_committed_at, outcome, client_status_code,
-           input_tokens, output_tokens, cached_tokens, cache_write_tokens, total_tokens, service_tier,
-           cost_source, cost_amount, cost_currency, started_at, deadline_at, completed_at,
-           routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_id, provider_account_ref, upstream_model_id, upstream_transport, attempt_count, upstream_send_state, downstream_committed_at, outcome, client_status_code, input_tokens, output_tokens, cached_tokens, cache_write_tokens, total_tokens, service_tier, cost_source, cost_amount, cost_currency, started_at, deadline_at, completed_at, request_observation_json
          ) values (
-           'req_observe_calculated', 'key_observe', 1, 'openai', 'responses', '/v1/responses',
-           'http_sse', 'public-model', 'openai', 'acct_observe', 'acct_observe', 'gpt-5.5',
-           'http_sse', 1,
-           'primary', 'account@example.invalid', 'oauth',
-           'sent', $1 - interval '29 minutes', 'succeeded', 200,
-           800, 200, 0, 0, 1000, 'priority', 'calculated', 1.25, 'USD',
-           $1 - interval '30 minutes', $1 + interval '10 minutes', $1 - interval '29 minutes',
-           'all', '{}'::text[], '[]'::jsonb
+           'req_observe_calculated', 'key_observe', 'responses', 'http_sse', 'public-model', 'openai', 'acct_observe', 'acct_observe', 'gpt-5.5', 'http_sse', 1, 'sent', $1 - interval '29 minutes', 'succeeded', 200, 800, 200, 0, 0, 1000, 'priority', 'calculated', 1.25, 'USD', $1 - interval '30 minutes', $1 + interval '10 minutes', $1 - interval '29 minutes',
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'account', jsonb_build_object(
+             'name', 'primary',
+             'email', 'account@example.invalid',
+             'authenticationKind', 'oauth'),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .bind(now)
@@ -2395,23 +2455,23 @@ async fn seed_calculated_billing_facts(
     .await?;
     sqlx::query(
         "insert into model_requests (
-           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
-           client_transport, requested_model_id, provider_kind, provider_account_id,
-           provider_account_ref, upstream_model_id, upstream_transport, attempt_count,
-           provider_account_name_snapshot, provider_account_email_snapshot,
-           provider_account_authentication_kind_snapshot,
-           upstream_send_state, outcome, client_status_code, input_tokens, output_tokens,
-           total_tokens, cost_source, cost_amount, cost_currency, started_at, deadline_at,
-           completed_at, routing_scope, routing_group_refs, routing_group_names_snapshot
+           id, client_api_key_ref, operation, client_transport, requested_model_id, provider_kind, provider_account_id, provider_account_ref, upstream_model_id, upstream_transport, attempt_count, upstream_send_state, outcome, client_status_code, input_tokens, output_tokens, total_tokens, cost_source, cost_amount, cost_currency, started_at, deadline_at, completed_at, request_observation_json
          ) values (
-           'req_observe_calculated_uncommitted', 'key_observe', 1, 'openai', 'responses',
-           '/v1/responses', 'http_sse', 'public-model', 'openai', 'acct_observe',
-           'acct_observe', 'gpt-5.5', 'http_sse', 1,
-           'primary', 'account@example.invalid', 'oauth',
-           'sent', 'succeeded', 200, 800, 200,
-           1000, 'calculated', 1.25, 'USD',
-           $1 - interval '40 minutes', $1 + interval '10 minutes', $1 - interval '39 minutes',
-           'all', '{}'::text[], '[]'::jsonb
+           'req_observe_calculated_uncommitted', 'key_observe', 'responses', 'http_sse', 'public-model', 'openai', 'acct_observe', 'acct_observe', 'gpt-5.5', 'http_sse', 1, 'sent', 'succeeded', 200, 800, 200, 1000, 'calculated', 1.25, 'USD', $1 - interval '40 minutes', $1 + interval '10 minutes', $1 - interval '39 minutes',
+           jsonb_strip_nulls(jsonb_build_object(
+           'request', jsonb_build_object(
+             'configRevision', 1,
+             'protocol', 'openai',
+             'endpoint', '/v1/responses',
+             'compact', false),
+           'account', jsonb_build_object(
+             'name', 'primary',
+             'email', 'account@example.invalid',
+             'authenticationKind', 'oauth'),
+           'routing', jsonb_build_object(
+             'scope', 'all',
+             'groupRefs', '{}'::text[],
+             'groupNamesSnapshot', '[]'::jsonb)))
          )",
     )
     .bind(now)

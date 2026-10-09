@@ -54,6 +54,12 @@ export interface AccountGroupListResponse {
   configRevision: number
 }
 
+export interface AccountGroupOptionsResponse {
+  items: AccountGroupRef[]
+  page: AccountGroupPageMeta
+  configRevision: number
+}
+
 export interface AccountGroupMutationResponse {
   id: string
   record: AccountGroup | null
@@ -89,6 +95,15 @@ interface AccountGroupIdParam {
 export function getAccountGroups(data: AccountGroupListParams, options: RequestOptions = {}) {
   return request<AccountGroupListResponse>({
     url: '/api/admin/account-groups',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function getAccountGroupOptions(data: AccountGroupListParams, options: RequestOptions = {}) {
+  return request<AccountGroupOptionsResponse>({
+    url: '/api/admin/account-groups/options',
     method: 'GET',
     params: data,
     ...options,

@@ -190,7 +190,7 @@ pub fn initialize(
     let state = ApiState {
         admin,
         openai: OpenAiService::new(execution, lifecycle),
-        health: HealthStatus::new(probes, worker_health),
+        health: HealthStatus::new(probes, worker_health, diagnostics.clone()),
     };
     let index = config.asset_directory.join("index.html");
     let mut router = Router::new()

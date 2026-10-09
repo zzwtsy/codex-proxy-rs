@@ -101,29 +101,32 @@ fn response_signals_should_count_structural_start_without_semantic_output() {
 }
 
 #[test]
-fn first_token_should_follow_non_preamble_events_without_reclassifying_content() {
+fn first_token_should_use_only_the_official_output_item_added_boundary() {
     for event in [
         "response.created",
         "response.in_progress",
         "keepalive",
         "codex.rate_limits",
+        "codex.response.metadata",
+        "response.metadata",
+        "responsesapi.websocket_timing",
+        "response.content_part.added",
+        "response.reasoning_summary_part.added",
+        "response.output_text.delta",
+        "response.output_item.done",
+        "response.completed",
         "response.failed",
         "error",
     ] {
         let signals = response_event_signals(Some(event), &json!({"type": event}));
-        assert!(!signals.output_start, "not a first token: {event}");
+        assert!(!signals.output_start, "not an output item start: {event}");
     }
-    for event in [
-        "response.output_item.added",
-        "response.content_part.added",
-        "response.reasoning_summary_part.added",
-        "response.output_text.delta",
-        "response.completed",
-    ] {
-        let signals = response_event_signals(Some(event), &json!({"type": event}));
-        assert!(signals.output_start, "first non-preamble event: {event}");
-        assert!(!signals.semantic_output, "no content: {event}");
-    }
+    let signals = response_event_signals(
+        Some("response.output_item.added"),
+        &json!({"type": "response.output_item.added", "item": {"type": "message", "content": []}}),
+    );
+    assert!(signals.output_start);
+    assert!(!signals.semantic_output);
 }
 
 #[test]

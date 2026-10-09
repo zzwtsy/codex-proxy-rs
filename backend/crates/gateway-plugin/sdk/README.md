@@ -1,7 +1,7 @@
 # Gateway Plugin SDK
 
 用于编写 Codex Proxy 插件的 Rust 合同与可选会话辅助。插件只依赖本包，不依赖宿主 Core、Admin、Store 或 Host。
-SDK 仍处于实验阶段；能力是否可用取决于宿主支持、清单声明与实际注册，
+SDK 处于实验阶段；能力是否可用取决于宿主支持、清单声明与实际注册，
 而不只是枚举中存在该名称
 
 | 版本 | 当前值 | 用途 |
@@ -90,14 +90,12 @@ sequenceDiagram
 元数据保留 64 KiB 上限；正文总量不由插件传输层额外限制。传输内部以 256 KiB 为单次 I/O 块，
 不逐块发起 RPC，也不要求插件配置与宿主同步。读取按进度扩展缓冲区；截断正文必须报错，不能作为完整消息交付
 
-`read_frame` / `write_frame` 使用协议 v2。帧写入队列之前先用 `validate_frame` 校验元数据，
+帧写入队列前先用 `validate_frame` 校验元数据，
 避免本地输入错误关闭共享传输。协议校验不会自动重试业务调用；部分读写中断后不能把当前位置当作新帧边界。
 底层 `read_frame` / `write_frame` 不是取消安全的；自行编排会话时，不能在 `select!` 的其他分支完成后
 重建半途中的帧读写。`PluginSession` 会在处理调用完成通知时保留同一个读取 future，直到完整帧到达或会话关闭
 
-会话由宿主发送 `Hello`，插件校验协议后返回携带相同 incarnation 的 `Ready`。
-注册结果必须与清单中的能力一致。一次 `Call` 的结果、错误和流帧按 ID 关联；回调必须
-携带当前父调用 ID。实例、代次、阶段、账号或资源 ID 用于关联调用和管理资源生命周期
+插件须校验 `Hello` 的协议版本。一次 `Call` 的结果、错误和流帧按 ID 关联；实例、代次、阶段、账号或资源 ID 用于关联调用和管理资源生命周期
 
 ## 本地验证
 
@@ -117,6 +115,6 @@ RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml -p
 RUST_MIN_STACK=16777216 RUSTDOCFLAGS='-D warnings' cargo +1.97.0 doc --manifest-path backend/Cargo.toml -p gateway-plugin-sdk --all-features --no-deps --locked
 ```
 
-源码中的类型和字段是当前合同；宿主接入、目录边界与 Runtime 集成验证见
-[系统架构](../../../../docs/architecture.md)。Provider 固定为宿主内置的 OpenAI 与 xAI；插件实现只依赖公开 SDK 合同。
+源码中的类型和字段是当前合同；宿主接入、目录边界、内置 Provider 与 Runtime 集成验证见
+[系统架构](../../../../docs/architecture.md#31-插件扩展)。
 单元测试与文档构建不代替目标平台上的安装、配置及实际能力验证

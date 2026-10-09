@@ -20,7 +20,6 @@ host:
       directory: '../.runtime/logs'
       retention_days: 7
       max_file_size_mb: 20
-  drain_timeout_seconds: 30
   worker_shutdown_timeout_seconds: 30
 
 store:

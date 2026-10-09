@@ -14,9 +14,10 @@ use gateway_admin::{
         MutationContext,
         account_groups::{
             AccountGroupAccountSummary, AccountGroupCapacity, AccountGroupColor,
-            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation, AccountGroupPage,
-            AccountGroupRecord, AccountGroupUsage, DeleteAccountGroup, NewAccountGroup,
-            SetAccountGroupEnabled, UpdateAccountGroup,
+            AccountGroupListQuery, AccountGroupMemberFact, AccountGroupMutation,
+            AccountGroupOptionsPage, AccountGroupPage, AccountGroupRecord, AccountGroupRef,
+            AccountGroupUsage, DeleteAccountGroup, NewAccountGroup, SetAccountGroupEnabled,
+            UpdateAccountGroup,
         },
         observability::DecimalAmount,
     },
@@ -217,6 +218,70 @@ impl AccountGroupStore for SqliteAccountGroupRepository {
             config_revision: self.current_revision().await?,
             items,
             total,
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
+    }
+
+    async fn list_account_group_options(
+        &self,
+        query: AccountGroupListQuery,
+    ) -> AdminStoreResult<AccountGroupOptionsPage> {
+        validate_page_query(&query)?;
+        let mut count =
+            sqlx::QueryBuilder::<Sqlite>::new("select count(*) from account_groups g where 1 = 1");
+        push_filter(&mut count, &query);
+        let total = count
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| unavailable_admin("count account group options"))?;
+        let offset = u64::from(query.page.saturating_sub(1))
+            .checked_mul(u64::from(query.page_size.get()))
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| invalid_admin("page is too large"))?;
+        let mut statement = sqlx::QueryBuilder::<Sqlite>::new(
+            "select g.id, g.name, g.color, g.enabled from account_groups g where 1 = 1",
+        );
+        push_filter(&mut statement, &query);
+        statement
+            .push(" order by g.created_at_us desc, g.id desc limit ")
+            .push_bind(i64::from(query.page_size.get()))
+            .push(" offset ")
+            .push_bind(offset);
+        let rows = statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| unavailable_admin("list account group options"))?;
+        let items = rows
+            .iter()
+            .map(|row| {
+                let id: String = row
+                    .try_get("id")
+                    .map_err(|_| invalid_admin("group ID is invalid"))?;
+                let color: String = row
+                    .try_get("color")
+                    .map_err(|_| invalid_admin("group color is invalid"))?;
+                Ok(AccountGroupRef {
+                    id: AccountGroupId::new(id)
+                        .map_err(|_| invalid_admin("group ID is invalid"))?,
+                    name: row
+                        .try_get("name")
+                        .map_err(|_| invalid_admin("group name is invalid"))?,
+                    color: AccountGroupColor::parse(&color)
+                        .ok_or_else(|| invalid_admin("group color is invalid"))?,
+                    enabled: row
+                        .try_get("enabled")
+                        .map_err(|_| invalid_admin("group enabled flag is invalid"))?,
+                })
+            })
+            .collect::<AdminStoreResult<Vec<_>>>()?;
+        Ok(AccountGroupOptionsPage {
+            config_revision: self.current_revision().await?,
+            items,
+            total: u64::try_from(total)
+                .map_err(|_| invalid_admin("negative account group count"))?,
             page: query.page,
             page_size: query.page_size.get(),
         })
@@ -661,7 +726,7 @@ async fn group_usage(
     let rows = sqlx::query(
         "select membership.account_group_id, request.cost_amount, request.started_at_us
          from account_group_accounts membership
-         join model_requests request
+         join model_request_observations request
            on request.provider_account_ref = membership.provider_account_id
          where membership.account_group_id in (select value from json_each(?1))
            and request.started_at_us >= ?2

@@ -66,7 +66,7 @@ pub struct ImageCostBreakdown {
     pub cache_read_price_per_million: RequestMoney,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseObservation {
     pub transport: String,

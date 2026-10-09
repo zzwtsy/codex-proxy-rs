@@ -134,6 +134,7 @@ impl SqliteRuntimeSettingsRepository {
                openai_account_affinity = ?31,
                max_account_rotations = ?32,
                openai_session_affinity_ttl_hours = ?33,
+               codex_privacy_policy_json = ?35,
                updated_at_us = max(updated_at_us, ?34)
              where id = 1 and config_revision < 9223372036854775807
              returning config_revision",
@@ -172,6 +173,7 @@ impl SqliteRuntimeSettingsRepository {
         .bind(i64::from(update.max_account_rotations))
         .bind(i64::from(update.openai_session_affinity_ttl_hours))
         .bind(now)
+        .bind(encode_json(&update.codex_privacy_policy)?)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| sqlite_unavailable("update SQLite runtime settings"))?
@@ -210,7 +212,7 @@ impl RuntimeSettingsRepository for SqliteRuntimeSettingsRepository {
             "select provider_request_profiles_json, config_revision, admin_api_key,
                     refresh_margin_seconds, refresh_concurrency, max_concurrent_per_account,
                     request_interval_ms, smart_scheduling_json, rotation_strategy,
-                    request_location_enabled, request_location_json, model_mappings_json,
+                    request_location_enabled, request_location_json, codex_privacy_policy_json, model_mappings_json,
                     usage_retention_days, ops_event_retention_days, audit_retention_days,
                     min_codex_desktop_version, min_codex_cli_version, updated_at_us,
                     max_waiting_per_key, max_waiting_per_account,
@@ -533,6 +535,7 @@ fn settings_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<RuntimeSettin
     let request_location: gateway_core::account::RequestLocation =
         decode_json(row, "request_location_json")?;
     Ok(RuntimeSettings {
+        codex_privacy_policy: decode_json(row, "codex_privacy_policy_json")?,
         request_profiles,
         config_revision: crate::Revision::new(nonnegative(read_i64(row, "config_revision")?)?)?,
         admin_api_key: read_optional_string(row, "admin_api_key")?,
@@ -677,7 +680,7 @@ async fn load_runtime_settings_in_transaction(
         "select provider_request_profiles_json, config_revision, admin_api_key,
                 refresh_margin_seconds, refresh_concurrency, max_concurrent_per_account,
                 request_interval_ms, smart_scheduling_json, rotation_strategy,
-                request_location_enabled, request_location_json, model_mappings_json,
+                request_location_enabled, request_location_json, codex_privacy_policy_json, model_mappings_json,
                 usage_retention_days, ops_event_retention_days, audit_retention_days,
                 min_codex_desktop_version, min_codex_cli_version, updated_at_us,
                 max_waiting_per_key, max_waiting_per_account,

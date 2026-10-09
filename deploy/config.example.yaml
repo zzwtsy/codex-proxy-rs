@@ -38,7 +38,6 @@ host:
   #   deployment_mode: 'binary'
   #   self_restart_enabled: true
   #   executable_path: '/opt/codex-proxy-rs/codex-proxy-rs' # 可选：覆盖启动时解析的程序路径。
-  drain_timeout_seconds: 30
   worker_shutdown_timeout_seconds: 30
 
 store:

@@ -50,7 +50,7 @@ impl RuntimeSnapshotRepository for SqliteRuntimeSnapshotRepository {
                     concurrency_wait_timeout_seconds, openai_guardian_reserved_concurrency,
                     openai_account_affinity, max_account_rotations,
                     openai_session_affinity_ttl_hours,
-                    request_location_json, request_location_enabled,
+                    request_location_json, request_location_enabled, codex_privacy_policy_json,
                     responses_max_decompressed_body_bytes, provider_request_profiles_json,
                     pricing_overrides_json, pricing_synced_json
              from runtime_settings where id = 1",
@@ -81,6 +81,7 @@ impl RuntimeSnapshotRepository for SqliteRuntimeSnapshotRepository {
         crate::pricing_validation::validate_pricing(&pricing_overrides)?;
         crate::pricing_validation::validate_pricing(&pricing_synced)?;
         let settings = SnapshotRuntimeSettings {
+            codex_privacy_policy: decode_json(&settings_row, "codex_privacy_policy_json")?,
             pricing: gateway_core::metering::merge_pricing(pricing_synced, &pricing_overrides),
             request_profiles,
             request_location_enabled: read_i64(&settings_row, "request_location_enabled")? != 0,

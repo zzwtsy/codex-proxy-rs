@@ -23,12 +23,12 @@ const WEBSOCKET_STREAM_BUFFER: usize = 16;
 
 pub(super) use self::stream::{WebSocketStreamPoolReturn, stream_websocket_response};
 
-/// Responses WebSocket live SSE 交互结果
+/// Responses WebSocket 文本流交互结果
 pub struct CodexWebSocketStreamingExchange {
     /// 关联请求日志与底层 pump 生命周期日志的连接标识
     pub(crate) websocket_connection_id: Uuid,
-    /// 由 WebSocket 事件转换出的 live SSE 字节流
-    pub body: CodexWebSocketSseStream,
+    /// 上游完整 WebSocket 文本消息流
+    pub body: CodexWebSocketTextStream,
     /// 上游为本次响应返回的首个 turn state
     pub turn_state: Option<String>,
     /// 上游握手响应里的 `set-cookie` 列表
@@ -49,8 +49,8 @@ pub struct CodexWebSocketStreamingExchange {
     pub response_metadata: CodexResponseMetadata,
 }
 
-/// Responses WebSocket live SSE 字节流
-pub type CodexWebSocketSseStream =
+/// Responses WebSocket 完整文本消息流
+pub type CodexWebSocketTextStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, CodexWebSocketExchangeError>> + Send + 'static>>;
 /// live 流中的结构化限流动态更新
 pub type CodexWebSocketRateLimitUpdates = Arc<Mutex<Vec<ParsedRateLimits>>>;

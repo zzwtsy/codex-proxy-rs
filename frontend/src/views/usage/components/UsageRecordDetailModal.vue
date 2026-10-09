@@ -13,6 +13,7 @@ import {
   usageLatencyDetails,
   usageModelDisplay,
   usageReasoningEffort,
+  usageTokenDetails,
   usageTransportType,
   usageUserAgent,
 } from '@/components/usage/shared/presenter'
@@ -37,7 +38,7 @@ const responseText = computed(() => props.record ? visibleResponseText(props.rec
 const modelDisplay = computed(() => props.record
   ? usageModelDisplay(props.record)
   : { primary: '—', secondary: '' })
-const tokenDetails = computed(() => props.record ? props.record.tokenDetails : null)
+const tokenDetails = computed(() => props.record ? usageTokenDetails(props.record.tokenDetails) : null)
 const billing = computed(() => props.record ? props.record.billing : null)
 const latencyDetails = computed(() => props.record ? usageLatencyDetails(props.record) : null)
 
@@ -55,8 +56,9 @@ const overviewItems = computed(() => [
   { label: '客户端传输', value: usageTransportType(props.record?.clientTransport), mono: true },
   { label: '上游传输', value: usageTransportType(props.record?.upstreamTransport), mono: true },
   { label: '总耗时', value: props.record?.latencyMsDisplay, mono: true },
+  { label: '上游耗时', value: latencyDetails.value?.upstreamDisplay ?? '—', mono: true },
   {
-    label: latencyDetails.value?.firstOutputLabel ?? '首字',
+    label: '首个输出等待',
     value: latencyDetails.value?.firstOutputDisplay ?? '—',
     mono: true,
   },
