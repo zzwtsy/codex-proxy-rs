@@ -1,16 +1,15 @@
 //! SQLite 用量列表、请求详情和运维错误查询。
 
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqliteRow};
 
 use crate::{
     DecimalAmount, StoreError, StoreResult,
     postgres::{
-        ObservabilityRange, OpsErrorFilter, OpsErrorPage, OpsErrorQuery, OpsErrorRecord,
-        UsageAttemptObservation, UsageListRecord, UsageRecord, UsageRecordDetail,
-        UsageRecordFilter, UsageRecordPage, UsageRecordQuery,
+        ObservabilityRange, OpsErrorPage, OpsErrorQuery, OpsErrorRecord, UsageAttemptObservation,
+        UsageListRecord, UsageRecord, UsageRecordDetail, UsageRecordFilter, UsageRecordPage,
+        UsageRecordQuery,
     },
     sqlite::value::{datetime_from_micros, decode_amount},
 };
@@ -164,110 +163,182 @@ pub(crate) async fn ops_errors(
     query: OpsErrorQuery,
 ) -> StoreResult<OpsErrorPage> {
     crate::postgres::validate_ops_error_filter(&query.filter)?;
-    // UNION ALL 外层的时间条件不会下推到两个分支，需绑定到各自的时间列。
-    let mut rows = sqlx::query(OPS_ERROR_SELECT)
-        .bind(query.range.start.timestamp_micros())
-        .bind(query.range.end.timestamp_micros())
-        .bind(query.range.start.timestamp_micros())
-        .bind(query.range.end.timestamp_micros())
-        .fetch(pool);
     let offset = crate::postgres::observability_page_offset(query.current_page, query.page_size)?;
-    let page_start =
-        u64::try_from(offset).map_err(|_| invalid("ops error offset exceeds supported range"))?;
-    let page_end = page_start.saturating_add(u64::from(query.page_size.get()));
-    let mut items = Vec::with_capacity(usize::from(query.page_size.get()));
-    let mut total = 0_u64;
-    while let Some(row) = rows.try_next().await.map_err(|_| unavailable())? {
-        if ops_error_matches(&row, &query.filter)? {
-            if total >= page_start && total < page_end {
-                items.push(ops_error_from_row(&row)?);
-            }
-            total = total
-                .checked_add(1)
-                .ok_or_else(|| invalid("ops error count exceeds supported range"))?;
-        }
-    }
+    // 名称匹配、总数和页面共用只读快照，避免并发写入造成分页计数不一致
+    let mut transaction = pool.begin().await.map_err(|_| unavailable())?;
+    let matching_keys = if let Some(search) = &query.filter.search {
+        let names: Vec<(String, String)> = sqlx::query_as("select id, name from client_api_keys")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| unavailable())?;
+        let search = search.to_lowercase();
+        let ids: Vec<String> = names
+            .into_iter()
+            .filter_map(|(id, name)| name.to_lowercase().starts_with(&search).then_some(id))
+            .collect();
+        serde_json::to_string(&ids).map_err(|_| invalid("matching key IDs cannot be encoded"))?
+    } else {
+        String::from("[]")
+    };
+    let mut count = QueryBuilder::<Sqlite>::new("select sum(source_count) from (");
+    count.push("select count(*) as source_count from model_request_observations mr where ");
+    push_ops_error_filter(&mut count, &query, true, &matching_keys);
+    count.push(" union all select count(*) as source_count from ops_events oe left join model_request_observations mr on mr.id = oe.model_request_id where ");
+    push_ops_error_filter(&mut count, &query, false, &matching_keys);
+    count.push(")");
+    let total: i64 = count
+        .build_query_scalar()
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| unavailable())?;
+    let mut page = QueryBuilder::<Sqlite>::new("select * from (");
+    page.push(OPS_REQUEST_SELECT).push(" where ");
+    push_ops_error_filter(&mut page, &query, true, &matching_keys);
+    page.push(" union all ")
+        .push(OPS_EVENT_SELECT)
+        .push(" where ");
+    push_ops_error_filter(&mut page, &query, false, &matching_keys);
+    page.push(") errors order by occurred_at_us desc, stable_sort_id desc limit ")
+        .push_bind(i64::from(query.page_size.get()))
+        .push(" offset ")
+        .push_bind(offset);
+    let rows = page
+        .build()
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| unavailable())?;
+    let items = rows
+        .iter()
+        .map(ops_error_from_row)
+        .collect::<StoreResult<Vec<_>>>()?;
+    transaction.commit().await.map_err(|_| unavailable())?;
     Ok(OpsErrorPage {
         items,
         current_page: query.current_page,
         page_size: query.page_size.get(),
-        total,
+        total: checked_u64(total)?,
     })
 }
 
-fn ops_error_matches(row: &SqliteRow, filter: &OpsErrorFilter) -> StoreResult<bool> {
-    let source: String = get(row, "source")?;
-    let matches_text = |column: &'static str, expected: &Option<String>| -> StoreResult<bool> {
-        let value: Option<String> = get(row, column)?;
-        Ok(expected
-            .as_ref()
-            .is_none_or(|expected| value.as_ref() == Some(expected)))
+fn push_ops_error_filter(
+    statement: &mut QueryBuilder<Sqlite>,
+    query: &OpsErrorQuery,
+    request: bool,
+    matching_keys: &str,
+) {
+    let filter = &query.filter;
+    let (alias, time, request_id, event_id, attempt, status) = if request {
+        statement.push("mr.error_kind is not null and mr.error_kind <> 'cancelled' and mr.outcome <> 'running' and ");
+        (
+            "mr",
+            "mr.completed_at_us",
+            "mr.id",
+            "mr.id",
+            "nullif(mr.attempt_count, 0)",
+            "mr.upstream_status_code",
+        )
+    } else {
+        (
+            "oe",
+            "oe.created_at_us",
+            "oe.model_request_id",
+            "oe.id",
+            "oe.attempt_index",
+            "oe.status_code",
+        )
     };
+    statement
+        .push(time)
+        .push(" >= ")
+        .push_bind(query.range.start.timestamp_micros())
+        .push(" and ")
+        .push(time)
+        .push(" < ")
+        .push_bind(query.range.end.timestamp_micros());
     for (column, expected) in [
-        ("client_api_key_ref", &filter.client_api_key_ref),
-        ("request_id", &filter.request_id),
+        ("mr.client_api_key_ref", &filter.client_api_key_ref),
+        (request_id, &filter.request_id),
+    ] {
+        if let Some(value) = expected {
+            statement
+                .push(" and ")
+                .push(column)
+                .push(" = ")
+                .push_bind(value);
+        }
+    }
+    for (column, expected) in [
         ("provider_kind", &filter.provider_kind),
         ("provider_account_ref", &filter.provider_account_ref),
         ("operation", &filter.operation),
         ("upstream_model_id", &filter.model),
         ("upstream_request_id", &filter.upstream_request_id),
     ] {
-        if !matches_text(column, expected)? {
-            return Ok(false);
+        if let Some(value) = expected {
+            statement
+                .push(" and ")
+                .push(alias)
+                .push(".")
+                .push(column)
+                .push(" = ")
+                .push_bind(value);
         }
-    }
-    if filter.transport.is_some() && source != "model_request" {
-        return Ok(false);
     }
     if let Some(transport) = &filter.transport {
-        let value: Option<String> = get(row, "upstream_transport")?;
-        if value.as_ref() != Some(transport) {
-            return Ok(false);
+        if request {
+            statement
+                .push(" and mr.upstream_transport = ")
+                .push_bind(transport);
+        } else {
+            statement.push(" and 0");
         }
     }
-    if let Some(attempt_index) = filter.attempt_index {
-        let value: Option<i64> = get(row, "attempt_index")?;
-        if value != Some(i64::from(attempt_index)) {
-            return Ok(false);
+    for (column, value) in [
+        (attempt, filter.attempt_index.map(i64::from)),
+        (status, filter.status_code.map(i64::from)),
+    ] {
+        if let Some(value) = value {
+            statement
+                .push(" and ")
+                .push(column)
+                .push(" = ")
+                .push_bind(value);
         }
     }
-    if let Some(status_code) = filter.status_code {
-        let value: Option<i64> = get(row, "upstream_status_code")?;
-        if value != Some(i64::from(status_code)) {
-            return Ok(false);
-        }
-    }
-    if let Some(response_id) = &filter.response_id {
-        let value: Option<Vec<u8>> = get(row, "client_response_id")?;
-        if value.as_deref() != Some(response_id.as_bytes()) {
-            return Ok(false);
-        }
+    if let Some(value) = &filter.response_id {
+        statement
+            .push(" and mr.client_response_id = ")
+            .push_bind(value.as_bytes());
     }
     if let Some(search) = &filter.search {
-        let prefix_matches = [
-            "event_id",
-            "request_id",
-            "client_api_key_ref",
-            "provider_account_ref",
-            "upstream_request_id",
-            "provider_error_code",
+        // instr 保持标识符的大小写和字面前缀语义，不将 % 与 _ 解释为通配符
+        statement.push(" and (");
+        for (index, column) in [
+            event_id.to_owned(),
+            request_id.to_owned(),
+            "mr.client_api_key_ref".to_owned(),
+            format!("{alias}.provider_account_ref"),
+            format!("{alias}.upstream_request_id"),
+            format!("{alias}.provider_error_code"),
         ]
         .into_iter()
-        .any(|column| {
-            row.try_get::<Option<String>, _>(column)
-                .ok()
-                .flatten()
-                .is_some_and(|value| value.starts_with(search))
-        });
-        let key_name: Option<String> = get(row, "client_api_key_name")?;
-        if !prefix_matches
-            && !key_name
-                .is_some_and(|value| value.to_lowercase().starts_with(&search.to_lowercase()))
+        .enumerate()
         {
-            return Ok(false);
+            if index > 0 {
+                statement.push(" or ");
+            }
+            statement
+                .push("instr(")
+                .push(column)
+                .push(", ")
+                .push_bind(search)
+                .push(") = 1");
         }
+        statement
+            .push(" or mr.client_api_key_ref in (select value from json_each(")
+            .push_bind(matching_keys)
+            .push(")))");
     }
-    Ok(true)
 }
 
 fn usage_list_record_from_row(row: &SqliteRow) -> StoreResult<UsageListRecord> {
@@ -561,8 +632,8 @@ const USAGE_LIST_SELECT: &str = "select mr.*,
   left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
   left join provider_accounts account on account.id = mr.provider_account_ref";
 
-const OPS_ERROR_SELECT: &str = "select * from (
- select 'model_request' as source, mr.id as event_id, mr.id as request_id,
+const OPS_REQUEST_SELECT: &str =
+    " select 'model_request' as source, mr.id as event_id, mr.id as request_id,
         nullif(mr.attempt_count, 0) as attempt_index, mr.client_api_key_ref,
         client_key.name as client_api_key_name, 'model_request' as component, mr.operation,
         mr.protocol, mr.client_transport, mr.requested_model_id, mr.service_tier, mr.endpoint,
@@ -587,11 +658,10 @@ const OPS_ERROR_SELECT: &str = "select * from (
    from model_request_observations mr
    left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
    left join provider_accounts account on account.id = mr.provider_account_ref
-  where mr.error_kind is not null and mr.error_kind <> 'cancelled'
-    and mr.outcome <> 'running'
-    and mr.completed_at_us >= ? and mr.completed_at_us < ?
- union all
- select 'ops_event' as source, oe.id as event_id, oe.model_request_id as request_id,
+";
+
+const OPS_EVENT_SELECT: &str =
+    " select 'ops_event' as source, oe.id as event_id, oe.model_request_id as request_id,
         oe.attempt_index, mr.client_api_key_ref, client_key.name as client_api_key_name,
         oe.component, oe.operation, mr.protocol, mr.client_transport,
         mr.requested_model_id, mr.service_tier, mr.endpoint, oe.provider_kind,
@@ -616,8 +686,7 @@ const OPS_ERROR_SELECT: &str = "select * from (
    left join model_request_observations mr on mr.id = oe.model_request_id
    left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
    left join provider_accounts account on account.id = oe.provider_account_ref
-  where oe.created_at_us >= ? and oe.created_at_us < ?
-) errors order by occurred_at_us desc, stable_sort_id desc";
+";
 
 fn get<'r, T>(row: &'r SqliteRow, column: &'static str) -> StoreResult<T>
 where

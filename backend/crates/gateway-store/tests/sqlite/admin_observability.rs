@@ -1,3 +1,5 @@
+//! SQLite 管理观测、错误筛选及分页合同
+
 use std::sync::Arc;
 
 use chrono::{TimeDelta, Utc};
@@ -14,6 +16,335 @@ use gateway_store::{
     SqliteStoreConfig, sqlite,
     sqlite::{SqliteAdminObservabilityStore, SqliteProviderCooldownRepository},
 };
+
+#[tokio::test]
+async fn ops_errors_preserve_filters_unicode_and_stable_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect_and_migrate(
+        &root.path().join("errors.sqlite3"),
+        &SqliteStoreConfig::default(),
+    )
+    .await
+    .unwrap();
+    let now = Utc::now();
+    let time = now.timestamp_micros();
+    let range = TimeRange::new(now - TimeDelta::minutes(1), now + TimeDelta::minutes(1)).unwrap();
+    sqlx::query("insert into client_api_keys (id,name,key,created_at_us,updated_at_us) values ('key-observability','ÄBC%_测试','synthetic-query-key',?1,?1)").bind(time).execute(&pool).await.unwrap();
+    for id in ["req_A%_one", "req_Axx", "req_null"] {
+        insert_request(
+            &pool,
+            RequestFixture {
+                id,
+                outcome: "failed",
+                model: Some("requested"),
+                cost_source: None,
+                cost_amount: None,
+                cost_currency: None,
+                status: Some(502),
+                total_tokens: None,
+                error_kind: Some("upstream_error"),
+                started_at_us: time - 1,
+                completed_at_us: time,
+            },
+        )
+        .await;
+    }
+    sqlx::query("update model_requests set provider_kind='openai',provider_account_ref='acct_filter',upstream_model_id='upstream',upstream_transport='http_sse',attempt_count=2,upstream_status_code=429,upstream_request_id='Upstream%_',client_response_id=?1 where id='req_A%_one'").bind(b"response-id".as_slice()).execute(&pool).await.unwrap();
+    sqlx::query("insert into ops_events (id,model_request_id,attempt_index,level,component,operation,provider_kind,provider_account_ref,upstream_model_id,failure_kind,status_code,upstream_request_id,message,created_at_us) values ('evt_A%_', 'req_A%_one', 2, 'warning', 'provider', 'responses.create','openai','acct_filter','upstream','upstream_error',429,'Upstream%_','synthetic error',?1)").bind(time).execute(&pool).await.unwrap();
+    let store = SqliteAdminObservabilityStore::new(
+        pool.clone(),
+        Arc::new(SqliteProviderCooldownRepository::new(pool.clone())),
+    );
+    for (filter, expected) in [
+        (OpsErrorFilter::default(), 4),
+        (
+            OpsErrorFilter {
+                request_id: Some("req_A%_one".into()),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                client_api_key_ref: Some("key-observability".into()),
+                ..Default::default()
+            },
+            4,
+        ),
+        (
+            OpsErrorFilter {
+                provider_kind: Some("openai".into()),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                provider_account_ref: Some("acct_filter".into()),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                operation: Some("responses.create".into()),
+                ..Default::default()
+            },
+            4,
+        ),
+        (
+            OpsErrorFilter {
+                model: Some("upstream".into()),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                model: Some("requested".into()),
+                ..Default::default()
+            },
+            0,
+        ),
+        (
+            OpsErrorFilter {
+                transport: Some("http_sse".into()),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            OpsErrorFilter {
+                attempt_index: Some(2),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                status_code: Some(429),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                status_code: Some(502),
+                ..Default::default()
+            },
+            0,
+        ),
+        (
+            OpsErrorFilter {
+                response_id: Some("response-id".into()),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                upstream_request_id: Some("Upstream%_".into()),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                search: Some("req_A%_".into()),
+                ..Default::default()
+            },
+            2,
+        ),
+        (
+            OpsErrorFilter {
+                search: Some("req_a%_".into()),
+                ..Default::default()
+            },
+            0,
+        ),
+        (
+            OpsErrorFilter {
+                search: Some("äbc%_测".into()),
+                ..Default::default()
+            },
+            4,
+        ),
+        (
+            OpsErrorFilter {
+                search: Some("äbcX".into()),
+                ..Default::default()
+            },
+            0,
+        ),
+        (
+            OpsErrorFilter {
+                provider_kind: Some("openai".into()),
+                transport: Some("http_sse".into()),
+                status_code: Some(429),
+                search: Some("äbc".into()),
+                ..Default::default()
+            },
+            1,
+        ),
+    ] {
+        let page = store
+            .list_ops_errors(OpsErrorQuery {
+                range,
+                filter: filter.clone(),
+                current_page: 1,
+                page_size: ObservabilityPageSize::new(20).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, expected, "{filter:?}");
+        assert_eq!(page.items.len() as u64, expected, "{filter:?}");
+    }
+    let mut ids = Vec::new();
+    for current_page in 1..=5 {
+        let page = store
+            .list_ops_errors(OpsErrorQuery {
+                range,
+                filter: OpsErrorFilter::default(),
+                current_page,
+                page_size: ObservabilityPageSize::new(1).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 4);
+        ids.extend(page.items.into_iter().map(|item| item.event_id));
+    }
+    assert_eq!(ids, ["evt_A%_", "req_null", "req_Axx", "req_A%_one"]);
+    // 起点包含、终点排除；没有关联请求的运维事件仍可列出
+    sqlx::query("update model_requests set started_at_us = ?1-2, completed_at_us = case id when 'req_A%_one' then ?1 when 'req_Axx' then ?1-1 else ?2 end")
+        .bind((now-TimeDelta::minutes(1)).timestamp_micros()).bind((now+TimeDelta::minutes(1)).timestamp_micros()).execute(&pool).await.unwrap();
+    sqlx::query("update ops_events set created_at_us = ?")
+        .bind((now + TimeDelta::minutes(1)).timestamp_micros())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("insert into ops_events (id,level,component,operation,failure_kind,message,created_at_us) values ('orphan%_', 'warning', 'provider', 'responses.create', 'upstream_error', 'synthetic orphan', ?)")
+        .bind((now-TimeDelta::minutes(1)).timestamp_micros()).execute(&pool).await.unwrap();
+    for (filter, expected) in [
+        (OpsErrorFilter::default(), 2),
+        (
+            OpsErrorFilter {
+                search: Some("orphan%_".into()),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            OpsErrorFilter {
+                client_api_key_ref: Some("key-observability".into()),
+                ..Default::default()
+            },
+            1,
+        ),
+        (
+            OpsErrorFilter {
+                response_id: Some("response-id".into()),
+                ..Default::default()
+            },
+            1,
+        ),
+    ] {
+        let page = store
+            .list_ops_errors(OpsErrorQuery {
+                range,
+                filter,
+                current_page: 1,
+                page_size: ObservabilityPageSize::new(20).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, expected);
+        assert_eq!(page.items.len() as u64, expected);
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "使用隔离合成数据，手动执行 release 查询基准"]
+async fn ops_error_query_benchmark() {
+    let count: i64 = std::env::var("CPR_BENCH_ROWS")
+        .unwrap_or_else(|_| "10000".into())
+        .parse()
+        .unwrap();
+    assert!([10_000, 100_000].contains(&count));
+    let root = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect_and_migrate(
+        &root.path().join("bench.sqlite3"),
+        &SqliteStoreConfig::default(),
+    )
+    .await
+    .unwrap();
+    let now = Utc::now();
+    let time = now.timestamp_micros();
+    insert_request(
+        &pool,
+        RequestFixture {
+            id: "seed",
+            outcome: "failed",
+            model: Some("model"),
+            cost_source: None,
+            cost_amount: None,
+            cost_currency: None,
+            status: Some(502),
+            total_tokens: None,
+            error_kind: Some("upstream_error"),
+            started_at_us: time - 1,
+            completed_at_us: time,
+        },
+    )
+    .await;
+    sqlx::query("with recursive n(x) as (select 1 union all select x+1 from n where x < ?1) insert into model_requests (id,client_api_key_ref,operation,client_transport,outcome,error_kind,started_at_us,deadline_at_us,completed_at_us,request_observation_json) select printf('req_%08d',x),'synthetic-key','responses.create','http','failed','upstream_error',?2-1,?2+60000000,?2,request_observation_json from n cross join model_requests where id='seed'").bind(count).bind(time).execute(&pool).await.unwrap();
+    sqlx::query("delete from model_requests where id='seed'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = SqliteAdminObservabilityStore::new(
+        pool.clone(),
+        Arc::new(SqliteProviderCooldownRepository::new(pool.clone())),
+    );
+    let range = TimeRange::new(now - TimeDelta::minutes(1), now + TimeDelta::minutes(1)).unwrap();
+    for (name, filter, total) in [
+        ("all", OpsErrorFilter::default(), count as u64),
+        (
+            "exact",
+            OpsErrorFilter {
+                request_id: Some("req_00000001".into()),
+                ..Default::default()
+            },
+            1,
+        ),
+    ] {
+        let mut times = Vec::new();
+        for iteration in 0..12 {
+            let start = std::time::Instant::now();
+            let page = store
+                .list_ops_errors(OpsErrorQuery {
+                    range,
+                    filter: filter.clone(),
+                    current_page: 1,
+                    page_size: ObservabilityPageSize::new(20).unwrap(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(page.total, total);
+            assert_eq!(page.items.len(), usize::try_from(total.min(20)).unwrap());
+            if iteration >= 2 {
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        println!(
+            "BENCH rows={count} query={name} median_ms={:.3} max_ms={:.3}",
+            times[times.len() / 2],
+            times.last().unwrap()
+        );
+    }
+    pool.close().await;
+}
 
 #[tokio::test]
 async fn sqlite_admin_observability_reads_metrics_usage_diagnostics_and_ops_errors() {
