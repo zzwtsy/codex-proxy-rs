@@ -46,7 +46,7 @@ use crate::{
 
 use super::{
     acquire_write_lock, append_admin_audit_event_in_transaction, bump_config_revision,
-    sqlite_unavailable,
+    completed_usage_fact_predicate, sqlite_unavailable,
 };
 
 const fn account_status_sort_rank(status: AccountStatus) -> u8 {
@@ -241,7 +241,7 @@ impl SqliteAdminAccountStore {
             .timestamp_micros()
             .checked_sub(retention_micros)
             .ok_or_else(|| invalid("usage retention range overflows"))?;
-        let rows = sqlx::query(
+        let mut query = QueryBuilder::<Sqlite>::new(
             "select mr.provider_account_ref,
                     coalesce(sum(coalesce(
                       mr.total_tokens,
@@ -250,26 +250,20 @@ impl SqliteAdminAccountStore {
                     max(mr.started_at_us) as last_used_at_us
                from model_requests mr
               where mr.provider_account_ref is not null
-                and mr.started_at_us >= ?1 and mr.started_at_us < ?2
-                and mr.outcome = 'succeeded'
-                and mr.downstream_committed_at_us is not null
-                and (mr.provider_kind is not 'openai' or mr.request_kind is not 'prewarm')
-                and ((mr.client_transport = 'websocket' and mr.client_status_code is null)
-                     or mr.client_status_code between 200 and 399)
-                and mr.recovered_at_us is null
-                and (mr.requested_model_id is not null or mr.upstream_model_id is not null
-                     or mr.image_generation_requested = 1 or mr.input_tokens is not null
-                     or mr.output_tokens is not null or mr.cached_tokens is not null
-                     or mr.cache_write_tokens is not null or mr.reasoning_tokens is not null
-                     or mr.image_input_tokens is not null or mr.image_output_tokens is not null
-                     or mr.total_tokens is not null or mr.cost_amount is not null)
-              group by mr.provider_account_ref",
-        )
-        .bind(start_us)
-        .bind(now.timestamp_micros())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| unavailable("load account usage sort values"))?;
+                and mr.started_at_us >= ",
+        );
+        query
+            .push_bind(start_us)
+            .push(" and mr.started_at_us < ")
+            .push_bind(now.timestamp_micros())
+            .push(" and mr.recovered_at_us is null and (")
+            .push(completed_usage_fact_predicate("mr"))
+            .push(") group by mr.provider_account_ref");
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| unavailable("load account usage sort values"))?;
         let mut values = HashMap::with_capacity(rows.len());
         for row in rows {
             let account_id: String = row
@@ -1203,7 +1197,7 @@ impl OptionalTokenTotal {
 }
 
 #[derive(Default)]
-struct AccountModelUsageAccumulator {
+struct UsageTotals {
     request_count: u64,
     input_tokens: OptionalTokenTotal,
     output_tokens: OptionalTokenTotal,
@@ -1222,26 +1216,37 @@ struct AccountModelUsageAccumulator {
 
 #[derive(Default)]
 struct AccountUsageAccumulator {
-    request_count: u64,
-    input_tokens: OptionalTokenTotal,
-    output_tokens: OptionalTokenTotal,
-    cached_tokens: OptionalTokenTotal,
-    cache_write_tokens: OptionalTokenTotal,
-    reasoning_tokens: OptionalTokenTotal,
-    image_input_tokens: OptionalTokenTotal,
-    image_output_tokens: OptionalTokenTotal,
-    total_tokens: u64,
-    image_request_count: u64,
-    image_request_failed_count: u64,
-    costs: HashMap<String, gateway_core::metering::Decimal>,
-    coverage: CostCoverage,
-    last_used_at: Option<DateTime<Utc>>,
+    totals: UsageTotals,
     buckets: std::collections::BTreeMap<i64, u64>,
-    models: HashMap<String, AccountModelUsageAccumulator>,
+    models: HashMap<String, UsageTotals>,
 }
 
-impl AccountUsageAccumulator {
-    fn add_row(&mut self, row: &sqlx::sqlite::SqliteRow) -> AdminStoreResult<()> {
+#[derive(Clone, Copy)]
+enum UsageAggregate {
+    Account,
+    Model,
+}
+
+struct UsageFact {
+    input: Option<i64>,
+    output: Option<i64>,
+    cached: Option<i64>,
+    cache_write: Option<i64>,
+    reasoning: Option<i64>,
+    image_input: Option<i64>,
+    image_output: Option<i64>,
+    token_total: u64,
+    started_at_us: i64,
+    started_at: DateTime<Utc>,
+    model: Option<String>,
+    image_succeeded: Option<i64>,
+    cost_source: String,
+    cost_currency: Option<String>,
+    cost: Option<gateway_core::metering::Decimal>,
+}
+
+impl UsageFact {
+    fn decode(row: &sqlx::sqlite::SqliteRow) -> AdminStoreResult<Self> {
         let input: Option<i64> = row
             .try_get("input_tokens")
             .map_err(|_| unavailable("decode account usage tokens"))?;
@@ -1298,98 +1303,129 @@ impl AccountUsageAccumulator {
             })
             .transpose()?;
 
-        self.request_count = checked_inc(self.request_count, "account request count")?;
-        self.input_tokens.add(input)?;
-        self.output_tokens.add(output)?;
-        self.cached_tokens.add(cached)?;
-        self.cache_write_tokens.add(cache_write)?;
-        self.reasoning_tokens.add(reasoning)?;
-        self.image_input_tokens.add(image_input)?;
-        self.image_output_tokens.add(image_output)?;
+        Ok(Self {
+            input,
+            output,
+            cached,
+            cache_write,
+            reasoning,
+            image_input,
+            image_output,
+            token_total,
+            started_at_us,
+            started_at,
+            model,
+            image_succeeded,
+            cost_source,
+            cost_currency,
+            cost,
+        })
+    }
+}
+
+impl UsageTotals {
+    fn add(&mut self, fact: &UsageFact, aggregate: UsageAggregate) -> AdminStoreResult<()> {
+        let (request_count_error, token_total_error) = match aggregate {
+            UsageAggregate::Account => ("account request count", "account token total overflows"),
+            UsageAggregate::Model => ("account model request count", "model token total overflows"),
+        };
+        self.request_count = checked_inc(self.request_count, request_count_error)?;
+        self.input_tokens.add(fact.input)?;
+        self.output_tokens.add(fact.output)?;
+        self.cached_tokens.add(fact.cached)?;
+        self.cache_write_tokens.add(fact.cache_write)?;
+        self.reasoning_tokens.add(fact.reasoning)?;
+        self.image_input_tokens.add(fact.image_input)?;
+        self.image_output_tokens.add(fact.image_output)?;
         self.total_tokens = self
             .total_tokens
-            .checked_add(token_total)
-            .ok_or_else(|| invalid("account token total overflows"))?;
+            .checked_add(fact.token_total)
+            .ok_or_else(|| invalid(token_total_error))?;
         self.image_request_count = self
             .image_request_count
-            .checked_add(u64::from(image_succeeded == Some(1)))
+            .checked_add(u64::from(fact.image_succeeded == Some(1)))
             .ok_or_else(|| invalid("image request count overflows"))?;
         self.image_request_failed_count = self
             .image_request_failed_count
-            .checked_add(u64::from(image_succeeded == Some(0)))
+            .checked_add(u64::from(fact.image_succeeded == Some(0)))
             .ok_or_else(|| invalid("failed image request count overflows"))?;
-        add_cost_source(&mut self.coverage, &cost_source)?;
-        if let (Some(currency), Some(cost)) = (cost_currency.as_deref(), cost.as_ref()) {
-            add_amount(&mut self.costs, currency, *cost)?;
+        add_cost_source(&mut self.coverage, &fact.cost_source)?;
+        if let (Some(currency), Some(cost)) = (fact.cost_currency.as_deref(), fact.cost) {
+            add_amount(&mut self.costs, currency, cost)?;
         }
         self.last_used_at = Some(
             self.last_used_at
-                .map_or(started_at, |value| value.max(started_at)),
+                .map_or(fact.started_at, |value| value.max(fact.started_at)),
         );
-        let hour = started_at_us.div_euclid(3_600_000_000);
+        Ok(())
+    }
+
+    fn finish_model(self, model: String) -> AdminStoreResult<AccountModelUsage> {
+        Ok(AccountModelUsage {
+            model,
+            request_count: self.request_count,
+            success_count: self.request_count,
+            input_tokens: self.input_tokens.finish(),
+            output_tokens: self.output_tokens.finish(),
+            cached_tokens: self.cached_tokens.finish(),
+            cache_write_tokens: self.cache_write_tokens.finish(),
+            reasoning_tokens: self.reasoning_tokens.finish(),
+            image_input_tokens: self.image_input_tokens.finish(),
+            image_output_tokens: self.image_output_tokens.finish(),
+            image_request_count: self.image_request_count,
+            image_request_failed_count: self.image_request_failed_count,
+            total_tokens: Some(self.total_tokens),
+            cost_coverage: self.coverage,
+            costs: finish_costs(self.costs)?,
+            last_used_at: self
+                .last_used_at
+                .ok_or_else(|| invalid("model usage timestamp is missing"))?,
+        })
+    }
+
+    fn finish_account(
+        self,
+        account_id: &str,
+        request_buckets: Vec<AccountRequestBucket>,
+        models: Vec<AccountModelUsage>,
+    ) -> AdminStoreResult<AccountUsage> {
+        Ok(AccountUsage {
+            account_id: account_id.to_owned(),
+            request_count: self.request_count,
+            success_count: self.request_count,
+            input_tokens: self.input_tokens.finish(),
+            output_tokens: self.output_tokens.finish(),
+            cached_tokens: self.cached_tokens.finish(),
+            cache_write_tokens: self.cache_write_tokens.finish(),
+            reasoning_tokens: self.reasoning_tokens.finish(),
+            image_input_tokens: self.image_input_tokens.finish(),
+            image_output_tokens: self.image_output_tokens.finish(),
+            image_request_count: self.image_request_count,
+            image_request_failed_count: self.image_request_failed_count,
+            total_tokens: Some(self.total_tokens),
+            cost_coverage: self.coverage,
+            costs: finish_costs(self.costs)?,
+            last_used_at: self.last_used_at,
+            request_buckets,
+            models,
+        })
+    }
+}
+
+impl AccountUsageAccumulator {
+    fn add_row(&mut self, row: &sqlx::sqlite::SqliteRow) -> AdminStoreResult<()> {
+        let fact = UsageFact::decode(row)?;
+        self.totals.add(&fact, UsageAggregate::Account)?;
+        let hour = fact.started_at_us.div_euclid(3_600_000_000);
         *self.buckets.entry(hour).or_default() = checked_inc(
             self.buckets.get(&hour).copied().unwrap_or_default(),
             "account request bucket",
         )?;
-        if let (Some(model), Some(currency), Some(cost)) =
-            (model.clone(), cost_currency.clone(), cost)
-        {
-            let usage = self.models.entry(model).or_default();
-            usage.request_count = checked_inc(usage.request_count, "account model request count")?;
-            usage.input_tokens.add(input)?;
-            usage.output_tokens.add(output)?;
-            usage.cached_tokens.add(cached)?;
-            usage.cache_write_tokens.add(cache_write)?;
-            usage.reasoning_tokens.add(reasoning)?;
-            usage.image_input_tokens.add(image_input)?;
-            usage.image_output_tokens.add(image_output)?;
-            usage.total_tokens = usage
-                .total_tokens
-                .checked_add(token_total)
-                .ok_or_else(|| invalid("model token total overflows"))?;
-            usage.image_request_count = usage
-                .image_request_count
-                .checked_add(u64::from(image_succeeded == Some(1)))
-                .ok_or_else(|| invalid("image request count overflows"))?;
-            usage.image_request_failed_count = usage
-                .image_request_failed_count
-                .checked_add(u64::from(image_succeeded == Some(0)))
-                .ok_or_else(|| invalid("failed image request count overflows"))?;
-            add_cost_source(&mut usage.coverage, &cost_source)?;
-            usage.last_used_at = Some(
-                usage
-                    .last_used_at
-                    .map_or(started_at, |value| value.max(started_at)),
-            );
-            add_amount(&mut usage.costs, &currency, cost)?;
-        } else if let Some(model) = model {
-            let usage = self.models.entry(model).or_default();
-            usage.request_count = checked_inc(usage.request_count, "account model request count")?;
-            usage.input_tokens.add(input)?;
-            usage.output_tokens.add(output)?;
-            usage.cached_tokens.add(cached)?;
-            usage.cache_write_tokens.add(cache_write)?;
-            usage.reasoning_tokens.add(reasoning)?;
-            usage.image_input_tokens.add(image_input)?;
-            usage.image_output_tokens.add(image_output)?;
-            usage.total_tokens = usage
-                .total_tokens
-                .checked_add(token_total)
-                .ok_or_else(|| invalid("model token total overflows"))?;
-            usage.image_request_count = usage
-                .image_request_count
-                .checked_add(u64::from(image_succeeded == Some(1)))
-                .ok_or_else(|| invalid("image request count overflows"))?;
-            usage.image_request_failed_count = usage
-                .image_request_failed_count
-                .checked_add(u64::from(image_succeeded == Some(0)))
-                .ok_or_else(|| invalid("failed image request count overflows"))?;
-            add_cost_source(&mut usage.coverage, &cost_source)?;
-            usage.last_used_at = Some(
-                usage
-                    .last_used_at
-                    .map_or(started_at, |value| value.max(started_at)),
-            );
+        if let Some(model) = fact.model.as_ref() {
+            self.models
+                .entry(model.clone())
+                .or_default()
+                .add(&fact, UsageAggregate::Model)?;
         }
         Ok(())
     }
@@ -1398,28 +1434,7 @@ impl AccountUsageAccumulator {
         let mut models = self
             .models
             .into_iter()
-            .map(|(model, usage)| {
-                Ok(AccountModelUsage {
-                    model,
-                    request_count: usage.request_count,
-                    success_count: usage.request_count,
-                    input_tokens: usage.input_tokens.finish(),
-                    output_tokens: usage.output_tokens.finish(),
-                    cached_tokens: usage.cached_tokens.finish(),
-                    cache_write_tokens: usage.cache_write_tokens.finish(),
-                    reasoning_tokens: usage.reasoning_tokens.finish(),
-                    image_input_tokens: usage.image_input_tokens.finish(),
-                    image_output_tokens: usage.image_output_tokens.finish(),
-                    image_request_count: usage.image_request_count,
-                    image_request_failed_count: usage.image_request_failed_count,
-                    total_tokens: Some(usage.total_tokens),
-                    cost_coverage: usage.coverage,
-                    costs: finish_costs(usage.costs)?,
-                    last_used_at: usage
-                        .last_used_at
-                        .ok_or_else(|| invalid("model usage timestamp is missing"))?,
-                })
-            })
+            .map(|(model, totals)| totals.finish_model(model))
             .collect::<AdminStoreResult<Vec<_>>>()?;
         models.sort_by(|left, right| {
             right
@@ -1442,26 +1457,8 @@ impl AccountUsageAccumulator {
                 })
             })
             .collect::<AdminStoreResult<Vec<_>>>()?;
-        Ok(AccountUsage {
-            account_id: account_id.to_owned(),
-            request_count: self.request_count,
-            success_count: self.request_count,
-            input_tokens: self.input_tokens.finish(),
-            output_tokens: self.output_tokens.finish(),
-            cached_tokens: self.cached_tokens.finish(),
-            cache_write_tokens: self.cache_write_tokens.finish(),
-            reasoning_tokens: self.reasoning_tokens.finish(),
-            image_input_tokens: self.image_input_tokens.finish(),
-            image_output_tokens: self.image_output_tokens.finish(),
-            image_request_count: self.image_request_count,
-            image_request_failed_count: self.image_request_failed_count,
-            total_tokens: Some(self.total_tokens),
-            cost_coverage: self.coverage,
-            costs: finish_costs(self.costs)?,
-            last_used_at: self.last_used_at,
-            request_buckets,
-            models,
-        })
+        self.totals
+            .finish_account(account_id, request_buckets, models)
     }
 }
 
@@ -1534,23 +1531,31 @@ async fn load_quota_forecast_history(
     }
     let start_us = window.range.start.timestamp_micros();
     let end_us = window.range.end.timestamp_micros();
-    let rows = sqlx::query(
-        "select id, started_at_us, completed_at_us, outcome, provider_observation_json,
-                input_tokens, output_tokens, cached_tokens, total_tokens, cost_source,
-                cost_amount, cost_currency, provider_kind, request_kind, downstream_committed_at_us,
-                client_transport, client_status_code, requested_model_id, upstream_model_id,
-                image_generation_requested, recovered_at_us, cache_write_tokens, reasoning_tokens,
-                image_input_tokens, image_output_tokens
-           from model_requests
-          where provider_account_ref = ?1 and started_at_us >= ?2 and started_at_us < ?3
-          order by completed_at_us, id",
-    )
-    .bind(&window.account_id)
-    .bind(start_us)
-    .bind(end_us)
-    .fetch_all(pool)
-    .await
-    .map_err(|_| unavailable("load quota forecast history"))?;
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "select mr.id, mr.started_at_us, mr.completed_at_us, mr.outcome,
+                mr.provider_observation_json, mr.input_tokens, mr.output_tokens,
+                mr.cached_tokens, mr.total_tokens, mr.cost_source, mr.cost_amount,
+                mr.cost_currency,
+                case when (",
+    );
+    query
+        .push(completed_usage_fact_predicate("mr"))
+        .push(
+            ") and mr.recovered_at_us is null then 1 else 0 end as usage_included
+           from model_requests mr
+          where mr.provider_account_ref = ",
+        )
+        .push_bind(&window.account_id)
+        .push(" and mr.started_at_us >= ")
+        .push_bind(start_us)
+        .push(" and mr.started_at_us < ")
+        .push_bind(end_us)
+        .push(" order by mr.completed_at_us, mr.id");
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| unavailable("load quota forecast history"))?;
 
     let mut by_completed_at =
         std::collections::BTreeMap::<i64, Vec<sqlx::sqlite::SqliteRow>>::new();
@@ -1583,7 +1588,10 @@ async fn load_quota_forecast_history(
         let mut latest_document = None;
         let mut group_start = None;
         for row in &group {
-            let included = sqlite_completed_usage_fact(row)?;
+            let included: i64 = row
+                .try_get("usage_included")
+                .map_err(|_| unavailable("decode quota forecast usage eligibility"))?;
+            let included = included != 0;
             if included {
                 cumulative.request_count =
                     checked_inc(cumulative.request_count, "forecast request count")?;
@@ -1718,84 +1726,6 @@ fn document_id(row: &sqlx::sqlite::SqliteRow) -> AdminStoreResult<String> {
         .map_err(|_| unavailable("decode quota forecast request ID"))
 }
 
-fn sqlite_completed_usage_fact(row: &sqlx::sqlite::SqliteRow) -> AdminStoreResult<bool> {
-    let outcome: String = row
-        .try_get("outcome")
-        .map_err(|_| unavailable("decode usage outcome"))?;
-    let committed: Option<i64> = row
-        .try_get("downstream_committed_at_us")
-        .map_err(|_| unavailable("decode usage commit"))?;
-    let provider: Option<String> = row
-        .try_get("provider_kind")
-        .map_err(|_| unavailable("decode usage Provider"))?;
-    let request_kind: Option<String> = row
-        .try_get("request_kind")
-        .map_err(|_| unavailable("decode usage kind"))?;
-    let transport: String = row
-        .try_get("client_transport")
-        .map_err(|_| unavailable("decode usage transport"))?;
-    let client_status: Option<i64> = row
-        .try_get("client_status_code")
-        .map_err(|_| unavailable("decode usage status"))?;
-    let requested: Option<String> = row
-        .try_get("requested_model_id")
-        .map_err(|_| unavailable("decode usage model"))?;
-    let upstream: Option<String> = row
-        .try_get("upstream_model_id")
-        .map_err(|_| unavailable("decode usage model"))?;
-    let image: i64 = row
-        .try_get("image_generation_requested")
-        .map_err(|_| unavailable("decode image usage intent"))?;
-    let input: Option<i64> = row
-        .try_get("input_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let output: Option<i64> = row
-        .try_get("output_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let cached: Option<i64> = row
-        .try_get("cached_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let cache_write: Option<i64> = row
-        .try_get("cache_write_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let reasoning: Option<i64> = row
-        .try_get("reasoning_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let image_input: Option<i64> = row
-        .try_get("image_input_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let image_output: Option<i64> = row
-        .try_get("image_output_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let total: Option<i64> = row
-        .try_get("total_tokens")
-        .map_err(|_| unavailable("decode usage tokens"))?;
-    let cost: Option<String> = row
-        .try_get("cost_amount")
-        .map_err(|_| unavailable("decode usage cost"))?;
-    let recovered: Option<i64> = row
-        .try_get("recovered_at_us")
-        .map_err(|_| unavailable("decode recovery state"))?;
-    Ok(outcome == "succeeded"
-        && committed.is_some()
-        && recovered.is_none()
-        && !(provider.as_deref() == Some("openai") && request_kind.as_deref() == Some("prewarm"))
-        && ((transport == "websocket" && client_status.is_none())
-            || client_status.is_some_and(|status| (200..=399).contains(&status)))
-        && (requested.is_some()
-            || upstream.is_some()
-            || image != 0
-            || input.is_some()
-            || output.is_some()
-            || cached.is_some()
-            || cache_write.is_some()
-            || reasoning.is_some()
-            || image_input.is_some()
-            || image_output.is_some()
-            || total.is_some()
-            || cost.is_some()))
-}
-
 async fn account_usage_in_range(
     pool: &SqlitePool,
     account_id: &str,
@@ -1804,33 +1734,29 @@ async fn account_usage_in_range(
     if range.start >= range.end {
         return Err(invalid("usage range must be positive"));
     }
-    let rows = sqlx::query(
-        "select coalesce(upstream_model_id, requested_model_id) as model,
-                input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens,
-                image_input_tokens, image_output_tokens, image_generation_succeeded, total_tokens,
-                cost_source, cost_amount, cost_currency, started_at_us
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "select coalesce(mr.upstream_model_id, mr.requested_model_id) as model,
+                mr.input_tokens, mr.output_tokens, mr.cached_tokens,
+                mr.cache_write_tokens, mr.reasoning_tokens, mr.image_input_tokens,
+                mr.image_output_tokens, mr.image_generation_succeeded, mr.total_tokens,
+                mr.cost_source, mr.cost_amount, mr.cost_currency, mr.started_at_us
            from model_requests mr
-          where provider_account_ref = ?1
-            and started_at_us >= ?2 and started_at_us < ?3
-            and outcome = 'succeeded' and downstream_committed_at_us is not null
-            and (provider_kind is not 'openai' or request_kind is not 'prewarm')
-            and ((client_transport = 'websocket' and client_status_code is null)
-                 or client_status_code between 200 and 399)
-            and recovered_at_us is null
-            and (requested_model_id is not null or upstream_model_id is not null
-                 or image_generation_requested = 1 or input_tokens is not null
-                 or output_tokens is not null or cached_tokens is not null
-                 or cache_write_tokens is not null or reasoning_tokens is not null
-                 or image_input_tokens is not null or image_output_tokens is not null
-                 or total_tokens is not null or cost_amount is not null)
-          order by started_at_us, id",
-    )
-    .bind(account_id)
-    .bind(range.start.timestamp_micros())
-    .bind(range.end.timestamp_micros())
-    .fetch_all(pool)
-    .await
-    .map_err(|_| unavailable("load account usage"))?;
+          where mr.provider_account_ref = ",
+    );
+    query
+        .push_bind(account_id)
+        .push(" and mr.started_at_us >= ")
+        .push_bind(range.start.timestamp_micros())
+        .push(" and mr.started_at_us < ")
+        .push_bind(range.end.timestamp_micros())
+        .push(" and mr.recovered_at_us is null and (")
+        .push(completed_usage_fact_predicate("mr"))
+        .push(") order by mr.started_at_us, mr.id");
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| unavailable("load account usage"))?;
     let mut usage = AccountUsageAccumulator::default();
     for row in &rows {
         usage.add_row(row)?;

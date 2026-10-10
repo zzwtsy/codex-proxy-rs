@@ -37,6 +37,7 @@ mod runtime_change;
 mod runtime_settings;
 pub(crate) mod session_cleanup;
 mod snapshot;
+mod usage_facts;
 pub use account_groups::SqliteAccountGroupRepository;
 pub use admin_accounts::SqliteAdminAccountStore;
 pub use admin_client_keys::SqliteAdminClientKeyStore;
@@ -70,6 +71,7 @@ pub use runtime_cache::SqliteProviderRuntimeCache;
 pub use runtime_change::SqliteRuntimeChangeRepository;
 pub use runtime_settings::SqliteRuntimeSettingsRepository;
 pub use snapshot::SqliteRuntimeSnapshotRepository;
+pub(crate) use usage_facts::completed_usage_fact_predicate;
 pub mod value;
 
 use sqlx::{

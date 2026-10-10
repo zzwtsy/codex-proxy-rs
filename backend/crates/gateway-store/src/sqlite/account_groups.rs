@@ -31,7 +31,7 @@ use gateway_core::{
     metering::Decimal,
     routing::AccountGroupId,
 };
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 
 use crate::{
     AdminAuditEvent, ConflictKind, Revision, StoreError, StoreResult, admin_revision,
@@ -39,8 +39,8 @@ use crate::{
 };
 
 use super::{
-    acquire_write_lock, append_admin_audit_event_in_transaction, name_key::normalize_name_key,
-    sqlite_unavailable, value::datetime_from_micros,
+    acquire_write_lock, append_admin_audit_event_in_transaction, completed_usage_fact_predicate,
+    name_key::normalize_name_key, sqlite_unavailable, value::datetime_from_micros,
 };
 
 const ENTITY: &str = "account group";
@@ -723,32 +723,29 @@ async fn group_usage(
     );
     let encoded_ids =
         serde_json::to_string(group_ids).map_err(|_| invalid_admin("invalid account group IDs"))?;
-    let rows = sqlx::query(
+    let mut query = QueryBuilder::<Sqlite>::new(
         "select membership.account_group_id, request.cost_amount, request.started_at_us
          from account_group_accounts membership
          join model_request_observations request
            on request.provider_account_ref = membership.provider_account_id
-         where membership.account_group_id in (select value from json_each(?1))
-           and request.started_at_us >= ?2
-           and request.outcome = 'succeeded'
-           and request.downstream_committed_at_us is not null
-           and (request.provider_kind is not 'openai' or request.request_kind is not 'prewarm')
-           and ((request.client_transport = 'websocket' and request.client_status_code is null)
-             or request.client_status_code between 200 and 399)
-           and (request.requested_model_id is not null or request.upstream_model_id is not null
-             or request.image_generation_requested = 1 or request.input_tokens is not null
-             or request.output_tokens is not null or request.cached_tokens is not null
-             or request.cache_write_tokens is not null or request.reasoning_tokens is not null
-             or request.image_input_tokens is not null or request.image_output_tokens is not null
-             or request.total_tokens is not null or request.cost_amount is not null)
+         where membership.account_group_id in (select value from json_each(",
+    );
+    query
+        .push_bind(encoded_ids)
+        .push(")) and request.started_at_us >= ")
+        .push_bind(retention_cutoff)
+        .push(" and (")
+        .push(completed_usage_fact_predicate("request"))
+        .push(
+            ")
            and request.cost_currency = 'USD' and request.cost_amount is not null
          order by membership.account_group_id, request.id",
-    )
-    .bind(encoded_ids)
-    .bind(retention_cutoff)
-    .fetch_all(pool)
-    .await
-    .map_err(|_| unavailable_admin("load account group costs"))?;
+        );
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| unavailable_admin("load account group costs"))?;
     let mut totals: BTreeMap<String, (Decimal, Decimal)> = BTreeMap::new();
     for row in rows {
         let group_id = read_text(&row, "account_group_id")

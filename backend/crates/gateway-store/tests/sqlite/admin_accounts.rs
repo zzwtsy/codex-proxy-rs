@@ -793,3 +793,454 @@ async fn sqlite_account_usage_aggregates_exact_costs_and_sorts_accounts() {
     assert_eq!(page.items[0].account.id, "acct_usage_a");
     pool.close().await;
 }
+
+#[tokio::test]
+async fn sqlite_usage_facts_agree_across_account_group_and_forecast_queries() {
+    use chrono::{Duration, Utc};
+    use gateway_admin::model::{
+        PageSize,
+        account_groups::{AccountGroupColor, AccountGroupListQuery, NewAccountGroup},
+        accounts::{AccountSort, AccountSortField, AccountUsageWindowQuery, SortDirection},
+        observability::TimeRange,
+    };
+    use gateway_admin::ports::store::AccountGroupStore;
+    use gateway_core::account::{
+        CredentialRevision, NewProviderAccount, PlaintextCredential, ProviderAccount,
+        ProviderAccountId, ProviderAccountStore,
+    };
+    use gateway_store::sqlite::SqliteAccountGroupRepository;
+
+    let root = tempfile::tempdir().expect("SQLite directory");
+    let pool = sqlite::connect_and_migrate(
+        &root.path().join("usage-facts-matrix.sqlite3"),
+        &SqliteStoreConfig::default(),
+    )
+    .await
+    .expect("migrate SQLite");
+    let provider = ProviderKind::new("example").unwrap();
+    let accounts = SqliteProviderAccountRepository::new(pool.clone());
+    for (id, name) in [
+        ("acct_usage_matrix_a", "matrix-a"),
+        ("acct_usage_matrix_b", "matrix-b"),
+    ] {
+        ProviderAccountStore::create_account(
+            &accounts,
+            NewProviderAccount {
+                account: ProviderAccount::new(
+                    ProviderAccountId::new(id).unwrap(),
+                    provider.clone(),
+                    name.to_owned(),
+                    None,
+                    "api_key".to_owned(),
+                    CredentialRevision::new(1).unwrap(),
+                    None,
+                ),
+                credential: PlaintextCredential::new(
+                    serde_json::json!({"token":"test"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                model_access: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let group =
+        gateway_core::routing::AccountGroupId::new("grp_0123456789abcdef0123456789abcdef").unwrap();
+    let groups = SqliteAccountGroupRepository::new(pool.clone());
+    groups
+        .create_account_group(
+            NewAccountGroup {
+                id: group.clone(),
+                name: "Usage facts".to_owned(),
+                description: None,
+                color: AccountGroupColor::parse("#2563EBFF").unwrap(),
+                fast_mode: gateway_core::account::FastMode::Default,
+            },
+            &gateway_admin::model::MutationContext {
+                actor: gateway_admin::model::MutationActor::System,
+                request_id: "usage-facts-group-create".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let now_us = now.timestamp_micros();
+    sqlx::query(
+        "insert into account_group_accounts (account_group_id, provider_account_id, created_at_us)
+         values (?1, 'acct_usage_matrix_a', ?2)",
+    )
+    .bind(group.as_str())
+    .bind(now_us)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let start_us = now_us - 15 * 60 * 1_000_000;
+    let facts = [
+        UsageMatrixFact {
+            id: "matrix_http_success",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: Some(200),
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            total_tokens: Some(100),
+            image_generation_succeeded: None,
+            amount: Some("0.12500001"),
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_websocket_success",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "websocket",
+            status: None,
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: Some(50),
+            output_tokens: Some(0),
+            total_tokens: Some(50),
+            image_generation_succeeded: None,
+            amount: Some("0.00000002"),
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_image_intent",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: None,
+            transport: "http_sse",
+            status: Some(201),
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            image_generation_succeeded: Some(1),
+            amount: Some("0.00000003"),
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_no_usage_evidence",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: None,
+            transport: "http_sse",
+            status: Some(200),
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            image_generation_succeeded: None,
+            amount: None,
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_http_failure_status",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: Some(500),
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: Some(8),
+            output_tokens: Some(0),
+            total_tokens: Some(8),
+            image_generation_succeeded: None,
+            amount: Some("0.00000005"),
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_failed_outcome",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: Some(200),
+            outcome: "failed",
+            request_kind: None,
+            input_tokens: Some(7),
+            output_tokens: Some(0),
+            total_tokens: Some(7),
+            image_generation_succeeded: None,
+            amount: Some("0.00000006"),
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_openai_prewarm",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "openai",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: Some(200),
+            outcome: "succeeded",
+            request_kind: Some("prewarm"),
+            input_tokens: Some(9),
+            output_tokens: Some(0),
+            total_tokens: Some(9),
+            image_generation_succeeded: None,
+            amount: Some("0.00000007"),
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_recovered",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: Some(200),
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: Some(11),
+            output_tokens: Some(0),
+            total_tokens: Some(11),
+            image_generation_succeeded: None,
+            amount: Some("0.00000004"),
+            recovered: true,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_missing_tokens_and_cost",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: Some(200),
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            image_generation_succeeded: None,
+            amount: None,
+            recovered: false,
+            pending: false,
+        },
+        UsageMatrixFact {
+            id: "matrix_pending",
+            account_id: "acct_usage_matrix_a",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: None,
+            outcome: "running",
+            request_kind: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            image_generation_succeeded: None,
+            amount: None,
+            recovered: false,
+            pending: true,
+        },
+        UsageMatrixFact {
+            id: "matrix_other_account",
+            account_id: "acct_usage_matrix_b",
+            provider_kind: "example",
+            model: Some("gpt-matrix"),
+            transport: "http_sse",
+            status: Some(200),
+            outcome: "succeeded",
+            request_kind: None,
+            input_tokens: Some(155),
+            output_tokens: Some(0),
+            total_tokens: Some(155),
+            image_generation_succeeded: None,
+            amount: Some("0.00000001"),
+            recovered: false,
+            pending: false,
+        },
+    ];
+    for (index, fact) in facts.into_iter().enumerate() {
+        insert_usage_matrix_fact(&pool, fact, start_us + index as i64 * 10_000_000).await;
+    }
+
+    let store = SqliteAdminAccountStore::new(pool.clone());
+    let range = TimeRange::new(now - Duration::hours(1), now + Duration::hours(1)).unwrap();
+    let account_usage = store
+        .load_account_usage(range, &["acct_usage_matrix_a".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(account_usage[0].request_count, 4);
+    assert_eq!(account_usage[0].total_tokens, Some(150));
+    assert_eq!(account_usage[0].costs[0].amount.as_str(), "0.12500006");
+    assert_eq!(account_usage[0].models[0].request_count, 3);
+    assert_eq!(account_usage[0].models[0].input_tokens, Some(150));
+
+    let page = store
+        .list_accounts(
+            AccountListQuery {
+                page: 1,
+                page_size: PageSize::new(20).unwrap(),
+                provider_kind: Some(provider),
+                group_filter: None,
+                search: None,
+                status: None,
+                sort: Some(AccountSort {
+                    field: AccountSortField::Usage,
+                    direction: SortDirection::Desc,
+                }),
+            },
+            AccountRuntimeSnapshot::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items[0].account.id, "acct_usage_matrix_b");
+    assert_eq!(page.items[1].account.id, "acct_usage_matrix_a");
+
+    let group_page = groups
+        .list_account_groups(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).unwrap(),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .unwrap();
+    // 分组成本查询沿用现有资格合同，其中恢复请求仍计入保留成本
+    assert_eq!(
+        group_page.items[0].usage.retained_total_usd.as_str(),
+        "0.1250001"
+    );
+
+    let history = store
+        .load_quota_forecast_history(&AccountUsageWindowQuery {
+            account_id: "acct_usage_matrix_a".to_owned(),
+            key: "matrix".to_owned(),
+            range,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.usage.request_count, 4);
+    assert_eq!(history.usage.tokens, 150);
+    assert_eq!(history.usage.missing_token_count, 2);
+    assert_eq!(history.usage.known_cost_count, 3);
+    assert_eq!(history.usage.unavailable_cost_count, 1);
+    assert!((history.usage.usd - 0.12500006).abs() < f64::EPSILON);
+    assert_eq!(history.usage.excluded_request_count, 5);
+    assert_eq!(history.pending_request_count, 1);
+    pool.close().await;
+}
+
+#[derive(Clone, Copy)]
+struct UsageMatrixFact<'a> {
+    id: &'a str,
+    account_id: &'a str,
+    provider_kind: &'a str,
+    model: Option<&'a str>,
+    transport: &'a str,
+    status: Option<i64>,
+    outcome: &'a str,
+    request_kind: Option<&'a str>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    image_generation_succeeded: Option<i64>,
+    amount: Option<&'a str>,
+    recovered: bool,
+    pending: bool,
+}
+
+async fn insert_usage_matrix_fact(
+    pool: &sqlx::SqlitePool,
+    fact: UsageMatrixFact<'_>,
+    started_at_us: i64,
+) {
+    use std::str::FromStr as _;
+
+    let completed_at_us = (!fact.pending).then_some(started_at_us + 1_000_000);
+    let committed_at_us = (!fact.pending).then_some(started_at_us + 500_000);
+    let recovered_at_us = fact
+        .recovered
+        .then(|| completed_at_us.expect("recovered fact is complete") + 1_000_000);
+    let recovery_request_id = fact.recovered.then_some("matrix-recovery");
+    let recovery_attempt_count = i64::from(fact.recovered);
+    let amount = fact.amount.map(|amount| {
+        gateway_store::sqlite::value::encode_amount(
+            gateway_core::metering::Decimal::from_str(amount).unwrap(),
+        )
+    });
+    let cost_source = if amount.is_some() {
+        "provider_reported"
+    } else {
+        "unavailable"
+    };
+    let currency = fact.amount.map(|_| "USD");
+    let image_requested = i64::from(fact.image_generation_succeeded.is_some());
+    sqlx::query(
+        "insert into model_requests (
+           id, client_api_key_ref, operation, client_transport, requested_model_id,
+           provider_kind, upstream_model_id, provider_account_ref, upstream_transport,
+           attempt_count, upstream_send_state, downstream_committed_at_us, outcome,
+           client_status_code, input_tokens, output_tokens, total_tokens, cost_source,
+           cost_amount, cost_currency, started_at_us, deadline_at_us, completed_at_us,
+           request_kind, image_generation_requested, image_generation_succeeded,
+           recovery_request_id, recovered_at_us, recovery_attempt_count, provider_observation_json,
+           request_observation_json
+         ) values (
+           ?1, 'key_usage_matrix', 'generate', ?2, ?3, ?4, ?3, ?5, ?2, 1, 'sent',
+           ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+           ?21, ?22, ?23, '{}',
+           json_object('request', json_object('configRevision', 1, 'protocol', 'openai',
+             'endpoint', '/v1/responses', 'compact', json('false')),
+             'routing', json_object('scope', 'all', 'groupRefs', json('[]'),
+             'groupNamesSnapshot', json('[]')))
+         )",
+    )
+    .bind(fact.id)
+    .bind(fact.transport)
+    .bind(fact.model)
+    .bind(fact.provider_kind)
+    .bind(fact.account_id)
+    .bind(committed_at_us)
+    .bind(fact.outcome)
+    .bind(fact.status)
+    .bind(fact.input_tokens)
+    .bind(fact.output_tokens)
+    .bind(fact.total_tokens)
+    .bind(cost_source)
+    .bind(amount)
+    .bind(currency)
+    .bind(started_at_us)
+    .bind(started_at_us + 60_000_000)
+    .bind(completed_at_us)
+    .bind(fact.request_kind)
+    .bind(image_requested)
+    .bind(fact.image_generation_succeeded)
+    .bind(recovery_request_id)
+    .bind(recovered_at_us)
+    .bind(recovery_attempt_count)
+    .execute(pool)
+    .await
+    .unwrap();
+    if fact.recovered {
+        sqlx::query(
+            "update model_requests set request_observation_json = json_set(
+               request_observation_json, '$.recovery.retryDelayMs', 0,
+               '$.recovery.totalLatencyMs', 0
+             ) where id = ?1",
+        )
+        .bind(fact.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
