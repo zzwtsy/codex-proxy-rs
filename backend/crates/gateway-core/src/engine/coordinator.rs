@@ -345,9 +345,8 @@ where
             request_profiles: BTreeMap::new(),
             current: None,
             send_state_watermark: UpstreamSendState::NotSent,
-            downstream_committed_at: None,
+            delivery_state: DeliveryState::Uncommitted,
             client_status_code: None,
-            delivery_pending: false,
             upstream_complete: false,
             finalization: None,
             finalized_at: None,
@@ -409,6 +408,107 @@ struct PendingAttemptRetry {
     transport: AttemptTransport,
     delay: Duration,
     transport_recovery: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryState {
+    Uncommitted,
+    PendingCommit,
+    Committed(SystemTime),
+}
+
+impl DeliveryState {
+    const fn is_pending_commit(self) -> bool {
+        matches!(self, Self::PendingCommit)
+    }
+
+    const fn is_committed(self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+
+    const fn is_uncommitted(self) -> bool {
+        matches!(self, Self::Uncommitted)
+    }
+
+    const fn committed_at(self) -> Option<SystemTime> {
+        match self {
+            Self::Committed(at) => Some(at),
+            Self::Uncommitted | Self::PendingCommit => None,
+        }
+    }
+
+    fn begin_delivery(&mut self) -> Option<CommitRequirement> {
+        match self {
+            Self::Uncommitted => {
+                *self = Self::PendingCommit;
+                Some(CommitRequirement::CommitBeforeDelivery)
+            }
+            Self::PendingCommit => None,
+            Self::Committed(_) => Some(CommitRequirement::AlreadyCommitted),
+        }
+    }
+
+    fn mark_pending_commit(&mut self) {
+        debug_assert!(self.is_uncommitted());
+        *self = Self::PendingCommit;
+    }
+
+    fn mark_committed(&mut self, committed_at: SystemTime) {
+        debug_assert!(self.is_pending_commit());
+        *self = Self::Committed(committed_at);
+    }
+
+    fn discard_pending(&mut self) {
+        debug_assert!(self.is_pending_commit());
+        *self = Self::Uncommitted;
+    }
+
+    fn cancel_pending(&mut self) {
+        if self.is_pending_commit() {
+            *self = Self::Uncommitted;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RetryPlan {
+    Stop,
+    Continuation,
+    CredentialRecovery,
+    SameAccountWait(Duration),
+    TransportRecovery {
+        transport: AttemptTransport,
+        delay: Duration,
+    },
+    RotateAccount,
+}
+
+impl RetryPlan {
+    fn select(
+        continuation: bool,
+        credential_recovery: bool,
+        same_account_wait: Option<Duration>,
+        transport_recovery: Option<(AttemptTransport, Duration)>,
+        rotate_account: bool,
+    ) -> Self {
+        if credential_recovery {
+            Self::CredentialRecovery
+        } else if let Some(delay) = same_account_wait {
+            Self::SameAccountWait(delay)
+        } else if let Some((transport, delay)) = transport_recovery {
+            Self::TransportRecovery { transport, delay }
+        } else if continuation {
+            Self::Continuation
+        } else if rotate_account {
+            Self::RotateAccount
+        } else {
+            Self::Stop
+        }
+    }
+
+    const fn is_retryable(self) -> bool {
+        !matches!(self, Self::Stop)
+    }
 }
 
 /// API 可逐事件消费的 Core 执行会话
@@ -482,9 +582,8 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     current: Option<CurrentAttempt>,
     /// 请求级发送状态水位；跨 attempt 单调不降，终态写回不得低于此档
     send_state_watermark: UpstreamSendState,
-    downstream_committed_at: Option<SystemTime>,
+    delivery_state: DeliveryState,
     client_status_code: Option<u16>,
-    delivery_pending: bool,
     upstream_complete: bool,
     finalization: Option<RequestFinalization>,
     finalized_at: Option<SystemTime>,
@@ -534,7 +633,7 @@ where
     /// 未提交上一条首事件、Provider 失败、取消或超时时返回错误；观测写入失败只记录告警
     pub async fn next_event(&mut self) -> Result<Option<CoordinatedEvent>, EngineError> {
         self.resume_finalization().await;
-        if self.delivery_pending {
+        if self.delivery_state.is_pending_commit() {
             return Err(EngineError::DownstreamCommitRequired);
         }
         if let Some(pending) = self.pending_terminal_failure.take() {
@@ -548,12 +647,10 @@ where
         loop {
             match self.pull().await? {
                 PullOutcome::Events(events) => {
-                    let requirement = if self.downstream_committed_at.is_some() {
-                        CommitRequirement::AlreadyCommitted
-                    } else {
-                        self.delivery_pending = true;
-                        CommitRequirement::CommitBeforeDelivery
-                    };
+                    let requirement = self
+                        .delivery_state
+                        .begin_delivery()
+                        .ok_or(EngineError::DownstreamCommitRequired)?;
                     return CoordinatedEvent::try_batch(events, requirement).map(Some);
                 }
                 PullOutcome::AttemptDiscarded => {}
@@ -562,18 +659,16 @@ where
                     error,
                     send_state,
                 } => {
-                    let requirement = if self.downstream_committed_at.is_some() {
-                        CommitRequirement::AlreadyCommitted
-                    } else {
-                        self.delivery_pending = true;
-                        CommitRequirement::CommitBeforeDelivery
-                    };
+                    let requirement = self
+                        .delivery_state
+                        .begin_delivery()
+                        .ok_or(EngineError::DownstreamCommitRequired)?;
                     self.pending_terminal_failure =
                         Some(PendingTerminalFailure { error, send_state });
                     return CoordinatedEvent::try_batch(events, requirement).map(Some);
                 }
                 PullOutcome::End => {
-                    if self.downstream_committed_at.is_some() {
+                    if self.delivery_state.is_committed() {
                         self.finish_success().await?;
                     }
                     return Ok(None);
@@ -589,7 +684,7 @@ where
     /// 会话已提交、已有待提交结果或执行失败时返回错误
     pub async fn collect_uncommitted(&mut self) -> Result<Vec<ProviderEvent>, EngineError> {
         self.resume_finalization().await;
-        if self.downstream_committed_at.is_some() || self.delivery_pending {
+        if !self.delivery_state.is_uncommitted() {
             return Err(EngineError::InvalidDeliveryState);
         }
         if self.is_finalized() {
@@ -612,7 +707,7 @@ where
                     if events.is_empty() {
                         return Err(EngineError::InvalidDeliveryState);
                     }
-                    self.delivery_pending = true;
+                    self.delivery_state.mark_pending_commit();
                     return Ok(events);
                 }
             }
@@ -628,7 +723,7 @@ where
         &mut self,
         client_status_code: Option<u16>,
     ) -> Result<(), EngineError> {
-        if !self.delivery_pending || self.downstream_committed_at.is_some() || self.is_finalized() {
+        if !self.delivery_state.is_pending_commit() || self.is_finalized() {
             return Err(EngineError::InvalidDeliveryState);
         }
         let committed_at = SystemTime::now();
@@ -648,9 +743,8 @@ where
             )
             .await;
         }
-        self.downstream_committed_at = Some(committed_at);
+        self.delivery_state.mark_committed(committed_at);
         self.client_status_code = client_status_code;
-        self.delivery_pending = false;
         if self.upstream_complete {
             self.finish_success().await?;
         }
@@ -660,14 +754,13 @@ where
     /// 仅当 HTTP 流插件明确丢弃了整个尚未提交的非终态批次时释放交付屏障
     /// 原始 Provider facts 已经观察，不回滚计量，也不把丢弃误记为客户端 commit
     pub fn discard_pending_delivery(&mut self) -> Result<(), EngineError> {
-        if !self.delivery_pending
-            || self.downstream_committed_at.is_some()
+        if !self.delivery_state.is_pending_commit()
             || self.pending_terminal_failure.is_some()
             || self.is_finalized()
         {
             return Err(EngineError::InvalidDeliveryState);
         }
-        self.delivery_pending = false;
+        self.delivery_state.discard_pending();
         Ok(())
     }
 
@@ -803,7 +896,7 @@ where
         if self.is_finalized() {
             return Ok(());
         }
-        self.delivery_pending = false;
+        self.delivery_state.cancel_pending();
         if let Some(pending) = self.pending_terminal_failure.take() {
             return self
                 .finish_provider_error_with_send_state(&pending.error, pending.send_state)
@@ -1497,8 +1590,7 @@ where
         let account_rotation_retry = !execution_effect_observed
             && self.account_selection.required_account().is_none()
             && self.continuation_attempt == ContinuationAttempt::None
-            && self.downstream_committed_at.is_none()
-            && !self.delivery_pending
+            && self.delivery_state.is_uncommitted()
             && attempt_send_state != UpstreamSendState::Ambiguous
             && matches!(
                 error.pre_delivery_retry(),
@@ -1515,8 +1607,7 @@ where
             Some(crate::error::PreDeliveryRetry::SameAccountConnectionRetry { transport })
                 if !execution_effect_observed
                     && !self.connection_budget.exhausted()
-                    && self.downstream_committed_at.is_none()
-                    && !self.delivery_pending
+                    && self.delivery_state.is_uncommitted()
                     && attempt_send_state == UpstreamSendState::NotSent
                     && self.current_send_state() == UpstreamSendState::NotSent
                     && self.continuation_attempt == ContinuationAttempt::None =>
@@ -1533,8 +1624,7 @@ where
                 delay,
             }) if !execution_effect_observed
                 && !self.connection_budget.exhausted()
-                && self.downstream_committed_at.is_none()
-                && !self.delivery_pending
+                && self.delivery_state.is_uncommitted()
                 && attempt_send_state != UpstreamSendState::Ambiguous =>
             {
                 Some((AttemptTransport::Retry(retry_index), delay))
@@ -1542,8 +1632,7 @@ where
             Some(crate::error::PreDeliveryRetry::SameAccountTransportFallback)
                 if !execution_effect_observed
                     && !self.connection_budget.exhausted()
-                    && self.downstream_committed_at.is_none()
-                    && !self.delivery_pending
+                    && self.delivery_state.is_uncommitted()
                     && attempt_send_state != UpstreamSendState::Ambiguous =>
             {
                 Some((
@@ -1558,8 +1647,7 @@ where
             && !execution_effect_observed
             && self.account_selection.required_account().is_none()
             && self.continuation_attempt == ContinuationAttempt::None
-            && self.downstream_committed_at.is_none()
-            && !self.delivery_pending
+            && self.delivery_state.is_uncommitted()
             && attempt_send_state != UpstreamSendState::Ambiguous
             && provider_proved_replay_safe
             && self.routing_attempts < self.plan.max_attempts().get();
@@ -1590,8 +1678,7 @@ where
         let same_account_retry = !execution_effect_observed
             && error.retries_same_account()
             && provider_proved_replay_safe
-            && self.downstream_committed_at.is_none()
-            && !self.delivery_pending
+            && self.delivery_state.is_uncommitted()
             && attempt_send_state != UpstreamSendState::Ambiguous
             && self.routing_attempts < self.plan.max_attempts().get()
             && !self
@@ -1608,12 +1695,14 @@ where
             && (ordinary_retry || account_rotation_retry)
             && self.account_rotations
                 < self.plan.account_selection_policy().max_account_rotations();
-        let retryable = !error.retry_is_prohibited()
-            && (continuation_retry
-                || same_account_retry
-                || transient_retry.is_some()
-                || transport_recovery.is_some()
-                || rotation_retry);
+        let retry_candidate_plan = RetryPlan::select(
+            continuation_retry,
+            same_account_retry,
+            transient_retry,
+            transport_recovery,
+            rotation_retry,
+        );
+        let retry_candidate = !error.retry_is_prohibited() && retry_candidate_plan.is_retryable();
 
         let retryable = match self
             .apply_retry_policy(super::policy::RetryFacts {
@@ -1632,7 +1721,7 @@ where
                     .get()
                     .saturating_sub(self.routing_attempts),
                 remaining_deadline: Duration::ZERO,
-                retry_allowed: retryable,
+                retry_allowed: retry_candidate,
             })
             .await
         {
@@ -1642,6 +1731,11 @@ where
                 self.finish_interruption(&error).await?;
                 return Err(error);
             }
+        };
+        let retry_plan = if retryable {
+            retry_candidate_plan
+        } else {
+            RetryPlan::Stop
         };
 
         self.trace.attempt(current.index.get()).record("retry.decided", json!({
@@ -1655,7 +1749,7 @@ where
             "connectionBudgetRemainingMs": self.connection_budget.remaining().map(duration_ms),
             "executionEffectObserved": execution_effect_observed,
             "delayMs": transient_retry.or(transport_recovery.map(|(_, delay)| delay)).map(duration_ms),
-            "downstreamCommitted": self.downstream_committed_at.is_some(),
+            "downstreamCommitted": self.delivery_state.is_committed(),
             "sendState": format!("{attempt_send_state:?}"),
         }));
         if retryable {
@@ -1667,30 +1761,37 @@ where
             // 原始 wire/HTTP response 由 request-local 所有权保留到下一次 attempt
             // 成功，或最终空选路时返回客户端；持久化只取得稳定事实快照
             let persistence_error = self.request_persisted.then(|| error.stable_snapshot());
-            if same_account_retry {
-                let account = current.metadata.provider_account_id().clone();
-                self.credential_recovery_attempted_accounts
-                    .insert(account.clone());
-                // 只钉住紧随其后的 replay attempt；replay 再遇可重试错误时，
-                // ordinary/continuation 重试门不受影响，仍可换号
-                self.recovery_account = Some(account);
-            } else if let Some(delay) = transient_retry {
-                self.pending_retry = Some(PendingAttemptRetry {
-                    account: current.metadata.provider_account_id().clone(),
-                    transport: current.transport,
-                    delay,
-                    transport_recovery: false,
-                });
-            } else if let Some((transport, delay)) = transport_recovery {
-                self.pending_retry = Some(PendingAttemptRetry {
-                    account: current.metadata.provider_account_id().clone(),
-                    transport,
-                    delay,
-                    transport_recovery: true,
-                });
-            } else if !continuation_retry {
-                self.excluded_accounts
-                    .insert(current.metadata.provider_account_id().clone());
+            match retry_plan {
+                RetryPlan::Stop => unreachable!("retryable result has a retry plan"),
+                RetryPlan::Continuation => {}
+                RetryPlan::CredentialRecovery => {
+                    let account = current.metadata.provider_account_id().clone();
+                    self.credential_recovery_attempted_accounts
+                        .insert(account.clone());
+                    // 只钉住紧随其后的 replay attempt；replay 再遇可重试错误时，
+                    // ordinary/continuation 重试门不受影响，仍可换号
+                    self.recovery_account = Some(account);
+                }
+                RetryPlan::SameAccountWait(delay) => {
+                    self.pending_retry = Some(PendingAttemptRetry {
+                        account: current.metadata.provider_account_id().clone(),
+                        transport: current.transport,
+                        delay,
+                        transport_recovery: false,
+                    });
+                }
+                RetryPlan::TransportRecovery { transport, delay } => {
+                    self.pending_retry = Some(PendingAttemptRetry {
+                        account: current.metadata.provider_account_id().clone(),
+                        transport,
+                        delay,
+                        transport_recovery: true,
+                    });
+                }
+                RetryPlan::RotateAccount => {
+                    self.excluded_accounts
+                        .insert(current.metadata.provider_account_id().clone());
+                }
             }
             self.last_retryable_failure_events = atomic_client_events;
             self.last_retryable_failure = Some(error);
@@ -1813,8 +1914,7 @@ where
     ) -> bool {
         if self.account_selection.required_account().is_some()
             || self.continuation_attempt == ContinuationAttempt::None
-            || self.downstream_committed_at.is_some()
-            || self.delivery_pending
+            || !self.delivery_state.is_uncommitted()
             || send_state == UpstreamSendState::Ambiguous
             || !provider_proved_replay_safe
             || self.routing_attempts >= self.plan.max_attempts().get()
@@ -1952,7 +2052,7 @@ where
             outcome: ExecutionOutcome::Succeeded,
             send_state: UpstreamSendState::Sent,
             attempt_count: self.attempts,
-            downstream_committed_at: self.downstream_committed_at,
+            downstream_committed_at: self.delivery_state.committed_at(),
             client_status_code: self.client_status_code,
             upstream_status_code,
             client_response_id: self.observation.client_response_id.clone(),
@@ -2001,7 +2101,7 @@ where
         let send_state = self.raise_send_watermark(send_state);
         let outcome = if error.kind() == ProviderErrorKind::Cancelled {
             ExecutionOutcome::Cancelled
-        } else if self.downstream_committed_at.is_some() {
+        } else if self.delivery_state.is_committed() {
             ExecutionOutcome::Incomplete
         } else {
             ExecutionOutcome::Failed
@@ -2032,7 +2132,7 @@ where
                 GatewayError::new(GatewayErrorKind::Cancelled, "request was cancelled"),
             ),
             EngineError::Deadline => (
-                if self.downstream_committed_at.is_some() {
+                if self.delivery_state.is_committed() {
                     ExecutionOutcome::Incomplete
                 } else {
                     ExecutionOutcome::Failed
@@ -2046,7 +2146,7 @@ where
         };
         let send_state = if self.attempts == 0 {
             UpstreamSendState::NotSent
-        } else if self.downstream_committed_at.is_some()
+        } else if self.delivery_state.is_committed()
             || self
                 .current
                 .as_ref()
@@ -2117,7 +2217,7 @@ where
             outcome: finalization.outcome,
             send_state: finalization.send_state,
             attempt_count: self.attempts,
-            downstream_committed_at: self.downstream_committed_at,
+            downstream_committed_at: self.delivery_state.committed_at(),
             client_status_code: self.client_status_code,
             upstream_status_code: finalization.upstream_status_code.or(observed_status_code),
             client_response_id: self.observation.client_response_id.clone(),

@@ -1005,6 +1005,10 @@ fn success_updates_one_model_request_and_persists_usage() {
     assert_eq!(started_id, completed_id);
     assert!(!session.is_finalized());
     block_on(session.commit_downstream(Some(200))).expect("commit response");
+    assert!(matches!(
+        block_on(session.commit_downstream(Some(200))),
+        Err(EngineError::InvalidDeliveryState)
+    ));
 
     assert!(session.is_finalized());
     let state = store.state.lock().expect("store lock");
@@ -4307,6 +4311,59 @@ fn cancellation_before_pending_delivery_commit_reaches_terminal_state() {
     assert_eq!(state.finalizations[0].outcome, ExecutionOutcome::Cancelled);
     assert!(!state.finalizations[0].committed);
     assert_eq!(session.budget_charge().amount_usd.scaled(), 0);
+}
+
+#[test]
+fn discarded_pending_delivery_releases_the_commit_barrier_once() {
+    let operation = generate_operation();
+    let route_plan = plan(&operation);
+    let (coordinator, store, _) = coordinator(vec![Script::Stream {
+        account_id: "acct_first",
+        items: complete_stream(None),
+    }]);
+    let mut session = block_on(coordinator.start(
+        model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
+        operation,
+        route_plan,
+        None,
+        None,
+        CancellationToken::new(),
+    ))
+    .expect("start execution");
+
+    let discarded = block_on(session.next_event())
+        .expect("first event")
+        .expect("pending event");
+    assert_eq!(
+        discarded.commit_requirement(),
+        CommitRequirement::CommitBeforeDelivery
+    );
+    session
+        .discard_pending_delivery()
+        .expect("discard pending event batch");
+    assert!(matches!(
+        block_on(session.commit_downstream(Some(200))),
+        Err(EngineError::InvalidDeliveryState)
+    ));
+
+    let visible = block_on(session.next_event())
+        .expect("next event after discard")
+        .expect("remaining provider event");
+    assert_eq!(
+        visible.commit_requirement(),
+        CommitRequirement::CommitBeforeDelivery
+    );
+    block_on(session.commit_downstream(Some(200))).expect("commit remaining delivery");
+    while block_on(session.next_event())
+        .expect("drain committed stream")
+        .is_some()
+    {}
+
+    assert!(session.is_finalized());
+    let state = store.state.lock().expect("store lock");
+    assert_eq!(state.commits, 1);
+    assert_eq!(state.finalizations[0].outcome, ExecutionOutcome::Succeeded);
+    assert!(state.finalizations[0].committed);
 }
 
 #[test]
