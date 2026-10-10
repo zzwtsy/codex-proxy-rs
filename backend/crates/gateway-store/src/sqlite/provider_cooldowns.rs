@@ -1,4 +1,4 @@
-//! SQLite 共享账号与模型 cooldown、容量失败计数及峰值。
+//! SQLite 共享账号与模型 cooldown、容量失败计数及峰值
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -39,16 +39,16 @@ impl SqliteProviderCooldownRepository {
         .bind(account_id.as_str())
         .fetch_optional(&self.pool)
         .await
-        .map_err(|_| provider_unavailable("read provider cooldown"))?;
+        .map_err(|source| super::provider_query_error("read provider cooldown", source))?;
         let Some(row) = row else {
             return Ok(None);
         };
         let revision: i64 = sqlx::Row::try_get(&row, "credential_revision")
-            .map_err(|_| provider_unavailable("decode provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("decode provider cooldown", source))?;
         let until: i64 = sqlx::Row::try_get(&row, "until_us")
-            .map_err(|_| provider_unavailable("decode provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("decode provider cooldown", source))?;
         let kind_value: String = sqlx::Row::try_get(&row, "kind")
-            .map_err(|_| provider_unavailable("decode provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("decode provider cooldown", source))?;
         let kind = AccountCooldownKind::parse(&kind_value)
             .ok_or_else(|| provider_invalid("decode provider cooldown kind"))?;
         if kind != AccountCooldownKind::CapacityFreezeProbe
@@ -63,7 +63,7 @@ impl SqliteProviderCooldownRepository {
             .bind(&kind_value)
             .execute(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("clean expired provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("clean expired provider cooldown", source))?;
             return Ok(None);
         }
         let revision = CredentialRevision::new(
@@ -93,14 +93,16 @@ impl SqliteProviderCooldownRepository {
         .bind(scope.value())
         .fetch_optional(&self.pool)
         .await
-        .map_err(|_| provider_unavailable("read scoped provider cooldown"))?;
+        .map_err(|source| super::provider_query_error("read scoped provider cooldown", source))?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let revision: i64 = sqlx::Row::try_get(&row, "credential_revision")
-            .map_err(|_| provider_unavailable("decode scoped provider cooldown"))?;
-        let until: i64 = sqlx::Row::try_get(&row, "until_us")
-            .map_err(|_| provider_unavailable("decode scoped provider cooldown"))?;
+        let revision: i64 = sqlx::Row::try_get(&row, "credential_revision").map_err(|source| {
+            super::provider_query_error("decode scoped provider cooldown", source)
+        })?;
+        let until: i64 = sqlx::Row::try_get(&row, "until_us").map_err(|source| {
+            super::provider_query_error("decode scoped provider cooldown", source)
+        })?;
         let now = datetime_to_micros(Utc::now());
         if until <= now {
             sqlx::query(
@@ -113,7 +115,7 @@ impl SqliteProviderCooldownRepository {
             .bind(now)
             .execute(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("clean expired scoped provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("clean expired scoped provider cooldown", source))?;
             return Ok(None);
         }
         let revision = CredentialRevision::new(
@@ -135,7 +137,7 @@ impl SqliteProviderCooldownRepository {
     ) -> Result<(), ProviderStoreError> {
         super::acquire_write_lock(transaction)
             .await
-            .map_err(|_| provider_unavailable("acquire SQLite write lock"))
+            .map_err(|source| crate::provider_unavailable("acquire SQLite write lock", source))
     }
 
     async fn put_account(
@@ -152,46 +154,59 @@ impl SqliteProviderCooldownRepository {
             .pool
             .begin()
             .await
-            .map_err(|_| provider_unavailable("write provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("write provider cooldown", source))?;
         Self::acquire_write_lock(&mut transaction).await?;
         let now = datetime_to_micros(Utc::now());
+        // 过期普通冻结不能继续压制新的限流；探测冻结直到显式恢复才失效
+        sqlx::query(
+            "DELETE FROM provider_cooldowns
+             WHERE account_id = ? AND kind <> 'capacity_freeze_probe' AND until_us <= ?",
+        )
+        .bind(account_id.as_str())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| {
+            crate::provider_unavailable("clean expired provider cooldown before write", source)
+        })?;
         let current = sqlx::query(
             "SELECT credential_revision, until_us, kind FROM provider_cooldowns WHERE account_id = ?",
         )
         .bind(account_id.as_str())
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(|_| provider_unavailable("read provider cooldown"))?;
+        .map_err(|source| super::provider_query_error("read provider cooldown", source))?;
         let mut until = incoming_until;
         if let Some(row) = current {
-            let current_revision: i64 = sqlx::Row::try_get(&row, "credential_revision")
-                .map_err(|_| provider_unavailable("decode provider cooldown"))?;
-            let current_until: i64 = sqlx::Row::try_get(&row, "until_us")
-                .map_err(|_| provider_unavailable("decode provider cooldown"))?;
-            let current_kind: String = sqlx::Row::try_get(&row, "kind")
-                .map_err(|_| provider_unavailable("decode provider cooldown"))?;
+            let current_revision: i64 =
+                sqlx::Row::try_get(&row, "credential_revision").map_err(|source| {
+                    super::provider_query_error("decode provider cooldown", source)
+                })?;
+            let current_until: i64 = sqlx::Row::try_get(&row, "until_us").map_err(|source| {
+                super::provider_query_error("decode provider cooldown", source)
+            })?;
+            let current_kind: String = sqlx::Row::try_get(&row, "kind").map_err(|source| {
+                super::provider_query_error("decode provider cooldown", source)
+            })?;
             if current_revision > revision {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|_| provider_unavailable("write provider cooldown"))?;
+                transaction.commit().await.map_err(|source| {
+                    super::provider_query_error("write provider cooldown", source)
+                })?;
                 return Ok(false);
             }
             if current_revision == revision {
                 if current_kind != AccountCooldownKind::RateLimit.as_str()
                     && kind == AccountCooldownKind::RateLimit
                 {
-                    transaction
-                        .commit()
-                        .await
-                        .map_err(|_| provider_unavailable("write provider cooldown"))?;
+                    transaction.commit().await.map_err(|source| {
+                        super::provider_query_error("write provider cooldown", source)
+                    })?;
                     return Ok(false);
                 }
                 if current_kind == kind.as_str() && current_until >= incoming_until {
-                    transaction
-                        .commit()
-                        .await
-                        .map_err(|_| provider_unavailable("write provider cooldown"))?;
+                    transaction.commit().await.map_err(|source| {
+                        super::provider_query_error("write provider cooldown", source)
+                    })?;
                     return Ok(false);
                 }
                 until = current_until.max(incoming_until);
@@ -201,7 +216,7 @@ impl SqliteProviderCooldownRepository {
             transaction
                 .commit()
                 .await
-                .map_err(|_| provider_unavailable("write provider cooldown"))?;
+                .map_err(|source| super::provider_query_error("write provider cooldown", source))?;
             return Ok(false);
         }
         let generation = Uuid::now_v7().to_string();
@@ -215,11 +230,11 @@ impl SqliteProviderCooldownRepository {
         .bind(generation)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| provider_unavailable("write provider cooldown"))?;
+        .map_err(|source| super::provider_query_error("write provider cooldown", source))?;
         transaction
             .commit()
             .await
-            .map_err(|_| provider_unavailable("write provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("write provider cooldown", source))?;
         Ok(true)
     }
 }
@@ -262,7 +277,7 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(revision)
             .execute(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("clear provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("clear provider cooldown", source))?;
             Ok(result.rows_affected() > 0)
         })
     }
@@ -279,11 +294,9 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             if until <= now {
                 return Ok(false);
             }
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("write scoped provider cooldown"))?;
+            let mut transaction = self.pool.begin().await.map_err(|source| {
+                super::provider_query_error("write scoped provider cooldown", source)
+            })?;
             Self::acquire_write_lock(&mut transaction).await?;
             let current: Option<(i64, i64)> = sqlx::query_as(
                 "SELECT credential_revision, until_us FROM provider_scoped_cooldowns                  WHERE account_id = ? AND scope_kind = ? AND scope_value = ?",
@@ -293,15 +306,14 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(cooldown.scope().value())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("read scoped provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("read scoped provider cooldown", source))?;
             if current.is_some_and(|(current_revision, current_until)| {
                 current_revision > revision
                     || (current_revision == revision && current_until >= until)
             }) {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|_| provider_unavailable("write scoped provider cooldown"))?;
+                transaction.commit().await.map_err(|source| {
+                    super::provider_query_error("write scoped provider cooldown", source)
+                })?;
                 return Ok(false);
             }
             sqlx::query(
@@ -314,11 +326,10 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(until)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("write scoped provider cooldown"))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("write scoped provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("write scoped provider cooldown", source))?;
+            transaction.commit().await.map_err(|source| {
+                super::provider_query_error("write scoped provider cooldown", source)
+            })?;
             Ok(true)
         })
     }
@@ -349,7 +360,7 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(revision)
             .execute(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("clear scoped provider cooldown"))?;
+            .map_err(|source| super::provider_query_error("clear scoped provider cooldown", source))?;
             Ok(result.rows_affected() > 0)
         })
     }
@@ -359,11 +370,9 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
         account_id: &'a ProviderAccountId,
     ) -> BoxFuture<'a, Result<bool, ProviderStoreError>> {
         Box::pin(async move {
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("clear provider runtime state"))?;
+            let mut transaction = self.pool.begin().await.map_err(|source| {
+                super::provider_query_error("clear provider runtime state", source)
+            })?;
             Self::acquire_write_lock(&mut transaction).await?;
             let mut removed = 0_u64;
             for query in [
@@ -376,14 +385,15 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
                         .bind(account_id.as_str())
                         .execute(&mut *transaction)
                         .await
-                        .map_err(|_| provider_unavailable("clear provider runtime state"))?
+                        .map_err(|source| {
+                            super::provider_query_error("clear provider runtime state", source)
+                        })?
                         .rows_affected(),
                 );
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("clear provider runtime state"))?;
+            transaction.commit().await.map_err(|source| {
+                super::provider_query_error("clear provider runtime state", source)
+            })?;
             Ok(removed > 0)
         })
     }
@@ -403,11 +413,10 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             let expires = now
                 .checked_add(window_micros)
                 .ok_or_else(|| provider_invalid("encode capacity failure expiry"))?;
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("record capacity failure"))?;
+            let mut transaction =
+                self.pool.begin().await.map_err(|source| {
+                    super::provider_query_error("record capacity failure", source)
+                })?;
             Self::acquire_write_lock(&mut transaction).await?;
             let current: Option<(i64, i64, Option<i64>, Option<i64>)> = sqlx::query_as(
                 "SELECT failure_count, failures_expires_at_us, peak_in_flight, peak_expires_at_us                  FROM provider_capacity_failures WHERE account_id = ?",
@@ -415,7 +424,7 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(account_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("read capacity failure state"))?;
+            .map_err(|source| super::provider_query_error("read capacity failure state", source))?;
             let (count, previous_peak, previous_peak_expiry) = match current {
                 Some((count, failure_expiry, peak, peak_expiry)) if failure_expiry > now => (
                     count
@@ -447,11 +456,11 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(peak_expiry)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("record capacity failure"))?;
+            .map_err(|source| super::provider_query_error("record capacity failure", source))?;
             transaction
                 .commit()
                 .await
-                .map_err(|_| provider_unavailable("record capacity failure"))?;
+                .map_err(|source| super::provider_query_error("record capacity failure", source))?;
             u32::try_from(count).map_err(|_| provider_invalid("capacity failure count exceeds u32"))
         })
     }
@@ -464,12 +473,28 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
         Box::pin(async move {
             let revision = i64::try_from(through_revision.get())
                 .map_err(|_| provider_invalid("encode cooldown revision"))?;
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("clear cooldown after success"))?;
+            let mut transaction = self.pool.begin().await.map_err(|source| {
+                super::provider_query_error("clear cooldown after success", source)
+            })?;
             Self::acquire_write_lock(&mut transaction).await?;
+            // 已发出的请求可以晚于冻结成功返回，不能抹掉冻结的峰值证据
+            let protected: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM provider_cooldowns
+                 WHERE account_id = ? AND (credential_revision > ? OR kind <> 'rate_limit'))",
+            )
+            .bind(account_id.as_str())
+            .bind(revision)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| {
+                crate::provider_unavailable("check capacity evidence protection", source)
+            })?;
+            if protected {
+                transaction.commit().await.map_err(|source| {
+                    crate::provider_unavailable("preserve capacity evidence", source)
+                })?;
+                return Ok(());
+            }
             sqlx::query(
                 "DELETE FROM provider_cooldowns WHERE account_id = ?                  AND credential_revision <= ? AND kind = 'rate_limit'",
             )
@@ -477,16 +502,17 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(revision)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("clear cooldown after success"))?;
+            .map_err(|source| super::provider_query_error("clear cooldown after success", source))?;
             sqlx::query("DELETE FROM provider_capacity_failures WHERE account_id = ?")
                 .bind(account_id.as_str())
                 .execute(&mut *transaction)
                 .await
-                .map_err(|_| provider_unavailable("clear capacity failure evidence"))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("clear cooldown after success"))
+                .map_err(|source| {
+                    super::provider_query_error("clear capacity failure evidence", source)
+                })?;
+            transaction.commit().await.map_err(|source| {
+                super::provider_query_error("clear cooldown after success", source)
+            })
         })
     }
 
@@ -503,7 +529,7 @@ impl ProviderCooldownPort for SqliteProviderCooldownRepository {
             .bind(now)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("read capacity peak"))?
+            .map_err(|source| super::provider_query_error("read capacity peak", source))?
             .flatten();
             peak.map(|value| {
                 u32::try_from(value).map_err(|_| provider_invalid("capacity peak exceeds u32"))
@@ -524,29 +550,30 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|_| sqlite_store_unavailable("clean expired provider cooldowns"))?;
+        .map_err(|source| sqlite_store_unavailable("clean expired provider cooldowns").with_source(source))?;
         let rows = sqlx::query(
             "SELECT account_id, until_us, kind FROM provider_cooldowns             WHERE kind = 'capacity_freeze_probe' OR until_us > ?",
         )
         .bind(now)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| sqlite_store_unavailable("list active provider cooldowns"))?;
+        .map_err(|source| sqlite_store_unavailable("list active provider cooldowns").with_source(source))?;
         let mut cooldown = BTreeMap::new();
         for row in rows {
-            let account_id: String = row
-                .try_get("account_id")
-                .map_err(|_| sqlite_store_invalid("decode provider cooldown account"))?;
-            let until: i64 = row
-                .try_get("until_us")
-                .map_err(|_| sqlite_store_invalid("decode provider cooldown expiry"))?;
-            let kind_value: String = row
-                .try_get("kind")
-                .map_err(|_| sqlite_store_invalid("decode provider cooldown kind"))?;
+            let account_id: String = row.try_get("account_id").map_err(|source| {
+                sqlite_store_invalid("decode provider cooldown account").with_source(source)
+            })?;
+            let until: i64 = row.try_get("until_us").map_err(|source| {
+                sqlite_store_invalid("decode provider cooldown expiry").with_source(source)
+            })?;
+            let kind_value: String = row.try_get("kind").map_err(|source| {
+                sqlite_store_invalid("decode provider cooldown kind").with_source(source)
+            })?;
             let kind = AccountCooldownKind::parse(&kind_value)
                 .ok_or_else(|| sqlite_store_invalid("decode provider cooldown kind"))?;
-            let until = datetime_from_micros(until)
-                .map_err(|_| sqlite_store_invalid("decode provider cooldown expiry"))?;
+            let until = datetime_from_micros(until).map_err(|source| {
+                sqlite_store_invalid("decode provider cooldown expiry").with_source(source)
+            })?;
             cooldown.insert(
                 account_id,
                 gateway_core::account::AccountCooldown {
@@ -568,8 +595,10 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
         let mut cooldowns = BTreeMap::new();
         for account_id in account_ids {
             crate::require_nonempty("account runtime", "account_id", account_id)?;
-            let account_id_value = ProviderAccountId::new(account_id.clone())
-                .map_err(|_| sqlite_store_invalid("decode provider account ID"))?;
+            let account_id_value =
+                ProviderAccountId::new(account_id.clone()).map_err(|source| {
+                    sqlite_store_invalid("decode provider account ID").with_source(source)
+                })?;
             if let Some(cooldown) = self
                 .read_account(&account_id_value)
                 .await
@@ -595,35 +624,36 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
         .bind(now)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| sqlite_store_unavailable("list active provider freezes"))?;
+        .map_err(|source| sqlite_store_unavailable("list active provider freezes").with_source(source))?;
         let mut freezes = BTreeMap::new();
         for row in rows {
-            let account_id: String = row
-                .try_get("account_id")
-                .map_err(|_| sqlite_store_invalid("decode provider freeze account"))?;
-            let revision: i64 = row
-                .try_get("credential_revision")
-                .map_err(|_| sqlite_store_invalid("decode provider freeze revision"))?;
-            let until: i64 = row
-                .try_get("until_us")
-                .map_err(|_| sqlite_store_invalid("decode provider freeze expiry"))?;
-            let kind_value: String = row
-                .try_get("kind")
-                .map_err(|_| sqlite_store_invalid("decode provider freeze kind"))?;
+            let account_id: String = row.try_get("account_id").map_err(|source| {
+                sqlite_store_invalid("decode provider freeze account").with_source(source)
+            })?;
+            let revision: i64 = row.try_get("credential_revision").map_err(|source| {
+                sqlite_store_invalid("decode provider freeze revision").with_source(source)
+            })?;
+            let until: i64 = row.try_get("until_us").map_err(|source| {
+                sqlite_store_invalid("decode provider freeze expiry").with_source(source)
+            })?;
+            let kind_value: String = row.try_get("kind").map_err(|source| {
+                sqlite_store_invalid("decode provider freeze kind").with_source(source)
+            })?;
             let kind = AccountCooldownKind::parse(&kind_value)
                 .ok_or_else(|| sqlite_store_invalid("decode provider freeze kind"))?;
             if !kind.is_capacity_freeze() {
                 return Err(sqlite_store_invalid("decode provider freeze kind"));
             }
-            let generation: String = row
-                .try_get("generation")
-                .map_err(|_| sqlite_store_invalid("decode provider freeze generation"))?;
+            let generation: String = row.try_get("generation").map_err(|source| {
+                sqlite_store_invalid("decode provider freeze generation").with_source(source)
+            })?;
             let revision = u64::try_from(revision)
                 .ok()
                 .and_then(|revision| gateway_admin::model::Revision::new(revision).ok())
                 .ok_or_else(|| sqlite_store_invalid("decode provider freeze revision"))?;
-            let until = datetime_from_micros(until)
-                .map_err(|_| sqlite_store_invalid("decode provider freeze expiry"))?;
+            let until = datetime_from_micros(until).map_err(|source| {
+                sqlite_store_invalid("decode provider freeze expiry").with_source(source)
+            })?;
             freezes.insert(
                 account_id,
                 AccountFreeze {
@@ -663,19 +693,22 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
             .build()
             .fetch_all(&self.pool)
             .await
-            .map_err(|_| sqlite_store_unavailable("read provider capacity peaks"))?;
+            .map_err(|source| {
+                sqlite_store_unavailable("read provider capacity peaks").with_source(source)
+            })?;
         let mut peaks = BTreeMap::new();
         for row in rows {
-            let account_id: String = row
-                .try_get("account_id")
-                .map_err(|_| sqlite_store_invalid("decode provider capacity peak account"))?;
-            let peak: i64 = row
-                .try_get("peak_in_flight")
-                .map_err(|_| sqlite_store_invalid("decode provider capacity peak"))?;
+            let account_id: String = row.try_get("account_id").map_err(|source| {
+                sqlite_store_invalid("decode provider capacity peak account").with_source(source)
+            })?;
+            let peak: i64 = row.try_get("peak_in_flight").map_err(|source| {
+                sqlite_store_invalid("decode provider capacity peak").with_source(source)
+            })?;
             peaks.insert(
                 account_id,
-                u32::try_from(peak)
-                    .map_err(|_| sqlite_store_invalid("decode provider capacity peak"))?,
+                u32::try_from(peak).map_err(|source| {
+                    sqlite_store_invalid("decode provider capacity peak").with_source(source)
+                })?,
             );
         }
         Ok(peaks)
@@ -688,13 +721,12 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
         postpone_until: Option<DateTime<Utc>>,
     ) -> crate::StoreResult<bool> {
         crate::require_nonempty("account runtime", "account_id", account_id)?;
-        let revision = i64::try_from(expected.credential_revision.get())
-            .map_err(|_| sqlite_store_invalid("encode provider freeze revision"))?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| sqlite_store_unavailable("finish provider freeze"))?;
+        let revision = i64::try_from(expected.credential_revision.get()).map_err(|source| {
+            sqlite_store_invalid("encode provider freeze revision").with_source(source)
+        })?;
+        let mut transaction = self.pool.begin().await.map_err(|source| {
+            sqlite_store_unavailable("finish provider freeze").with_source(source)
+        })?;
         Self::acquire_write_lock(&mut transaction)
             .await
             .map_err(provider_store_error)?;
@@ -710,7 +742,7 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
             .bind(&expected.generation)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| sqlite_store_unavailable("postpone provider freeze"))?
+            .map_err(|source| sqlite_store_unavailable("postpone provider freeze").with_source(source))?
             .rows_affected()
                 == 1
         } else {
@@ -722,7 +754,7 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
             .bind(&expected.generation)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| sqlite_store_unavailable("finish provider freeze"))?
+            .map_err(|source| sqlite_store_unavailable("finish provider freeze").with_source(source))?
             .rows_affected()
                 == 1;
             if deleted {
@@ -730,14 +762,16 @@ impl AccountRuntimeStateRepository for SqliteProviderCooldownRepository {
                     .bind(account_id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|_| sqlite_store_unavailable("clear provider freeze evidence"))?;
+                    .map_err(|source| {
+                        sqlite_store_unavailable("clear provider freeze evidence")
+                            .with_source(source)
+                    })?;
             }
             deleted
         };
-        transaction
-            .commit()
-            .await
-            .map_err(|_| sqlite_store_unavailable("finish provider freeze"))?;
+        transaction.commit().await.map_err(|source| {
+            sqlite_store_unavailable("finish provider freeze").with_source(source)
+        })?;
         Ok(changed)
     }
 }
@@ -747,15 +781,17 @@ fn provider_store_error(error: ProviderStoreError) -> crate::StoreError {
         ProviderStoreErrorKind::InvalidData => crate::StoreError::InvalidData {
             entity: "SQLite provider runtime state",
             message: error.to_string(),
-            source: None,
+            source: Some(error.into()),
         },
         ProviderStoreErrorKind::Conflict => crate::StoreError::Conflict {
             entity: "provider runtime state",
             id: "account".to_owned(),
             kind: crate::ConflictKind::InvalidTransition,
-            source: None,
+            source: Some(error.into()),
         },
-        ProviderStoreErrorKind::Unavailable => sqlite_store_unavailable("provider runtime state"),
+        ProviderStoreErrorKind::Unavailable => {
+            sqlite_store_unavailable("provider runtime state").with_source(error)
+        }
     }
 }
 
@@ -773,10 +809,6 @@ fn sqlite_store_invalid(message: &'static str) -> crate::StoreError {
         message: message.to_owned(),
         source: None,
     }
-}
-
-fn provider_unavailable(operation: &'static str) -> ProviderStoreError {
-    ProviderStoreError::new(ProviderStoreErrorKind::Unavailable, operation)
 }
 
 fn provider_invalid(operation: &'static str) -> ProviderStoreError {

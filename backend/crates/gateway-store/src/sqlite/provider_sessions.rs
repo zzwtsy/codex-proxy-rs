@@ -1,4 +1,4 @@
-//! SQLite Provider 会话亲和与失败账号排除状态。
+//! SQLite Provider 会话亲和与失败账号排除状态
 
 use std::time::Duration;
 
@@ -82,18 +82,9 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
             .bind(now)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("load provider session affinity"))?;
-            if binding.is_none() {
-                sqlx::query(
-                    "DELETE FROM provider_session_affinity
-                     WHERE session_fingerprint = ? AND expires_at_us <= ?",
-                )
-                .bind(fingerprint)
-                .bind(now)
-                .execute(&self.pool)
-                .await
-                .map_err(|_| provider_unavailable("clean expired provider session affinity"))?;
-            }
+            .map_err(|source| {
+                super::provider_query_error("load provider session affinity", source)
+            })?;
             binding
                 .map(|(account_id, revision)| {
                     let account_id = ProviderAccountId::new(account_id)
@@ -115,14 +106,14 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
         Box::pin(async move {
             let fingerprint = Self::key(provider_kind, key)?;
             let ttl = Self::ttl(ttl)?;
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("admit provider session affinity"))?;
+            let mut transaction = self.pool.begin().await.map_err(|source| {
+                crate::provider_unavailable("admit provider session affinity", source)
+            })?;
             super::acquire_write_lock(&mut transaction)
                 .await
-                .map_err(|_| provider_unavailable("admit provider session affinity"))?;
+                .map_err(|source| {
+                    crate::provider_unavailable("admit provider session affinity", source)
+                })?;
             let now = datetime_to_micros(Utc::now());
             let current = sqlx::query_as::<_, (String, String)>(
                 "SELECT account_id, revision FROM provider_session_affinity
@@ -132,7 +123,9 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("load provider session affinity"))?
+            .map_err(|source| {
+                super::provider_query_error("load provider session affinity", source)
+            })?
             .map(|(current_account, revision)| {
                 let current_account = ProviderAccountId::new(current_account)
                     .map_err(|_| provider_invalid("decode provider session affinity"))?;
@@ -169,11 +162,12 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
             .bind(expires_at)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("admit provider session affinity"))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("admit provider session affinity"))?;
+            .map_err(|source| {
+                crate::provider_unavailable("admit provider session affinity", source)
+            })?;
+            transaction.commit().await.map_err(|source| {
+                crate::provider_unavailable("admit provider session affinity", source)
+            })?;
             Ok(Some(binding))
         })
     }
@@ -194,18 +188,7 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
             .bind(now)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("load provider session alias"))?;
-            if value.is_none() {
-                sqlx::query(
-                    "DELETE FROM provider_session_aliases
-                     WHERE alias_fingerprint = ? AND expires_at_us <= ?",
-                )
-                .bind(fingerprint)
-                .bind(now)
-                .execute(&self.pool)
-                .await
-                .map_err(|_| provider_unavailable("clean expired provider session alias"))?;
-            }
+            .map_err(|source| super::provider_query_error("load provider session alias", source))?;
             value
                 .map(|(session_key, follow_only, root_session_key)| {
                     Ok(ProviderSessionAlias {
@@ -230,14 +213,14 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
         Box::pin(async move {
             let fingerprint = Self::alias_key(provider, alias)?;
             let ttl = Self::ttl(ttl)?;
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("bind provider session alias"))?;
+            let mut transaction = self.pool.begin().await.map_err(|source| {
+                crate::provider_unavailable("bind provider session alias", source)
+            })?;
             super::acquire_write_lock(&mut transaction)
                 .await
-                .map_err(|_| provider_unavailable("bind provider session alias"))?;
+                .map_err(|source| {
+                    crate::provider_unavailable("bind provider session alias", source)
+                })?;
             let now = datetime_to_micros(Utc::now());
             let expires_at = now
                 .checked_add(ttl)
@@ -254,7 +237,7 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
                  WHERE provider_session_aliases.expires_at_us <= ?
                     OR (provider_session_aliases.session_key = excluded.session_key
                         AND provider_session_aliases.follow_only = excluded.follow_only
-                        AND provider_session_aliases.root_session_key = excluded.root_session_key)",
+                        AND provider_session_aliases.root_session_key IS excluded.root_session_key)",
             )
             .bind(fingerprint)
             .bind(session.session_key.expose_to_store())
@@ -269,11 +252,10 @@ impl ProviderSessionAffinityPort for SqliteProviderSessionAffinityRepository {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("bind provider session alias"))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("bind provider session alias"))?;
+            .map_err(|source| crate::provider_unavailable("bind provider session alias", source))?;
+            transaction.commit().await.map_err(|source| {
+                crate::provider_unavailable("bind provider session alias", source)
+            })?;
             Ok(result.rows_affected() > 0)
         })
     }
@@ -311,52 +293,33 @@ impl SqliteProviderSessionExclusionRepository {
             .map_err(|_| provider_invalid("validate provider session exclusion TTL"))
     }
 
-    async fn load_active(
-        &self,
+    async fn load_active<'e>(
+        executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
         fingerprint: &str,
+        now: i64,
     ) -> Result<Option<ProviderSessionExclusions>, ProviderStoreError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| provider_unavailable("load provider session exclusion"))?;
-        let cleanup_before = datetime_to_micros(Utc::now());
-        sqlx::query(
-            "DELETE FROM provider_session_exclusions              WHERE session_fingerprint = ? AND expires_at_us <= ?",
-        )
-        .bind(fingerprint)
-        .bind(cleanup_before)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| provider_unavailable("clean provider session exclusion"))?;
-        let now = datetime_to_micros(Utc::now());
-        let rows = sqlx::query(
-            "SELECT account_id, revision FROM provider_session_exclusions              WHERE session_fingerprint = ? AND expires_at_us > ? ORDER BY account_id",
+        // 单条查询使用同一快照，过期记录由写入路径和后台任务清理
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT account_id, revision FROM provider_session_exclusions
+             WHERE session_fingerprint = ? AND expires_at_us > ? ORDER BY account_id",
         )
         .bind(fingerprint)
         .bind(now)
-        .fetch_all(&mut *transaction)
+        .fetch_all(executor)
         .await
-        .map_err(|_| provider_unavailable("load provider session exclusion"))?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| provider_unavailable("load provider session exclusion"))?;
+        .map_err(|source| super::provider_query_error("load provider session exclusion", source))?;
         if rows.is_empty() {
             return Ok(None);
         }
         let mut accounts = std::collections::BTreeSet::new();
         let mut revision = None;
-        for row in rows {
-            let account_id: String = sqlx::Row::try_get(&row, "account_id")
-                .map_err(|_| provider_unavailable("decode provider session exclusion"))?;
-            let row_revision: String = sqlx::Row::try_get(&row, "revision")
-                .map_err(|_| provider_unavailable("decode provider session exclusion"))?;
+        for (account_id, row_revision) in rows {
             if revision
                 .as_ref()
                 .is_some_and(|current| current != &row_revision)
             {
-                return Err(provider_unavailable(
+                return Err(ProviderStoreError::new(
+                    ProviderStoreErrorKind::InvalidData,
                     "provider session exclusion revision mismatch",
                 ));
             }
@@ -381,7 +344,7 @@ impl ProviderSessionExclusionPort for SqliteProviderSessionExclusionRepository {
     ) -> BoxFuture<'a, Result<Option<ProviderSessionExclusions>, ProviderStoreError>> {
         Box::pin(async move {
             let fingerprint = SqliteProviderSessionExclusionRepository::key(provider_kind, key)?;
-            self.load_active(&fingerprint).await
+            Self::load_active(&self.pool, &fingerprint, datetime_to_micros(Utc::now())).await
         })
     }
 
@@ -395,14 +358,14 @@ impl ProviderSessionExclusionPort for SqliteProviderSessionExclusionRepository {
         Box::pin(async move {
             let fingerprint = SqliteProviderSessionExclusionRepository::key(provider_kind, key)?;
             let ttl = Self::ttl(ttl)?;
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| provider_unavailable("record provider session exclusion"))?;
+            let mut transaction = self.pool.begin().await.map_err(|source| {
+                crate::provider_unavailable("record provider session exclusion", source)
+            })?;
             super::acquire_write_lock(&mut transaction)
                 .await
-                .map_err(|_| provider_unavailable("record provider session exclusion"))?;
+                .map_err(|source| {
+                    crate::provider_unavailable("record provider session exclusion", source)
+                })?;
             let now = datetime_to_micros(Utc::now());
             let expires_at = now
                 .checked_add(ttl)
@@ -415,16 +378,20 @@ impl ProviderSessionExclusionPort for SqliteProviderSessionExclusionRepository {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("clean provider session exclusion"))?;
+            .map_err(|source| crate::provider_unavailable("clean provider session exclusion", source))?;
             sqlx::query(
-                "UPDATE provider_session_exclusions SET revision = ?                  WHERE session_fingerprint = ? AND expires_at_us > ?",
+                "UPDATE provider_session_exclusions SET revision = ?, expires_at_us = ?
+                 WHERE session_fingerprint = ? AND expires_at_us > ?",
             )
             .bind(&revision)
+            .bind(expires_at)
             .bind(&fingerprint)
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("record provider session exclusion"))?;
+            .map_err(|source| {
+                crate::provider_unavailable("record provider session exclusion", source)
+            })?;
             sqlx::query(
                 "INSERT INTO provider_session_exclusions                  (session_fingerprint, account_id, revision, expires_at_us) VALUES (?, ?, ?, ?)                  ON CONFLICT (session_fingerprint, account_id) DO UPDATE SET                    revision = excluded.revision, expires_at_us = excluded.expires_at_us",
             )
@@ -434,14 +401,14 @@ impl ProviderSessionExclusionPort for SqliteProviderSessionExclusionRepository {
             .bind(expires_at)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| provider_unavailable("record provider session exclusion"))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| provider_unavailable("record provider session exclusion"))?;
-            self.load_active(&fingerprint)
+            .map_err(|source| crate::provider_unavailable("record provider session exclusion", source))?;
+            let state = Self::load_active(&mut *transaction, &fingerprint, now)
                 .await?
-                .ok_or_else(|| provider_unavailable("record provider session exclusion"))
+                .ok_or_else(|| provider_invalid("record provider session exclusion snapshot"))?;
+            transaction.commit().await.map_err(|source| {
+                crate::provider_unavailable("record provider session exclusion", source)
+            })?;
+            Ok(state)
         })
     }
 
@@ -460,17 +427,10 @@ impl ProviderSessionExclusionPort for SqliteProviderSessionExclusionRepository {
             .bind(expected_revision)
             .execute(&self.pool)
             .await
-            .map_err(|_| provider_unavailable("clear provider session exclusion"))?;
+            .map_err(|source| crate::provider_unavailable("clear provider session exclusion", source))?;
             Ok(result.rows_affected() > 0)
         })
     }
-}
-
-fn provider_unavailable(_operation: &'static str) -> ProviderStoreError {
-    ProviderStoreError::new(
-        ProviderStoreErrorKind::Unavailable,
-        "SQLite Provider state failed",
-    )
 }
 
 fn provider_invalid(operation: &'static str) -> ProviderStoreError {

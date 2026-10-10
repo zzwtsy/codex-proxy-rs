@@ -1,5 +1,7 @@
 //! 存储集成测试的基础设施地址读取与 CI 环境判定辅助
 
+pub mod provider_state;
+
 /// 读取集成测试基础设施地址（PostgreSQL / Redis）
 ///
 /// 本地未配置时返回 `None`，测试跳过；CI 中缺失则直接失败——

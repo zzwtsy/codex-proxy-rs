@@ -16,6 +16,69 @@ use gateway_store::{
 use redis::aio::ConnectionManager;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn successful_requests_preserve_frozen_and_newer_capacity_evidence() {
+    let Some((repository, _, _)) = repository().await else {
+        return;
+    };
+    crate::support::provider_state::success_cleanup_contract(&repository).await;
+}
+
+#[tokio::test]
+async fn expired_grace_freeze_allows_new_rate_limit_but_probe_freeze_does_not() {
+    for kind in [
+        ProviderCooldownKind::CapacityFreeze,
+        ProviderCooldownKind::CapacityFreezeProbe,
+    ] {
+        let Some((repository, mut connection, namespace)) = repository().await else {
+            return;
+        };
+        let mut initial = cooldown("acct_grace", 1, 600);
+        initial.kind = kind;
+        repository
+            .cache_credential_cooldown(&initial)
+            .await
+            .unwrap();
+        let keys = namespace_keys(&mut connection, &namespace).await;
+        let key = keys
+            .iter()
+            .find(|key| !key.ends_with(":account:active-cooldowns"))
+            .unwrap();
+        // 保留实体键，模拟业务期限已过而 Redis grace TTL 尚未结束
+        redis::cmd("HSET")
+            .arg(key)
+            .arg("until_ms")
+            .arg(1)
+            .query_async::<i64>(&mut connection)
+            .await
+            .unwrap();
+        redis::cmd("PEXPIRE")
+            .arg(key)
+            .arg(60_000)
+            .query_async::<i64>(&mut connection)
+            .await
+            .unwrap();
+        let applied = repository
+            .cache_credential_cooldown(&cooldown("acct_grace", 1, 60))
+            .await
+            .unwrap();
+        assert_eq!(applied, kind == ProviderCooldownKind::CapacityFreeze);
+        let current = repository
+            .read_credential_cooldown("acct_grace")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.kind,
+            if applied {
+                ProviderCooldownKind::RateLimit
+            } else {
+                kind
+            }
+        );
+    }
+}
+
 #[test]
 fn credential_cooldown_is_revision_fenced() {
     let cooldown = CredentialCooldown {

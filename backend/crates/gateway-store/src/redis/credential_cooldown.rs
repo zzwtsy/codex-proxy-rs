@@ -19,19 +19,25 @@ use crate::{Revision, StoreError, StoreResult, redis_unavailable, require_nonemp
 use super::{namespace, resource_fingerprint};
 
 const WRITE_SCRIPT: &str = r#"
+local clock = redis.call('TIME')
+local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
+local current_until = tonumber(redis.call('HGET', KEYS[1], 'until_ms') or '0')
+local current_kind = redis.call('HGET', KEYS[1], 'kind') or 'rate_limit'
+if current_kind ~= 'capacity_freeze_probe' and current_until <= now_ms then
+  redis.call('DEL', KEYS[1])
+  if #KEYS > 1 then redis.call('ZREM', KEYS[2], ARGV[3]) end
+  current_until = 0
+  current_kind = 'rate_limit'
+end
 local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
 local incoming = tonumber(ARGV[1])
 local incoming_until = tonumber(ARGV[2])
 if current > incoming then return 0 end
-local current_until = tonumber(redis.call('HGET', KEYS[1], 'until_ms') or '0')
-local current_kind = redis.call('HGET', KEYS[1], 'kind') or 'rate_limit'
 if current == incoming then
   if current_kind ~= 'rate_limit' and ARGV[4] == 'rate_limit' then return 0 end
   if current_kind == ARGV[4] and current_until >= incoming_until then return 0 end
   incoming_until = math.max(current_until, incoming_until)
 end
-local clock = redis.call('TIME')
-local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
 if incoming_until <= now_ms and ARGV[4] ~= 'capacity_freeze_probe' then return 0 end
 redis.call('HSET', KEYS[1], 'revision', ARGV[1], 'until_ms', incoming_until, 'kind', ARGV[4], 'generation', ARGV[5])
 if ARGV[4] == 'capacity_freeze_probe' then

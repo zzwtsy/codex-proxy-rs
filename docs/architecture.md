@@ -824,6 +824,8 @@ revision；credential 轮换只推进账号自己的 `credential_revision`。Pos
 `normal`、`quota_exhausted`、`rate_limited`、`disabled`、`error`。只有明确上游证据才能恢复或终态化账号，
 本地时钟和不确定响应不能伪造事实
 
+会话排除集合在每次失败时为所有仍有效成员统一续期并更新 revision，过期成员不随其他账号失败恢复；成功清理必须匹配整个集合的 revision。SQLite 的亲和绑定、轮次 alias 和排除集合读取只筛选有效期限，不承担物理删除；后台任务每 30 秒按表分批清理，每批最多 1000 条，并在取得写锁后复核期限
+
 容量冻结与上游限流共用冷却投影，探测恢复与持久化并发调整由 Admin 负责，详见[Worker 与账号冻结](#worker-与账号冻结)
 
 PostgreSQL 和 SQLite 分别使用独立迁移目录与冻结清单。已应用迁移按字节冻结，后续 schema 变化只能在对应目录新增编号迁移；SQLite 从空文件建库，不会导入 PostgreSQL 数据。详见 [PostgreSQL 迁移规则](../backend/migrations/postgres/README.md) 与 [SQLite 迁移规则](../backend/migrations/sqlite/README.md)

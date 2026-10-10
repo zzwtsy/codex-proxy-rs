@@ -157,6 +157,8 @@ pub trait ProviderSessionExclusionPort: Send + Sync {
         key: &'a ProviderSessionAffinityKey,
     ) -> BoxFuture<'a, Result<Option<ProviderSessionExclusions>, ProviderStoreError>>;
 
+    /// 删除过期成员后，为整个有效集合更新 revision 并从本次失败起统一续期
+    /// 返回本次写入的快照；旧 revision 的成功回调不能清除续期后的集合
     fn record_failure<'a>(
         &'a self,
         provider_kind: &'a ProviderKind,

@@ -10,6 +10,35 @@ use redis::aio::ConnectionManager;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn new_and_repeated_failures_renew_the_entire_exclusion_set() {
+    let Some((repository, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let provider = ProviderKind::new("openai").unwrap();
+    let session = ProviderSessionAffinityKey::try_new("renew-set").unwrap();
+    let a = ProviderAccountId::new("acct_a").unwrap();
+    let b = ProviderAccountId::new("acct_b").unwrap();
+    repository
+        .record_failure(&provider, &session, &a, Duration::from_secs(60))
+        .await
+        .unwrap();
+    for ttl in [600, 900] {
+        let state = repository
+            .record_failure(&provider, &session, &b, Duration::from_secs(ttl))
+            .await
+            .unwrap();
+        assert_eq!(state.excluded_accounts().len(), 2);
+        let keys = namespace_keys(&mut connection, &namespace).await;
+        let remaining: i64 = redis::cmd("PTTL")
+            .arg(&keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(remaining > (ttl as i64 - 10) * 1000);
+    }
+}
+
+#[tokio::test]
 async fn session_exclusion_should_record_each_failed_account_for_one_hour() {
     let Some((repository, mut connection, namespace)) = repository().await else {
         return;

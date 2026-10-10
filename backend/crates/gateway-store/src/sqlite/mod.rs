@@ -237,6 +237,20 @@ pub(crate) fn sqlite_unavailable(operation: &'static str) -> StoreError {
     }
 }
 
+/// 区分持久化字段无法解码与数据库不可用，同时保留底层来源
+pub(super) fn provider_query_error(
+    operation: &'static str,
+    source: sqlx::Error,
+) -> gateway_core::provider_ports::ProviderStoreError {
+    use gateway_core::provider_ports::{ProviderStoreError, ProviderStoreErrorKind};
+    match source {
+        sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_) => {
+            ProviderStoreError::caused_by(ProviderStoreErrorKind::InvalidData, operation, source)
+        }
+        source => crate::provider_unavailable(operation, source),
+    }
+}
+
 /// 在写事务中推进运行配置 revision，并防止 SQLite INTEGER 溢出。
 pub(crate) async fn bump_config_revision(
     transaction: &mut Transaction<'_, sqlx::Sqlite>,

@@ -15,6 +15,7 @@ mod plugin_distribution;
 mod plugin_resources;
 mod plugin_state;
 mod provider_leases;
+mod provider_state;
 mod proxies;
 mod retention;
 mod session_cleanup;
